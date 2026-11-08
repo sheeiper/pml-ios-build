@@ -9,6 +9,7 @@ struct ComicDirectPageView: View {
     @EnvironmentObject private var model: AppModel
     @State private var image: UIImage?
     @State private var failed = false
+    @State private var sourceLabel: String?
 
     var body: some View {
         Group {

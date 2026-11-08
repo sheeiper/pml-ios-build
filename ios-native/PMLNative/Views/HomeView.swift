@@ -311,7 +311,7 @@ struct HomeView: View {
         )
     }
 
-    private func refresh() async {
+    private func refresh(retryOnCancel: Bool = true) async {
         guard let client = model.apiClient else { return }
         loading = true
         errorText = ""

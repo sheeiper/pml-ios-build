@@ -258,7 +258,7 @@ struct GestureVideoPlayerSheet: View {
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, 18)
-                    .padding(.top, 52)
+                    .padding(.top, 20)
                 }
             }
             .overlay(alignment: .leading) {
@@ -421,8 +421,8 @@ struct GestureVideoPlayerSheet: View {
                 .foregroundStyle(.white)
             }
             .padding(.horizontal, 20)
-            .padding(.bottom, 24)
-            .padding(.top, 14)
+            .padding(.bottom, 8)
+            .padding(.top, 10)
             .background(
                 LinearGradient(colors: [.clear, .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             )

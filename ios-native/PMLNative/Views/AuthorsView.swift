@@ -94,10 +94,8 @@ struct AuthorsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     if isHall {
-                        Button("全库索引") {
-                            viewAll = true
-                            selectedCategory = nil
-                            Task { await load() }
+                        NavigationLink("全库索引") {
+                            CreatorCategoryView(category: nil)
                         }
                     } else {
                         Menu {
@@ -228,14 +226,8 @@ struct AuthorsView: View {
     }
 
     private func categoryCard(_ category: LibraryCategory) -> some View {
-        Button {
-            selectedCategory = category
-            viewAll = false
-            searchText = ""
-            Task {
-                await loadChildren(of: category)
-                await load()
-            }
+        NavigationLink {
+            CreatorCategoryView(category: category)
         } label: {
             VStack(alignment: .leading, spacing: 8) {
                 Image(systemName: "folder.fill")
@@ -334,6 +326,7 @@ struct AuthorProfileView: View {
 
     @EnvironmentObject private var model: AppModel
     @State private var assets: [LibraryAsset] = []
+    @State private var roots: [LibraryRoot] = []
     @State private var loading = false
     @State private var errorText = ""
     @State private var preview: PreviewItem?
@@ -362,16 +355,30 @@ struct AuthorProfileView: View {
                     Text("暂无作品").foregroundStyle(.secondary)
                 }
 
-                LazyVGrid(columns: columns, spacing: 8) {
-                    ForEach(assets) { asset in
-                        Button {
-                            Task { await open(asset) }
-                        } label: {
-                            cell(asset)
-                        }
-                        .buttonStyle(.plain)
-                        .task {
-                            await thumbs.image(assetId: asset.thumbnailAssetId ?? asset.id, client: model.apiClient)
+                if !roots.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("作品目录").font(.headline)
+                        ForEach(roots) { root in
+                            NavigationLink {
+                                AuthorFolderView(author: info, allAssets: assets, root: root, relativePath: "")
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: root.symbol).foregroundStyle(.tint)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text((root.remotePath as NSString).lastPathComponent)
+                                        Text(root.remotePath)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption)
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .padding(.vertical, 4)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -599,7 +606,10 @@ struct AuthorProfileView: View {
         loading = true
         errorText = ""
         do {
-            assets = try await client.libraryAssets(filter: "all", authorId: author.id, limit: 200)
+            async let assetsTask = client.libraryAssets(filter: "all", authorId: author.id, limit: 1000)
+            async let rootsTask = client.libraryRoots()
+            assets = try await assetsTask
+            roots = (try? await rootsTask) ?? []
             if let authors = try? await client.libraryAuthors(filter: "all"),
                let latest = authors.first(where: { $0.id == author.id }) {
                 displayAuthor = latest
