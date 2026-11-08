@@ -108,13 +108,12 @@ final class AppModel: ObservableObject {
     /// 服务器模式：优先 AList `/d` 直连；失败回退服务器 `/media`。
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         if settings.mode == .server {
-            // MOV/QuickTime 的 moov 常在文件尾，直链 Range 容易卡顿：优先服务器中转。
-            if let remotePath, remotePath.lowercased().hasSuffix(".mov"),
-               let fallback = await serverMediaURL(assetId: assetId) {
-                return PlaybackSource(url: fallback, fallbackURL: alistDirectURL(remotePath: remotePath), label: "服务器中转")
-            }
-            // 其他格式先返回直链：不阻塞打开播放器；兜底地址在失败时再取。
             if let remotePath, let direct = alistDirectURL(remotePath: remotePath) {
+                // MOV 的 moov 常在文件尾，先解析一次最终 CDN 地址，避免每个 Range 都重新 302。
+                if remotePath.lowercased().hasSuffix(".mov"),
+                   let stable = await resolveStableDirectURL(direct) {
+                    return PlaybackSource(url: stable, fallbackURL: nil, label: "AList 直连")
+                }
                 return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
             }
             if let fallback = await serverMediaURL(assetId: assetId) {
@@ -128,6 +127,23 @@ final class AppModel: ObservableObject {
             return nil
         }
         return PlaybackSource(url: url, fallbackURL: nil, label: nil)
+    }
+
+    /// 跟随 AList /d 的 302，拿到当前网络下可用的最终 115 CDN 地址。
+    private func resolveStableDirectURL(_ url: URL) async -> URL? {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        request.timeoutInterval = 8
+        do {
+            let (_, response) = try await APISession.shared.session.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  http.statusCode == 200 || http.statusCode == 206,
+                  let final = http.url, final != url else { return nil }
+            return final
+        } catch {
+            return nil
+        }
     }
     /// 播放失败时再取服务器中转地址（不阻塞首帧）。
     func fallbackMediaURL(assetId: String?) async -> URL? {
