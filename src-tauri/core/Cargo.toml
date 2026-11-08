@@ -1,0 +1,36 @@
+[package]
+name = "personal-media-library-core"
+version = "1.0.29"
+description = "面向 AList / CloudDrive2 的媒体库核心（不依赖 Tauri）"
+authors = ["Personal Media Library contributors"]
+edition = "2021"
+
+[lib]
+name = "personal_media_library_core"
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = []
+# 桌面/网页版：由 Tauri 宿主提供 AppHandle / State，并把函数注册成 Tauri 命令
+tauri = ["dep:tauri"]
+# iOS 原生壳：纯 Rust 静态库 + C ABI
+ios-ffi = []
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "custom-protocol"], optional = true }
+axum = "0.8"
+sha2 = "0.10"
+tower-http = { version = "0.6", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["sync", "time", "net", "io-util", "process", "rt-multi-thread"] }
+url = "2"
+roxmltree = "0.20"
+rand = "0.8"
+futures-util = "0.3"
+percent-encoding = "2"
+zip = { version = "9.0.0-pre3", default-features = false, features = ["deflate"] }

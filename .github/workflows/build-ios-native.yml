@@ -1,0 +1,94 @@
+name: Build iOS Native
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-native:
+    name: Build Native SwiftUI App (.ipa)
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          for candidate in \
+            /Applications/Xcode_26.3.app \
+            /Applications/Xcode_26.2.app \
+            /Applications/Xcode_26.1.1.app \
+            /Applications/Xcode_26.1.app \
+            /Applications/Xcode_26.0.1.app \
+            /Applications/Xcode_26.0.app; do
+            if [ -d "$candidate" ]; then
+              sudo xcode-select -s "$candidate/Contents/Developer"
+              echo "Selected $candidate"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            aarch64-apple-ios
+
+      - name: Build Rust Core for iOS
+        run: |
+          cargo build --manifest-path src-tauri/core/Cargo.toml --lib \
+            --target aarch64-apple-ios --release \
+            --no-default-features --features ios-ffi
+
+      - name: Stage Static Library
+        run: |
+          mkdir -p ios-native/Vendor
+          rm -f ios-native/Vendor/*.a
+          cp src-tauri/core/target/aarch64-apple-ios/release/libpersonal_media_library_core.a \
+             ios-native/Vendor/libpersonal_media_library_core.a
+          ls -lh ios-native/Vendor/
+
+      - name: Install XcodeGen
+        run: command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec ios-native/project.yml --project ios-native
+
+      - name: Build and archive (unsigned)
+        run: |
+          xcodebuild archive \
+            -project ios-native/PMLNative.xcodeproj \
+            -scheme PMLNative \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/PMLNative.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO
+
+      - name: Package .ipa
+        run: |
+          APP_PATH=$(find "$RUNNER_TEMP/PMLNative.xcarchive/Products/Applications" -maxdepth 1 -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: compiled .app bundle not found"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/ipa_out/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa_out/Payload/"
+          cd "$RUNNER_TEMP/ipa_out"
+          zip -qr "$RUNNER_TEMP/personal-media-library-native-unsigned.ipa" Payload
+          ls -lh "$RUNNER_TEMP/personal-media-library-native-unsigned.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: personal-media-library-native-ios
+          path: ${{ runner.temp }}/personal-media-library-native-unsigned.ipa
+          retention-days: 14

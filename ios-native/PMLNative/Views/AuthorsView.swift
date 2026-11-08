@@ -1,0 +1,625 @@
+import PhotosUI
+import SwiftUI
+import UIKit
+
+private enum AuthorSortMode: String, CaseIterable, Identifiable {
+    case mediaCount = "作品数"
+    case name = "名称"
+    var id: String { rawValue }
+}
+
+/// 创作者分类大厅：一级分类卡片 → 子分类/作者列表，可切换全库索引。
+struct AuthorsView: View {
+    @EnvironmentObject private var model: AppModel
+
+    @State private var categories: [LibraryCategory] = []
+    @State private var authors: [LibraryAuthor] = []
+    @State private var selectedCategory: LibraryCategory?
+    @State private var viewAll = false
+    @State private var loading = false
+    @State private var errorText = ""
+    @State private var searchText = ""
+    @State private var sortMode: AuthorSortMode = .mediaCount
+    @StateObject private var thumbs = ThumbnailLoader()
+
+    private var isHall: Bool {
+        selectedCategory == nil && !viewAll && searchText.isEmpty
+    }
+
+    private var topCategories: [LibraryCategory] {
+        let ids = Set(categories.map(\.id))
+        return categories
+            .filter { category in
+                guard let parent = category.parentId, !parent.isEmpty else { return true }
+                return !ids.contains(parent)
+            }
+            .sorted { $0.authorCount > $1.authorCount }
+    }
+
+    private var childCategories: [LibraryCategory] {
+        guard let selectedCategory else { return [] }
+        return categories
+            .filter { $0.parentId == selectedCategory.id }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    private var displayedAuthors: [LibraryAuthor] {
+        let filtered: [LibraryAuthor]
+        if searchText.isEmpty {
+            filtered = authors
+        } else {
+            filtered = authors.filter { author in
+                author.name.localizedCaseInsensitiveContains(searchText)
+                    || author.aliases.contains(where: { $0.localizedCaseInsensitiveContains(searchText) })
+            }
+        }
+        switch sortMode {
+        case .mediaCount:
+            return filtered.sorted { $0.mediaCount > $1.mediaCount }
+        case .name:
+            return filtered.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    if loading && categories.isEmpty && authors.isEmpty {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("加载创作者…").foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 40)
+                    } else if isHall {
+                        hall
+                    } else {
+                        detail
+                    }
+
+                    if !errorText.isEmpty {
+                        Text(errorText)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+            }
+            .navigationTitle(navigationTitle)
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索创作者/别名")
+            .refreshable { await load() }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    if isHall {
+                        Button("全库索引") {
+                            viewAll = true
+                            selectedCategory = nil
+                            Task { await load() }
+                        }
+                    } else {
+                        Menu {
+                            Picker("排序", selection: $sortMode) {
+                                ForEach(AuthorSortMode.allCases) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "arrow.up.arrow.down")
+                        }
+                        Button("分类总览") {
+                            selectedCategory = nil
+                            viewAll = false
+                            searchText = ""
+                            authors = []
+                            Task { await load() }
+                        }
+                    }
+                }
+            }
+            .task { await load() }
+            .onChange(of: searchText) { _, value in
+                if !value.isEmpty && !viewAll && selectedCategory == nil {
+                    viewAll = true
+                    Task { await load() }
+                }
+            }
+        }
+    }
+
+    private var navigationTitle: String {
+        if isHall { return "创作者" }
+        if viewAll { return "全部创作者" }
+        return selectedCategory?.name ?? "创作者"
+    }
+
+    private var hall: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("创作者分类大厅")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Text("\(topCategories.count) 个分类 · \(topCategories.reduce(0) { $0 + Int($1.authorCount) }) 位创作者")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if topCategories.isEmpty {
+                Text("还没有分类。扫描资料库并整理后，这里会显示分类大厅。")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 30)
+            } else {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                    ForEach(topCategories) { category in
+                        categoryCard(category)
+                    }
+                }
+            }
+        }
+    }
+
+    private var detail: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(viewAll ? "全部创作者" : (selectedCategory?.name ?? "创作者"))
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Text("\(displayedAuthors.count) 位")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !childCategories.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(childCategories) { child in
+                            Button {
+                                selectedCategory = child
+                                Task {
+                                    await loadChildren(of: child)
+                                    await load()
+                                }
+                            } label: {
+                                Text(child.name)
+                                    .font(.caption)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 7)
+                                    .background(Color(.secondarySystemBackground), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            if loading && authors.isEmpty {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("加载作者…").foregroundStyle(.secondary)
+                }
+                .padding(.top, 20)
+            } else if displayedAuthors.isEmpty {
+                Text("这个分类下还没有创作者。")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 30)
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(displayedAuthors) { author in
+                        NavigationLink {
+                            AuthorProfileView(author: author)
+                        } label: {
+                            authorRow(author)
+                        }
+                        .buttonStyle(.plain)
+                        .task {
+                            if let avatar = author.avatarAssetId ?? author.coverAssetId {
+                                await thumbs.image(assetId: avatar, client: model.apiClient)
+                            }
+                        }
+                        Divider().padding(.leading, 58)
+                    }
+                }
+            }
+        }
+    }
+
+    private func categoryCard(_ category: LibraryCategory) -> some View {
+        Button {
+            selectedCategory = category
+            viewAll = false
+            searchText = ""
+            Task {
+                await loadChildren(of: category)
+                await load()
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                Image(systemName: "folder.fill")
+                    .font(.title3)
+                    .foregroundStyle(.tint)
+                Text(category.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Text("\(category.authorCount) 位 · \(category.mediaCount) 项")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: 110, alignment: .topLeading)
+            .padding(12)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func authorRow(_ author: LibraryAuthor) -> some View {
+        HStack(spacing: 12) {
+            avatar(author)
+                .frame(width: 46, height: 46)
+                .clipShape(Circle())
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(author.name).lineLimit(1)
+                HStack(spacing: 8) {
+                    Text("\(author.mediaCount) 项")
+                    if author.collectionCount > 0 {
+                        Text("\(author.collectionCount) 个合集")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 9)
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private func avatar(_ author: LibraryAuthor) -> some View {
+        if let id = author.avatarAssetId, let image = thumbs.images[id] {
+            Image(uiImage: image).resizable().scaledToFill()
+        } else if let id = author.coverAssetId, let image = thumbs.images[id] {
+            Image(uiImage: image).resizable().scaledToFill()
+        } else {
+            ZStack {
+                LinearGradient(colors: [.accentColor.opacity(0.85), .accentColor.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                Text(String(author.name.prefix(1)))
+                    .font(.headline)
+                    .foregroundStyle(.white)
+            }
+        }
+    }
+
+    private func loadChildren(of category: LibraryCategory) async {
+        guard let client = model.apiClient else { return }
+        guard !categories.contains(where: { $0.parentId == category.id }) else { return }
+        if let children = try? await client.libraryCategories(parentId: category.id, filter: "all") {
+            categories.append(contentsOf: children)
+        }
+    }
+
+    private func load() async {
+        guard let client = model.apiClient else { return }
+        loading = true
+        errorText = ""
+        do {
+            if categories.isEmpty {
+                categories = try await client.libraryCategories(filter: "all")
+            }
+            if isHall {
+                authors = []
+            } else {
+                authors = try await client.libraryAuthors(categoryId: selectedCategory?.id, filter: "all")
+            }
+            if categories.isEmpty && authors.isEmpty {
+                viewAll = true
+                authors = try await client.libraryAuthors(filter: "all")
+            }
+        } catch {
+            errorText = error.localizedDescription
+        }
+        loading = false
+    }
+}
+struct AuthorProfileView: View {
+    let author: LibraryAuthor
+
+    @EnvironmentObject private var model: AppModel
+    @State private var assets: [LibraryAsset] = []
+    @State private var loading = false
+    @State private var errorText = ""
+    @State private var preview: PreviewItem?
+    @State private var showAliasEditor = false
+    @State private var aliasText = ""
+    @State private var notice = ""
+    @State private var displayAuthor: LibraryAuthor?
+    @State private var avatarItem: PhotosPickerItem?
+    @State private var bannerItem: PhotosPickerItem?
+    @State private var showAvatarPicker = false
+    @State private var showBannerPicker = false
+    @StateObject private var thumbs = ThumbnailLoader()
+
+    private let columns = [GridItem(.adaptive(minimum: 100), spacing: 8)]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                header
+
+                if !errorText.isEmpty {
+                    Text(errorText).font(.footnote).foregroundStyle(.red)
+                }
+
+                if assets.isEmpty && !loading {
+                    Text("暂无作品").foregroundStyle(.secondary)
+                }
+
+                LazyVGrid(columns: columns, spacing: 8) {
+                    ForEach(assets) { asset in
+                        Button {
+                            Task { await open(asset) }
+                        } label: {
+                            cell(asset)
+                        }
+                        .buttonStyle(.plain)
+                        .task {
+                            await thumbs.image(assetId: asset.thumbnailAssetId ?? asset.id, client: model.apiClient)
+                        }
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .navigationTitle(author.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button {
+                        showAvatarPicker = true
+                    } label: {
+                        Label("更换头像", systemImage: "person.crop.circle")
+                    }
+                    Button {
+                        showBannerPicker = true
+                    } label: {
+                        Label("更换横幅", systemImage: "rectangle.topthird.inset.filled")
+                    }
+                    Button {
+                        aliasText = info.aliases.joined(separator: "，")
+                        showAliasEditor = true
+                    } label: {
+                        Label("编辑别名", systemImage: "tag")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+            }
+        }
+        .photosPicker(isPresented: $showAvatarPicker, selection: $avatarItem, matching: .images)
+        .photosPicker(isPresented: $showBannerPicker, selection: $bannerItem, matching: .images)
+        .onChange(of: avatarItem) { _, item in
+            guard let item else { return }
+            Task { await upload(item, isAvatar: true) }
+        }
+        .onChange(of: bannerItem) { _, item in
+            guard let item else { return }
+            Task { await upload(item, isAvatar: false) }
+        }
+        .task { await load() }
+        .sheet(isPresented: $showAliasEditor) {
+            aliasEditor
+        }
+        .fullScreenCover(item: $preview) { item in
+            if item.isVideo {
+                GestureVideoPlayerSheet(
+                    url: item.url,
+                    title: item.title,
+                    assetId: item.assetId,
+                    startAt: item.startAt,
+                    fallbackURL: item.fallbackURL,
+                    sourceLabel: item.sourceLabel
+                )
+                .environmentObject(model)
+            } else {
+                ImageViewerSheet(url: item.url)
+            }
+        }
+    }
+
+    private var info: LibraryAuthor {
+        displayAuthor ?? author
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let bannerId = info.bannerAssetId, let image = thumbs.images[bannerId] {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(height: 110)
+                    .frame(maxWidth: .infinity)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+
+            HStack(spacing: 12) {
+                avatarView(info)
+                    .frame(width: 54, height: 54)
+                    .clipShape(Circle())
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(info.name).font(.headline)
+                    if !info.aliases.isEmpty {
+                        Text(info.aliases.joined(separator: " / "))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("\(info.mediaCount) 项作品 · \(info.collectionCount) 个合集")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if !notice.isEmpty {
+                Text(notice).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .task {
+            if let bannerId = info.bannerAssetId {
+                await thumbs.image(assetId: bannerId, client: model.apiClient)
+            }
+            if let avatarId = info.avatarAssetId {
+                await thumbs.image(assetId: avatarId, client: model.apiClient)
+            }
+        }
+    }
+
+    private var aliasEditor: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("别名，用逗号分隔", text: $aliasText, axis: .vertical)
+                        .lineLimit(2...4)
+                } footer: {
+                    Text("别名会参与待收纳整理时的作者匹配。")
+                }
+                Section {
+                    Button("保存别名") { Task { await saveAliases() } }
+                }
+            }
+            .navigationTitle("编辑别名")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("取消") { showAliasEditor = false }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func avatarView(_ author: LibraryAuthor) -> some View {
+        if let id = author.avatarAssetId, let image = thumbs.images[id] {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+        } else {
+            ZStack {
+                Circle().fill(.quaternary.opacity(0.35))
+                Image(systemName: "person.fill").foregroundStyle(.tint)
+            }
+        }
+    }
+
+    private func saveAliases() async {
+        guard let client = model.apiClient else { return }
+        let aliases = aliasText
+            .split(whereSeparator: { "，,;；/".contains($0) })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        do {
+            try await client.updateAuthorAliases(authorId: info.id, aliases: aliases)
+            notice = "别名已保存（\(aliases.count) 个）"
+            showAliasEditor = false
+            await refreshAuthor()
+        } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    private func upload(_ item: PhotosPickerItem, isAvatar: Bool) async {
+        guard let client = model.apiClient else { return }
+        guard let data = try? await item.loadTransferable(type: Data.self),
+              let base64 = pmlJPEGBase64(data, maxDimension: isAvatar ? 800 : 1600) else {
+            notice = "读取图片失败"
+            return
+        }
+        do {
+            if isAvatar {
+                try await client.uploadAuthorAvatar(authorId: info.id, dataBase64: base64)
+            } else {
+                try await client.uploadAuthorBanner(authorId: info.id, dataBase64: base64)
+            }
+            notice = isAvatar ? "头像已更新" : "横幅已更新"
+            await refreshAuthor()
+        } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    private func refreshAuthor() async {
+        guard let client = model.apiClient else { return }
+        if let authors = try? await client.libraryAuthors(filter: "all"),
+           let latest = authors.first(where: { $0.id == info.id }) {
+            displayAuthor = latest
+            if let avatarId = latest.avatarAssetId {
+                await thumbs.image(assetId: avatarId, client: client)
+            }
+            if let bannerId = latest.bannerAssetId {
+                await thumbs.image(assetId: bannerId, client: client)
+            }
+        }
+    }
+
+    private func cell(_ asset: LibraryAsset) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(.quaternary.opacity(0.35))
+                if let image = thumbs.images[asset.thumbnailAssetId ?? asset.id] {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Image(systemName: asset.mediaType == "video" ? "play.rectangle.fill" : "photo.fill")
+                        .foregroundStyle(.tint)
+                }
+            }
+            .aspectRatio(1, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            Text(asset.fileName)
+                .font(.caption2)
+                .lineLimit(1)
+        }
+    }
+
+
+    private func load() async {
+        guard let client = model.apiClient else { return }
+        loading = true
+        errorText = ""
+        do {
+            assets = try await client.libraryAssets(filter: "all", authorId: author.id, limit: 200)
+            if let authors = try? await client.libraryAuthors(filter: "all"),
+               let latest = authors.first(where: { $0.id == author.id }) {
+                displayAuthor = latest
+            }
+        } catch {
+            errorText = error.localizedDescription
+        }
+        loading = false
+    }
+
+    private func open(_ asset: LibraryAsset) async {
+        guard let source = await model.playbackSource(assetId: asset.id, remotePath: asset.remotePath) else { return }
+        preview = PreviewItem(
+            url: source.url,
+            isVideo: asset.mediaType == "video",
+            assetId: asset.id,
+            title: asset.fileName,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: asset.remotePath
+        )
+    }
+}

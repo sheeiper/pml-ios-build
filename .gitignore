@@ -1,0 +1,8 @@
+.build/
+DerivedData/
+build/
+target/
+Vendor/*.a
+*.xcarchive
+*.ipa
+.DS_Store
