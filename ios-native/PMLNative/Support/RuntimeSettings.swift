@@ -9,6 +9,21 @@ enum AppRunMode: String, Codable, CaseIterable {
         case .local: return "本地"
         case .server: return "服务器"
         }
+
+enum PlaybackRouteMode: String, Codable, CaseIterable, Identifiable {
+    case auto
+    case direct
+    case relay
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .auto: return "自动"
+        case .direct: return "直连"
+        case .relay: return "中转"
+        }
+    }
+}
     }
 }
 
@@ -22,6 +37,9 @@ struct RuntimeSettings: Codable, Equatable {
     var alistPrefix: String = "/115"
     var alistUser: String = ""
     var alistPassword: String = ""
+    var playbackMode: PlaybackRouteMode? = .auto
+
+    var routeMode: PlaybackRouteMode { playbackMode ?? .auto }
 
     static let storageKey = "pml.runtime.settings.v1"
 
