@@ -67,13 +67,13 @@ struct HomeView: View {
                     }
                 }
             }
-'            .task { await refresh() }
+            .task { await refresh() }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active else { return }
                 if errorText.lowercased().contains("cancel") || overview == nil {
                     Task { await refresh() }
                 }
-            }'
+            }
             .refreshable { await refresh() }
             .fullScreenCover(item: $preview) { item in
                 if item.isVideo {
