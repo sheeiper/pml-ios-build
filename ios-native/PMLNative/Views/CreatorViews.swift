@@ -130,6 +130,46 @@ func pmlAuthorSnapshot(assets: [LibraryAsset], roots: [LibraryRoot]) -> AuthorFo
 
     return AuthorFolderSnapshot(root: root, basePath: basePath, folders: folders, files: files)
 }
+/// 作者头像优先用作者封面/头像，没有时从该作者第一部作品的封面取。
+struct AuthorAvatarView: View {
+    let author: LibraryAuthor
+    var size: CGFloat = 38
+
+    @EnvironmentObject private var model: AppModel
+    @StateObject private var thumbs = ThumbnailLoader()
+    @State private var fallbackAssetId: String?
+
+    var body: some View {
+        Group {
+            if let id = author.avatarAssetId ?? author.coverAssetId, let image = thumbs.images[id] {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else if let id = fallbackAssetId, let image = thumbs.images[id] {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                ZStack {
+                    LinearGradient(colors: [.accentColor.opacity(0.85), .accentColor.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    Text(String(author.name.prefix(1)))
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                }
+            }
+        }
+        .task(id: author.id) { await load() }
+    }
+
+    private func load() async {
+        guard let client = model.apiClient else { return }
+        if let id = author.avatarAssetId ?? author.coverAssetId,
+           await thumbs.image(assetId: id, client: client) != nil {
+            return
+        }
+        guard let assets = try? await client.libraryAssets(filter: "all", authorId: author.id, limit: 1),
+              let first = assets.first else { return }
+        let id = first.thumbnailAssetId ?? first.id
+        fallbackAssetId = id
+        _ = await thumbs.image(assetId: id, client: client)
+    }
+}
 /// 单个分类页：子分类递归进入，作者列表在下方；系统返回键自动回到上一级。
 struct CreatorCategoryView: View {
     let category: LibraryCategory?
