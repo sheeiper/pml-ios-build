@@ -106,18 +106,30 @@ final class AppModel: ObservableObject {
     // MARK: - 播放地址解析
 
     /// 服务器模式：优先 AList `/d` 直连；失败回退服务器 `/media`。
+    private var directURLCache: [String: (URL, Date)] = [:]
+
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         if settings.mode == .server {
-            // MOV/QuickTime 优先服务器中转（AVPlayer 会带 Basic 头），避免直链 Range 卡顿/黑屏。
-            if let remotePath, remotePath.lowercased().hasSuffix(".mov"),
-               let fallback = await serverMediaURL(assetId: assetId) {
-                return PlaybackSource(url: fallback, fallbackURL: alistDirectURL(remotePath: remotePath), label: "服务器中转")
+            let mode = settings.routeMode
+            let direct = remotePath.flatMap { alistDirectURL(remotePath: $0) }
+            let isMOV = remotePath?.lowercased().hasSuffix(".mov") == true
+
+            if mode == .relay {
+                if let relay = await serverMediaURL(assetId: assetId) {
+                    return PlaybackSource(url: relay, fallbackURL: direct, label: "服务器中转")
+                }
             }
-            if let remotePath, let direct = alistDirectURL(remotePath: remotePath) {
+
+            if let direct {
+                // MOV 只解析一次最终 CDN 地址，避免每个 Range 重复 302。
+                if isMOV, let stable = await stableDirectURL(direct) {
+                    return PlaybackSource(url: stable, fallbackURL: nil, label: "AList 直连")
+                }
                 return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
             }
-            if let fallback = await serverMediaURL(assetId: assetId) {
-                return PlaybackSource(url: fallback, fallbackURL: nil, label: "服务器中转")
+
+            if let relay = await serverMediaURL(assetId: assetId) {
+                return PlaybackSource(url: relay, fallbackURL: nil, label: "服务器中转")
             }
             return nil
         }
@@ -129,6 +141,27 @@ final class AppModel: ObservableObject {
         return PlaybackSource(url: url, fallbackURL: nil, label: nil)
     }
 
+    /// 跟随 AList /d 的 302，拿到最终 115 CDN 地址；缓存 10 分钟。
+    private func stableDirectURL(_ url: URL) async -> URL? {
+        let key = url.absoluteString
+        if let cached = directURLCache[key], Date().timeIntervalSince(cached.1) < 600 {
+            return cached.0
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        request.timeoutInterval = 6
+        do {
+            let (_, response) = try await APISession.shared.session.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  http.statusCode == 200 || http.statusCode == 206,
+                  let final = http.url, final != url else { return nil }
+            directURLCache[key] = (final, Date())
+            return final
+        } catch {
+            return nil
+        }
+    }
     /// AVPlayer 访问服务器 /media 时补 Basic 认证；直连 AList/CDN 不加，避免泄露。
     func playbackHeaders(for url: URL) -> [String: String] {
         guard settings.mode == .server,
