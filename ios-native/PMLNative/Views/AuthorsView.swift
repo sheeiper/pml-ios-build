@@ -327,7 +327,10 @@ struct AuthorProfileView: View {
     @EnvironmentObject private var model: AppModel
     @State private var assets: [LibraryAsset] = []
     @State private var roots: [LibraryRoot] = []
-    @State private var snapshot: AuthorFolderSnapshot?
+    @State private var folderRoot: LibraryRoot?
+    @State private var folderPath = ""
+    @State private var folderEntries: [RemoteBrowserEntry] = []
+    @State private var folderLoading = false
     @State private var loading = false
     @State private var errorText = ""
     @State private var preview: PreviewItem?
@@ -356,45 +359,33 @@ struct AuthorProfileView: View {
                     Text("暂无作品").foregroundStyle(.secondary)
                 }
 
-                if let snapshot {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("作品目录").font(.headline)
-                        if snapshot.folders.isEmpty && snapshot.files.isEmpty {
+                if folderLoading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("加载目录…").font(.footnote).foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 8)
+                } else if let folderRoot {
+                    VStack(alignment: .leading, spacing: 2) {
+                        if folderEntries.isEmpty {
                             Text("无文件").foregroundStyle(.secondary)
                         }
-                        ForEach(snapshot.folders) { folder in
-                            NavigationLink {
-                                AuthorFolderView(
-                                    author: info,
-                                    allAssets: assets,
-                                    root: snapshot.root,
-                                    relativePath: snapshot.basePath.isEmpty ? folder.name : "\(snapshot.basePath)/\(folder.name)"
-                                )
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "folder.fill").foregroundStyle(.tint)
-                                    Text(pmlDisplayName(folder.name))
-                                    Spacer()
-                                    Text("\(folder.count)").font(.caption).foregroundStyle(.secondary)
-                                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                        ForEach(folderEntries) { entry in
+                            if entry.isDirectory {
+                                NavigationLink {
+                                    DirectoryView(root: folderRoot, path: entry.path)
+                                } label: {
+                                    authorEntryRow(entry)
                                 }
-                                .padding(.vertical, 4)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        ForEach(snapshot.files) { asset in
-                            Button {
-                                Task { await open(asset) }
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: asset.mediaType == "video" ? "play.rectangle.fill" : "photo.fill")
-                                        .foregroundStyle(.secondary)
-                                    Text(asset.fileName).lineLimit(1)
-                                    Spacer()
+                                .buttonStyle(.plain)
+                            } else {
+                                Button {
+                                    Task { await open(entry) }
+                                } label: {
+                                    authorEntryRow(entry)
                                 }
-                                .padding(.vertical, 4)
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -636,6 +627,47 @@ struct AuthorProfileView: View {
         loading = false
     }
 
+    private func loadAuthorFolder() async {
+        guard let client = model.apiClient, let folderRoot, !folderPath.isEmpty else { return }
+        folderLoading = true
+        do {
+            let page = try await client.remoteChildren(rootId: folderRoot.id, path: folderPath, sort: "name")
+            folderEntries = page.items
+        } catch {
+            if !pmlIsCancellation(error) {
+                errorText = error.localizedDescription
+            }
+        }
+        folderLoading = false
+    }
+
+    private func open(_ entry: RemoteBrowserEntry) async {
+        guard let assetId = entry.assetId,
+              let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else { return }
+        preview = PreviewItem(
+            url: source.url,
+            isVideo: entry.isVideo,
+            assetId: assetId,
+            title: entry.name,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: entry.path
+        )
+    }
+
+    private func authorEntryRow(_ entry: RemoteBrowserEntry) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: entry.isDirectory ? "folder.fill" : (entry.isVideo ? "play.rectangle.fill" : "photo.fill"))
+                .foregroundStyle(entry.isDirectory ? Color.accentColor : Color.secondary)
+            Text(pmlDisplayName(entry.name)).lineLimit(1)
+            Spacer()
+            if entry.isDirectory {
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+    }
     private func open(_ asset: LibraryAsset) async {
         guard let source = await model.playbackSource(assetId: asset.id, remotePath: asset.remotePath) else { return }
         preview = PreviewItem(

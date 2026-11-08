@@ -561,6 +561,12 @@ struct DirectoryView: View {
             )
             entries = page.items
             nextCursor = page.nextCursor
+            if force {
+                for id in page.items.compactMap({ $0.assetId ?? $0.coverAssetId }) {
+                    thumbs.forget(assetId: id)
+                }
+            }
+            prefetchThumbnails(page.items)
             if !force && entries.isEmpty && nextCursor == nil && !autoRefreshed {
                 autoRefreshed = true
                 let fresh = try await client.remoteChildren(
@@ -592,6 +598,12 @@ struct DirectoryView: View {
     }
 
     @MainActor
+    private func prefetchThumbnails(_ items: [RemoteBrowserEntry]) {
+        let ids = items.prefix(24).compactMap { $0.assetId ?? $0.coverAssetId }
+        guard !ids.isEmpty else { return }
+        thumbs.prefetch(assetIds: Array(ids), client: model.apiClient)
+    }
+
     private func loadMore(cursor: String) async {
         guard let client = model.apiClient, !loadingMore else { return }
         loadingMore = true
@@ -604,6 +616,7 @@ struct DirectoryView: View {
             )
             entries.append(contentsOf: page.items)
             nextCursor = page.nextCursor
+            prefetchThumbnails(page.items)
         } catch {
             if !pmlIsCancellation(error) {
                 errorText = error.localizedDescription

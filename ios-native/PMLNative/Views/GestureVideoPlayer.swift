@@ -3,6 +3,8 @@ import AVKit
 import SwiftUI
 import UIKit
 
+private let pmlAVURLAssetHTTPHeaderFieldsKey = "AVURLAssetHTTPHeaderFieldsKey"
+
 struct VideoPlaylistItem: Identifiable {
     let id: String
     let title: String
@@ -622,7 +624,7 @@ struct GestureVideoPlayerSheet: View {
             url = fallback
             accelLabel = "服务器中转"
         }
-        player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        player.replaceCurrentItem(with: makePlayerItem(url))
         if await waitUntilReady(timeout: 8) {
             requestSeek(to: target, resume: true, debounce: false)
         }
@@ -638,7 +640,7 @@ struct GestureVideoPlayerSheet: View {
                 return
             }
             let target = currentTime
-            player.replaceCurrentItem(with: AVPlayerItem(url: currentURL))
+            player.replaceCurrentItem(with: makePlayerItem(currentURL))
             if await waitUntilReady() {
                 requestSeek(to: target, resume: true, debounce: false)
             }
@@ -651,8 +653,15 @@ struct GestureVideoPlayerSheet: View {
         try? session.setActive(true)
     }
 
+    private func makePlayerItem(_ url: URL) -> AVPlayerItem {
+        let headers = model.playbackHeaders(for: url)
+        guard !headers.isEmpty else { return AVPlayerItem(url: url) }
+        let options: [String: Any] = [pmlAVURLAssetHTTPHeaderFieldsKey: headers]
+        let asset = AVURLAsset(url: url, options: options)
+        return AVPlayerItem(asset: asset)
+    }
     private func loadCurrent(trackResume: Bool) {
-        let item = AVPlayerItem(url: currentURL)
+        let item = makePlayerItem(currentURL)
         let isMOV = currentURL.pathExtension.lowercased() == "mov"
         item.preferredForwardBufferDuration = isMOV ? 6 : 2
         player.replaceCurrentItem(with: item)
@@ -1038,7 +1047,7 @@ struct GestureVideoPlayerSheet: View {
                         usedFallback = false
                         return
                     }
-                    player.replaceCurrentItem(with: AVPlayerItem(url: fallback))
+                    player.replaceCurrentItem(with: makePlayerItem(fallback))
                     accelLabel = "服务器中转"
                     poster = nil
                     if await waitUntilReady() {

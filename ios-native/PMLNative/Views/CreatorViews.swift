@@ -1,6 +1,60 @@
 import Foundation
 import SwiftUI
 
+/// 定位作者对应的真实目录：优先路径中与作者名匹配的层级，否则取作品公共父目录。
+func pmlResolveAuthorFolder(assets: [LibraryAsset], roots: [LibraryRoot], authorName: String) -> (root: LibraryRoot, path: String)? {
+    guard !assets.isEmpty else { return nil }
+    let cleanName = authorName
+        .replacingOccurrences(of: #"[\[\]【】()（）]"#, with: "", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    func clean(_ value: String) -> String {
+        value.replacingOccurrences(of: #"[\[\]【】()（）]"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+    func rootFor(_ asset: LibraryAsset) -> LibraryRoot? {
+        if let rootId = asset.rootId, let exact = roots.first(where: { $0.id == rootId }) {
+            return exact
+        }
+        return roots.first { asset.parentPath.hasPrefix($0.remotePath) }
+    }
+
+    if !cleanName.isEmpty {
+        for asset in assets {
+            guard let root = rootFor(asset) else { continue }
+            let segments = asset.parentPath.split(separator: "/").map(String.init)
+            for (index, segment) in segments.enumerated() {
+                let value = clean(segment)
+                guard !value.isEmpty else { continue }
+                if value.contains(cleanName) || cleanName.contains(value) {
+                    return (root, "/" + segments.prefix(index + 1).joined(separator: "/"))
+                }
+            }
+        }
+    }
+
+    guard let firstRoot = rootFor(assets[0]) else { return nil }
+    let parents = assets.map(\.parentPath).filter { !$0.isEmpty }
+    if !parents.isEmpty {
+        let split = parents.map { $0.split(separator: "/").map(String.init) }
+        var common = split[0]
+        for parts in split.dropFirst() {
+            var prefix: [String] = []
+            for (lhs, rhs) in zip(common, parts) where lhs == rhs {
+                prefix.append(lhs)
+            }
+            common = prefix
+        }
+        if !common.isEmpty {
+            return (firstRoot, "/" + common.joined(separator: "/"))
+        }
+        if let shallowest = parents.min(by: { $0.split(separator: "/").count < $1.split(separator: "/").count }) {
+            return (firstRoot, shallowest)
+        }
+    }
+    return (firstRoot, firstRoot.remotePath)
+}
 /// 分类/文件夹显示名：只保留最后一级，并去掉 “1-”/“1_”/“1.” 这类排序前缀。
 func pmlDisplayName(_ raw: String) -> String {
     let last = raw.split(separator: "/").last.map(String.init) ?? raw

@@ -38,32 +38,53 @@ final class ThumbnailService: ObservableObject {
 
     @Published private(set) var images: [String: UIImage] = [:]
     private var inFlight = Set<String>()
-    private var failed = Set<String>()
+    private var failedAt: [String: Date] = [:]
     private let gate = AsyncGate(limit: 4)
 
     func image(assetId: String, client: PMLAPIClient?) async -> UIImage? {
         if let image = images[assetId] { return image }
-        guard let client, !inFlight.contains(assetId), !failed.contains(assetId) else { return nil }
+        if let failed = failedAt[assetId], Date().timeIntervalSince(failed) < 30 { return nil }
+        guard let client, !inFlight.contains(assetId) else { return nil }
         inFlight.insert(assetId)
         await gate.acquire()
 
         let generated = await Self.generate(assetId: assetId, client: client)
+        let cancelled = Task.isCancelled
         inFlight.remove(assetId)
         await gate.release()
 
         if let generated {
             images[assetId] = generated
+            failedAt.removeValue(forKey: assetId)
             return generated
         }
-        failed.insert(assetId)
+        if !cancelled {
+            failedAt[assetId] = Date()
+        }
         return nil
+    }
+
+    /// 目录加载后并发预生成前 24 个封面；可见 cell 也会同时请求，共享 4 个并发槽。
+    func prefetch(assetIds: [String], client: PMLAPIClient?) {
+        guard let client else { return }
+        var seen = Set<String>()
+        let ids = assetIds.filter { seen.insert($0).inserted }
+        Task { @MainActor in
+            await withTaskGroup(of: Void.self) { group in
+                for id in ids.prefix(24) {
+                    if images[id] != nil { continue }
+                    group.addTask { @MainActor in
+                        _ = await self.image(assetId: id, client: client)
+                    }
+                }
+            }
+        }
     }
 
     func forget(assetId: String) {
         images.removeValue(forKey: assetId)
-        failed.remove(assetId)
+        failedAt.removeValue(forKey: assetId)
     }
-
     private static func generate(assetId: String, client: PMLAPIClient) async -> UIImage? {
         guard let input = try? await client.thumbnailInput(assetId: assetId) else { return nil }
 
