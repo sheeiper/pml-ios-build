@@ -233,7 +233,7 @@ struct AuthorsView: View {
                 Image(systemName: "folder.fill")
                     .font(.title3)
                     .foregroundStyle(.tint)
-                Text(category.name)
+                Text(pmlDisplayName(category.name))
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
@@ -284,7 +284,7 @@ struct AuthorsView: View {
             ZStack {
                 LinearGradient(colors: [.accentColor.opacity(0.85), .accentColor.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing)
                 Text(String(author.name.prefix(1)))
-                    .font(.headline)
+                    .font(.title2.weight(.bold))
                     .foregroundStyle(.white)
             }
         }
@@ -327,6 +327,7 @@ struct AuthorProfileView: View {
     @EnvironmentObject private var model: AppModel
     @State private var assets: [LibraryAsset] = []
     @State private var roots: [LibraryRoot] = []
+    @State private var snapshot: AuthorFolderSnapshot?
     @State private var loading = false
     @State private var errorText = ""
     @State private var preview: PreviewItem?
@@ -355,26 +356,41 @@ struct AuthorProfileView: View {
                     Text("暂无作品").foregroundStyle(.secondary)
                 }
 
-                if !roots.isEmpty {
+                if let snapshot {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("作品目录").font(.headline)
-                        ForEach(roots) { root in
+                        if snapshot.folders.isEmpty && snapshot.files.isEmpty {
+                            Text("无文件").foregroundStyle(.secondary)
+                        }
+                        ForEach(snapshot.folders) { folder in
                             NavigationLink {
-                                AuthorFolderView(author: info, allAssets: assets, root: root, relativePath: "")
+                                AuthorFolderView(
+                                    author: info,
+                                    allAssets: assets,
+                                    root: snapshot.root,
+                                    relativePath: snapshot.basePath.isEmpty ? folder.name : "\(snapshot.basePath)/\(folder.name)"
+                                )
                             } label: {
                                 HStack(spacing: 12) {
-                                    Image(systemName: root.symbol).foregroundStyle(.tint)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text((root.remotePath as NSString).lastPathComponent)
-                                        Text(root.remotePath)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
+                                    Image(systemName: "folder.fill").foregroundStyle(.tint)
+                                    Text(pmlDisplayName(folder.name))
                                     Spacer()
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption)
-                                        .foregroundStyle(.tertiary)
+                                    Text("\(folder.count)").font(.caption).foregroundStyle(.secondary)
+                                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                                }
+                                .padding(.vertical, 4)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        ForEach(snapshot.files) { asset in
+                            Button {
+                                Task { await open(asset) }
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: asset.mediaType == "video" ? "play.rectangle.fill" : "photo.fill")
+                                        .foregroundStyle(.secondary)
+                                    Text(asset.fileName).lineLimit(1)
+                                    Spacer()
                                 }
                                 .padding(.vertical, 4)
                             }
@@ -452,7 +468,7 @@ struct AuthorProfileView: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
-                    .frame(height: 110)
+                    .frame(height: 140)
                     .frame(maxWidth: .infinity)
                     .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -464,7 +480,7 @@ struct AuthorProfileView: View {
                     .clipShape(Circle())
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(info.name).font(.headline)
+                    Text(info.name).font(.title2.weight(.bold))
                     if !info.aliases.isEmpty {
                         Text(info.aliases.joined(separator: " / "))
                             .font(.footnote)

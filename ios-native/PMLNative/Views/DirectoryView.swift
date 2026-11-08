@@ -26,7 +26,7 @@ struct DirectoryView: View {
 
     @State private var entries: [RemoteBrowserEntry] = []
     @State private var nextCursor: String?
-    @State private var loading = false
+    @State private var loading = true
     @State private var loadingMore = false
     @State private var errorText = ""
     @State private var noticeText = ""

@@ -1,6 +1,81 @@
 import Foundation
 import SwiftUI
 
+/// 分类/文件夹显示名：只保留最后一级，并去掉 “1-”/“1_”/“1.” 这类排序前缀。
+func pmlDisplayName(_ raw: String) -> String {
+    let last = raw.split(separator: "/").last.map(String.init) ?? raw
+    let cleaned = last.replacingOccurrences(
+        of: #"^\s*\d+\s*[-_.、]\s*"#,
+        with: "",
+        options: .regularExpression
+    )
+    return cleaned.isEmpty ? last : cleaned
+}
+
+struct AuthorFolderItem: Identifiable {
+    let id: String
+    let name: String
+    let count: Int
+}
+
+struct AuthorFolderSnapshot {
+    let root: LibraryRoot
+    let basePath: String
+    let folders: [AuthorFolderItem]
+    let files: [LibraryAsset]
+}
+
+/// 选择作者作品最多的根目录，并取这些作品的公共父目录，直接展示该层内容。
+func pmlAuthorSnapshot(assets: [LibraryAsset], roots: [LibraryRoot]) -> AuthorFolderSnapshot? {
+    let grouped = Dictionary(grouping: assets, by: { $0.rootId })
+    guard let primary = grouped.max(by: { $0.value.count < $1.value.count }),
+          let root = roots.first(where: { $0.id == primary.key }) else { return nil }
+
+    let basePrefix = root.remotePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    func components(_ asset: LibraryAsset) -> [String]? {
+        let full = asset.remotePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard full.hasPrefix(basePrefix) else { return nil }
+        let rel = String(full.dropFirst(basePrefix.count))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return rel.split(separator: "/").map(String.init)
+    }
+
+    var common: [String]? = nil
+    for asset in primary.value {
+        guard let parts = components(asset), parts.count > 1 else { continue }
+        let dirs = Array(parts.dropLast())
+        if common == nil {
+            common = dirs
+        } else if var current = common {
+            var prefix: [String] = []
+            for (lhs, rhs) in zip(current, dirs) where lhs == rhs {
+                prefix.append(lhs)
+            }
+            current = prefix
+            common = current
+        }
+    }
+    let base = common ?? []
+    let basePath = base.joined(separator: "/")
+
+    var folderCounts: [String: Int] = [:]
+    var files: [LibraryAsset] = []
+    for asset in primary.value {
+        guard let parts = components(asset) else { continue }
+        let remainder = Array(parts.dropFirst(base.count))
+        if remainder.count >= 2 {
+            folderCounts[remainder[0], default: 0] += 1
+        } else if remainder.count == 1 {
+            files.append(asset)
+        }
+    }
+    let folders = folderCounts.map {
+        AuthorFolderItem(id: "\(root.id)|\(basePath)|\($0.key)", name: $0.key, count: $0.value)
+    }
+    .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+    return AuthorFolderSnapshot(root: root, basePath: basePath, folders: folders, files: files)
+}
 /// 单个分类页：子分类递归进入，作者列表在下方；系统返回键自动回到上一级。
 struct CreatorCategoryView: View {
     let category: LibraryCategory?
@@ -41,7 +116,7 @@ struct CreatorCategoryView: View {
                             HStack(spacing: 12) {
                                 Image(systemName: "folder.fill").foregroundStyle(.tint)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(child.name)
+                                    Text(pmlDisplayName(child.name))
                                     Text("\(child.authorCount) 位创作者 · \(child.mediaCount) 项")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
@@ -83,7 +158,7 @@ struct CreatorCategoryView: View {
                 Text(errorText).font(.footnote).foregroundStyle(.red)
             }
         }
-        .navigationTitle(category?.name ?? "全部创作者")
+        .navigationTitle(pmlDisplayName(category?.name ?? "全部创作者"))
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索创作者")
         .toolbar {
@@ -183,7 +258,7 @@ struct AuthorFolderView: View {
                         } label: {
                             HStack(spacing: 12) {
                                 Image(systemName: "folder.fill").foregroundStyle(.tint)
-                                Text(folder.name)
+                                Text(pmlDisplayName(folder.name))
                                 Spacer()
                                 Text("\(folder.count)").font(.caption).foregroundStyle(.secondary)
                             }
@@ -212,7 +287,7 @@ struct AuthorFolderView: View {
                 Text(errorText).font(.footnote).foregroundStyle(.red)
             }
         }
-        .navigationTitle(currentPrefix.isEmpty ? root.kindLabel : String(currentPrefix.split(separator: "/").last ?? ""))
+        .navigationTitle(currentPrefix.isEmpty ? root.kindLabel : pmlDisplayName(String(currentPrefix.split(separator: "/").last ?? "")))
         .navigationBarTitleDisplayMode(.inline)
         .fullScreenCover(item: $preview) { item in
             if item.isVideo {

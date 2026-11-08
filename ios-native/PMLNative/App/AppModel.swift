@@ -108,7 +108,12 @@ final class AppModel: ObservableObject {
     /// 服务器模式：优先 AList `/d` 直连；失败回退服务器 `/media`。
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         if settings.mode == .server {
-            // 先返回直链：不阻塞打开播放器；兜底地址在失败时再取。
+            // MOV/QuickTime 的 moov 常在文件尾，直链 Range 容易卡顿：优先服务器中转。
+            if let remotePath, remotePath.lowercased().hasSuffix(".mov"),
+               let fallback = await serverMediaURL(assetId: assetId) {
+                return PlaybackSource(url: fallback, fallbackURL: alistDirectURL(remotePath: remotePath), label: "服务器中转")
+            }
+            // 其他格式先返回直链：不阻塞打开播放器；兜底地址在失败时再取。
             if let remotePath, let direct = alistDirectURL(remotePath: remotePath) {
                 return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
             }
@@ -124,7 +129,6 @@ final class AppModel: ObservableObject {
         }
         return PlaybackSource(url: url, fallbackURL: nil, label: nil)
     }
-
     /// 播放失败时再取服务器中转地址（不阻塞首帧）。
     func fallbackMediaURL(assetId: String?) async -> URL? {
         guard let assetId, let client = apiClient else { return nil }

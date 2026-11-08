@@ -533,7 +533,7 @@ struct GestureVideoPlayerSheet: View {
         guard let client = model.apiClient else { return }
         guard let siblings = try? await client.listSiblingVideos(assetId: assetId), !siblings.isEmpty else { return }
         let items = siblings.map {
-            VideoPlaylistItem(id: $0.id, title: $0.title, assetId: $0.id)
+            VideoPlaylistItem(id: $0.id, title: $0.title, assetId: $0.id, remotePath: $0.remotePath)
         }
         playlist = items
         currentIndex = items.firstIndex(where: { $0.assetId == assetId })
@@ -653,7 +653,8 @@ struct GestureVideoPlayerSheet: View {
 
     private func loadCurrent(trackResume: Bool) {
         let item = AVPlayerItem(url: currentURL)
-        item.preferredForwardBufferDuration = 2
+'        let isMOV = currentURL.pathExtension.lowercased() == "mov"
+        item.preferredForwardBufferDuration = isMOV ? 6 : 2'
         player.replaceCurrentItem(with: item)
         player.automaticallyWaitsToMinimizeStalling = true
         poster = currentAssetId.flatMap { thumbService.images[$0] }

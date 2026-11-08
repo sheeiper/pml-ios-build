@@ -13284,7 +13284,7 @@ pub fn list_sibling_videos(app: AppHandle, asset_id: String) -> Result<Vec<Sibli
     }
     let mut statement = connection
         .prepare(
-            "SELECT id, file_name FROM assets
+            "SELECT id, file_name, remote_path FROM assets
              WHERE root_id = ?1 AND parent_path = ?2 AND media_type = 'video' AND missing = 0
              ORDER BY file_name ASC",
         )
