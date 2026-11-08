@@ -131,9 +131,9 @@ struct AuthorFolderView: View {
     @State private var errorText = ""
 
     private struct Folder: Identifiable {
+        let id: String
         let name: String
         let count: Int
-        var id: String { "\(root.id)|\(relativePath)|\(name)" }
     }
 
     private var currentPrefix: String {
@@ -149,8 +149,10 @@ struct AuthorFolderView: View {
                 counts[name, default: 0] += 1
             }
         }
-        return counts.map { Folder(name: $0.key, count: $0.value) }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return counts.map { key, value in
+            Folder(id: "\(root.id)|\(currentPrefix)|\(key)", name: key, count: value)
+        }
+        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     private var files: [LibraryAsset] {
