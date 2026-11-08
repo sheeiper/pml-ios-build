@@ -75,10 +75,13 @@ extension PMLAPIClient {
 
     // MARK: - 短视频
 
-    func shortVideoFeed(cursor: String? = nil, limit: Int = 12, authorId: String? = nil) async throws -> ShortVideoFeedPage {
+    func shortVideoFeed(cursor: String? = nil, limit: Int = 12, authorId: String? = nil, maxDurationSeconds: Int? = nil) async throws -> ShortVideoFeedPage {
         var arguments: [String: Any] = ["limit": limit]
         if let cursor { arguments["cursor"] = cursor }
         if let authorId, !authorId.isEmpty { arguments["authorId"] = authorId }
+        if let maxDurationSeconds, maxDurationSeconds > 0 {
+            arguments["maxDurationSeconds"] = maxDurationSeconds
+        }
         return try await command("list_short_video_feed", arguments: arguments)
     }
 
