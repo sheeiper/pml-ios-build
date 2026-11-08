@@ -59,6 +59,10 @@ struct GestureVideoPlayerSheet: View {
     @State private var isBuffering = false
     @State private var didReachEnd = false
     @State private var seekGeneration = 0
+    @State private var seekTask: Task<Void, Never>?
+    @State private var seekRequestID = 0
+    @State private var seekWatchdog: Task<Void, Never>?
+    @State private var isRecovering = false
     @State private var stallRecoveryTask: Task<Void, Never>?
     @State private var subtitleTracks: [SubtitleTrack] = []
     @State private var subtitleCues: [SubtitleCue] = []
