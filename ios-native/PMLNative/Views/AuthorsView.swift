@@ -617,6 +617,11 @@ struct AuthorProfileView: View {
             async let rootsTask = client.libraryRoots()
             assets = try await assetsTask
             roots = (try? await rootsTask) ?? []
+            if let resolved = pmlResolveAuthorFolder(assets: assets, roots: roots, authorName: info.name) {
+                folderRoot = resolved.root
+                folderPath = resolved.path
+                await loadAuthorFolder()
+            }
             if let authors = try? await client.libraryAuthors(filter: "all"),
                let latest = authors.first(where: { $0.id == author.id }) {
                 displayAuthor = latest
