@@ -523,7 +523,7 @@ struct ShortVideosView: View {
               saved > 2 else { return }
         try? await Task.sleep(nanoseconds: 350_000_000)
         guard currentID == assetId else { return }
-        player.seek(
+        _ = await player.seek(
             to: CMTime(seconds: Double(saved), preferredTimescale: 600),
             toleranceBefore: .init(seconds: 0.5, preferredTimescale: 600),
             toleranceAfter: .init(seconds: 0.5, preferredTimescale: 600)
