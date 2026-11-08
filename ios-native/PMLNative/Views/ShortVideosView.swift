@@ -244,6 +244,15 @@ struct ShortVideosView: View {
                     Label("作者主页", systemImage: "person.crop.circle")
                 }
                 .disabled(currentAsset?.authorId == nil)
+                if let id = currentAsset?.authorId, let name = currentAsset?.authorName {
+                    Button {
+                        authorFilterId = id
+                        authorFilterName = name
+                        Task { await resetAndReload() }
+                    } label: {
+                        Label("只看作者：\(name)", systemImage: "person.crop.circle.badge.checkmark")
+                    }
+                }
                 Button { Task { await openDirectory() } } label: {
                     Label("所在目录", systemImage: "folder")
                 }
