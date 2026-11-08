@@ -551,7 +551,7 @@ struct GestureVideoPlayerSheet: View {
         return player.currentItem?.status == .readyToPlay
     }
 
-'    /// 所有 seek 统一入口：120ms 内合并，只让最后一个请求执行，避免滑块/双击/横滑并发。
+    /// 所有 seek 统一入口：120ms 内合并，只让最后一个请求执行，避免滑块/双击/横滑并发。
     private func requestSeek(to seconds: Double, resume: Bool, debounce: Bool = true) {
         seekRequestID += 1
         let request = seekRequestID
@@ -624,7 +624,7 @@ struct GestureVideoPlayerSheet: View {
         }
     }
 
-'    private func recoverFromStall() {
+    private func recoverFromStall() {
         guard stallRecoveryTask == nil else { return }
         stallRecoveryTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 7_000_000_000)
