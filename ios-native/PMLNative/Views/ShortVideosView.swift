@@ -89,40 +89,8 @@ struct ShortVideosView: View {
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
                         ForEach(items) { item in
-                            ShortVideoSlide(
-                                item: item,
-                                player: player,
-                                isCurrent: item.id == currentID,
-                                isPlaying: isPlaying && item.id == currentID,
-                                poster: covers.images[item.thumbnailAssetId ?? item.id],
-                                isBuffering: isBuffering && item.id == currentID,
-                                onSingleTap: { togglePlayback() },
-                                onDoubleTap: { pauseOrResume() },
-                                onLongPress: { pressing in
-                                    guard item.id == currentID else { return }
-                                    if pressing {
-                                        isLongPressing = true
-                                        player.rate = 2
-                                        showHUD("2x")
-                                    } else if isLongPressing {
-                                        isLongPressing = false
-                                        player.rate = 1
-                                        hudIcon = nil
-                                    }
-                                },
-                                onSeek: { delta in
-                                    guard item.id == currentID, duration > 0 else { return }
-                                    let target = min(max(0, progress + delta), duration)
-                                    player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .init(seconds: 0.4, preferredTimescale: 600), toleranceAfter: .init(seconds: 0.4, preferredTimescale: 600))
-                                    progress = target
-                                    showHUD(delta > 0 ? "goforward.5" : "gobackward.5")
-                                }
-                            )
-                            .frame(width: geo.size.width, height: geo.size.height)
-                            .id(item.id)
-                            .clipped()
+                            slide(item: item, size: geo.size)
                         }
-
                         if loadingMore {
                             ProgressView().tint(.white).padding(24)
                         }
@@ -190,6 +158,44 @@ struct ShortVideosView: View {
         .preferredColorScheme(.dark)
     }
 
+    private func slide(item: LibraryAsset, size: CGSize) -> some View {
+        ShortVideoSlide(
+            item: item,
+            player: player,
+            isCurrent: item.id == currentID,
+            isPlaying: isPlaying && item.id == currentID,
+            poster: covers.images[item.thumbnailAssetId ?? item.id],
+            isBuffering: isBuffering && item.id == currentID,
+            onSingleTap: { togglePlayback() },
+            onDoubleTap: { pauseOrResume() },
+            onLongPress: { pressing in
+                guard item.id == currentID else { return }
+                if pressing {
+                    isLongPressing = true
+                    player.rate = 2
+                    showHUD("2x")
+                } else if isLongPressing {
+                    isLongPressing = false
+                    player.rate = 1
+                    hudIcon = nil
+                }
+            },
+            onSeek: { delta in
+                guard item.id == currentID, duration > 0 else { return }
+                let target = min(max(0, progress + delta), duration)
+                player.seek(
+                    to: CMTime(seconds: target, preferredTimescale: 600),
+                    toleranceBefore: .init(seconds: 0.4, preferredTimescale: 600),
+                    toleranceAfter: .init(seconds: 0.4, preferredTimescale: 600)
+                )
+                progress = target
+                showHUD(delta > 0 ? "goforward.5" : "gobackward.5")
+            }
+        )
+        .frame(width: size.width, height: size.height)
+        .id(item.id)
+        .clipped()
+    }
     // MARK: - 顶部 / 右侧 / 底部
 
     private var topBar: some View {
