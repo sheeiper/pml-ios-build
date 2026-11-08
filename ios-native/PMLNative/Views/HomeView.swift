@@ -4,6 +4,7 @@ import UIKit
 /// 首页：资料库概览、最近新增、扫描入口。
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var overview: LibraryOverview?
     @State private var recent: [LibraryAsset] = []
@@ -66,7 +67,13 @@ struct HomeView: View {
                     }
                 }
             }
-            .task { await refresh() }
+'            .task { await refresh() }
+            .onChange(of: scenePhase) { _, phase in
+                guard phase == .active else { return }
+                if errorText.lowercased().contains("cancel") || overview == nil {
+                    Task { await refresh() }
+                }
+            }'
             .refreshable { await refresh() }
             .fullScreenCover(item: $preview) { item in
                 if item.isVideo {

@@ -331,6 +331,9 @@ struct AuthorProfileView: View {
     @State private var folderPath = ""
     @State private var folderEntries: [RemoteBrowserEntry] = []
     @State private var folderLoading = false
+    @State private var layout: BrowseLayout = .list
+    @State private var sort: BrowseSort = .name
+    @ObservedObject private var covers = ThumbnailService.shared
     @State private var loading = false
     @State private var errorText = ""
     @State private var preview: PreviewItem?
@@ -366,25 +369,46 @@ struct AuthorProfileView: View {
                     }
                     .padding(.vertical, 8)
                 } else if let folderRoot {
-                    VStack(alignment: .leading, spacing: 2) {
-                        if folderEntries.isEmpty {
-                            Text("无文件").foregroundStyle(.secondary)
+                    if folderEntries.isEmpty {
+                        Text("无文件").foregroundStyle(.secondary)
+                    } else if layout == .list {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(folderEntries) { entry in
+                                if entry.isDirectory {
+                                    NavigationLink {
+                                        DirectoryView(root: folderRoot, path: entry.path)
+                                    } label: {
+                                        authorEntryRow(entry)
+                                    }
+                                    .buttonStyle(.plain)
+                                } else {
+                                    Button {
+                                        Task { await open(entry) }
+                                    } label: {
+                                        authorEntryRow(entry)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
                         }
-                        ForEach(folderEntries) { entry in
-                            if entry.isDirectory {
-                                NavigationLink {
-                                    DirectoryView(root: folderRoot, path: entry.path)
-                                } label: {
-                                    authorEntryRow(entry)
+                    } else {
+                        LazyVGrid(columns: authorColumns, spacing: 6) {
+                            ForEach(folderEntries) { entry in
+                                if entry.isDirectory {
+                                    NavigationLink {
+                                        DirectoryView(root: folderRoot, path: entry.path)
+                                    } label: {
+                                        authorEntryCell(entry)
+                                    }
+                                    .buttonStyle(.plain)
+                                } else {
+                                    Button {
+                                        Task { await open(entry) }
+                                    } label: {
+                                        authorEntryCell(entry)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
-                            } else {
-                                Button {
-                                    Task { await open(entry) }
-                                } label: {
-                                    authorEntryRow(entry)
-                                }
-                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -418,7 +442,28 @@ struct AuthorProfileView: View {
                 }
             }
         }
-        .photosPicker(isPresented: $showAvatarPicker, selection: $avatarItem, matching: .images)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Picker("视图", selection: $layout) {
+                        ForEach(BrowseLayout.allCases) { item in
+                            Label(item.title, systemImage: item.symbol).tag(item)
+                        }
+                    }
+                    Divider()
+                    Picker("排序", selection: $sort) {
+                        ForEach(BrowseSort.allCases) { item in
+                            Text(item.title).tag(item)
+                        }
+                    }
+                } label: {
+                    Image(systemName: layout.symbol)
+                }
+            }
+        }
+        .onChange(of: sort) { _, _ in
+            Task { await loadAuthorFolder() }
+        }        .photosPicker(isPresented: $showAvatarPicker, selection: $avatarItem, matching: .images)
         .photosPicker(isPresented: $showBannerPicker, selection: $bannerItem, matching: .images)
         .onChange(of: avatarItem) { _, item in
             guard let item else { return }
@@ -636,7 +681,7 @@ struct AuthorProfileView: View {
         guard let client = model.apiClient, let folderRoot, !folderPath.isEmpty else { return }
         folderLoading = true
         do {
-            let page = try await client.remoteChildren(rootId: folderRoot.id, path: folderPath, sort: "name")
+            let page = try await client.remoteChildren(rootId: folderRoot.id, path: folderPath, sort: sort.rawValue)
             folderEntries = page.items
         } catch {
             if !pmlIsCancellation(error) {
@@ -658,6 +703,44 @@ struct AuthorProfileView: View {
             sourceLabel: source.label,
             remotePath: entry.path
         )
+    }
+
+    private var authorColumns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: 6), count: layout == .grid ? 3 : 2)
+    }
+
+    private func authorEntryCell(_ entry: RemoteBrowserEntry) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Color.clear
+                .aspectRatio(layout == .wall ? 1 : 0.8, contentMode: .fit)
+                .overlay {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(.quaternary.opacity(0.3))
+                        if let id = entry.assetId ?? entry.coverAssetId, let image = covers.images[id] {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFill()
+                        } else {
+                            Image(systemName: entry.isDirectory ? "folder.fill" : (entry.isVideo ? "play.rectangle.fill" : "photo.fill"))
+                                .font(.title3)
+                                .foregroundStyle(entry.isDirectory ? Color.accentColor : Color.secondary)
+                        }
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            Text(pmlDisplayName(entry.name))
+                .font(.caption2)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .task {
+            if let id = entry.assetId ?? entry.coverAssetId {
+                await covers.image(assetId: id, client: model.apiClient)
+            }
+        }
     }
 
     private func authorEntryRow(_ entry: RemoteBrowserEntry) -> some View {
