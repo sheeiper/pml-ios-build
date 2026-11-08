@@ -2,6 +2,7 @@ import Foundation
 
 struct SiblingVideo: Decodable {
     let id: String
+    let remotePath: String?
     let title: String
 }
 
