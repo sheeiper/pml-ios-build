@@ -653,8 +653,8 @@ struct GestureVideoPlayerSheet: View {
 
     private func loadCurrent(trackResume: Bool) {
         let item = AVPlayerItem(url: currentURL)
-'        let isMOV = currentURL.pathExtension.lowercased() == "mov"
-        item.preferredForwardBufferDuration = isMOV ? 6 : 2'
+        let isMOV = currentURL.pathExtension.lowercased() == "mov"
+        item.preferredForwardBufferDuration = isMOV ? 6 : 2
         player.replaceCurrentItem(with: item)
         player.automaticallyWaitsToMinimizeStalling = true
         poster = currentAssetId.flatMap { thumbService.images[$0] }
