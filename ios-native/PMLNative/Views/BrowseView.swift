@@ -8,6 +8,8 @@ struct BrowseView: View {
     @State private var roots: [LibraryRoot] = []
     @State private var config: DirectoryConfigPayload?
     @State private var loading = false
+    @State private var checking = false
+    @State private var notice = ""
     @State private var errorText = ""
 
     var body: some View {
@@ -78,6 +80,12 @@ struct BrowseView: View {
                     }
                 }
 
+                if !notice.isEmpty {
+                    Section {
+                        Text(notice).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
                 if !errorText.isEmpty {
                     Section {
                         Text(errorText).font(.footnote).foregroundStyle(.red)
@@ -86,7 +94,22 @@ struct BrowseView: View {
             }
             .navigationTitle("浏览")
             .task { await refresh() }
-            .refreshable { await refresh() }
+            .refreshable { await refreshAndCheckProvider() }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        Task { await refreshAndCheckProvider() }
+                    } label: {
+                        if checking {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(checking)
+                    .accessibilityLabel("检查 CD2 更新")
+                }
+            }
         }
     }
 
@@ -122,6 +145,21 @@ struct BrowseView: View {
             .first
             ?? roots.first(where: { $0.kind == "media" })
             ?? roots.first
+    }
+
+    /// Single refresh path: provider check first, then authoritative reads.
+    private func refreshAndCheckProvider() async {
+        guard let client = model.apiClient, !checking else { return }
+        checking = true
+        errorText = ""
+        do {
+            let outcomes = try await client.checkDomainRootsForUpdates()
+            await refresh()
+            notice = outcomes.refreshNotice
+        } catch {
+            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
+        }
+        checking = false
     }
 
     private func refresh() async {

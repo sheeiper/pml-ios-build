@@ -8,6 +8,7 @@ struct FourDomainHomeView: View {
     @State private var loading = false
     @State private var errorText = ""
     @State private var scanning: String?
+    @State private var checking = false
     @State private var cleanMessage = ""
 
     var body: some View {
@@ -51,18 +52,31 @@ struct FourDomainHomeView: View {
                         Button("重试") { Task { await load() } }
                     }
                 }
+
+                if !cleanMessage.isEmpty {
+                    Section {
+                        Text(cleanMessage)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
             .navigationTitle("媒体库")
-            .refreshable { await load() }
+            .refreshable { await refreshAndCheckProvider() }
             .task { await load() }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        Task { await load() }
+                        Task { await refreshAndCheckProvider() }
                     } label: {
-                        Image(systemName: "arrow.clockwise")
+                        if checking {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
                     }
-                    .disabled(loading)
+                    .disabled(checking)
+                    .accessibilityLabel("检查 CD2 更新")
                 }
             }
         }
@@ -107,6 +121,21 @@ struct FourDomainHomeView: View {
             if !pmlIsCancellation(error) { errorText = error.localizedDescription }
         }
         loading = false
+    }
+
+    /// Shared refresh path for pull-to-refresh and the toolbar button.
+    private func refreshAndCheckProvider() async {
+        guard let client = model.apiClient, !checking else { return }
+        checking = true
+        cleanMessage = "正在检查 CD2…"
+        do {
+            let outcomes = try await client.checkDomainRootsForUpdates()
+            cleanMessage = outcomes.refreshNotice
+            await load()
+        } catch {
+            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
+        }
+        checking = false
     }
 
     private func scan(_ domain: String) async {

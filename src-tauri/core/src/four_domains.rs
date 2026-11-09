@@ -1946,9 +1946,13 @@ pub async fn compat_remote_children(
     let connection = open_v2(&app)?;
     let has_snapshot = has_directory_snapshot(&connection, &domain, root_id, &scan_path)?;
     drop(connection);
-    if refresh || !has_snapshot {
-        refresh_domain_path(app.clone(), state, &domain, &scan_path).await?;
-    }
+    // A provider success is the only source of these counters; a cached read
+    // must not claim to have checked CD2.
+    let refresh_summary = if refresh || !has_snapshot {
+        Some(refresh_domain_path(app.clone(), state, &domain, &scan_path).await?)
+    } else {
+        None
+    };
 
     let mut entries = children(&app, &domain, Some(&scan_path))?;
     let sort_key = sort.to_owned();
@@ -2029,10 +2033,20 @@ pub async fn compat_remote_children(
             "progressSeconds": legacy_browse_progress(progress),
         }));
     }
+    let from_cache = refresh_summary.is_none();
+    let sync_summary = refresh_summary.map(|summary| {
+        serde_json::json!({
+            "total": summary.scanned,
+            "added": summary.added,
+            "updated": summary.updated,
+            "removed": summary.deleted,
+        })
+    });
     Ok(serde_json::json!({
         "items": items,
         "nextCursor": null,
-        "fromLocalCache": false,
+        "fromLocalCache": from_cache,
+        "syncSummary": sync_summary,
     }))
 }
 

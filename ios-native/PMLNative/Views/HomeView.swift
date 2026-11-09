@@ -16,6 +16,7 @@ struct HomeView: View {
     @State private var errorText = ""
     @State private var scanMessage = ""
     @State private var scanning = false
+    @State private var checking = false
     @State private var preview: PreviewItem?
     @State private var archiveComic: ComicArchiveTarget?
     @State private var folderComic: ComicFolderTarget?
@@ -47,6 +48,19 @@ struct HomeView: View {
             }
             .navigationTitle("首页")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        Task { await refreshAndCheckProvider() }
+                    } label: {
+                        if checking {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(checking)
+                    .accessibilityLabel("检查 CD2 更新")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 16) {
                         NavigationLink {
@@ -74,7 +88,7 @@ struct HomeView: View {
                     Task { await refresh() }
                 }
             }
-            .refreshable { await refresh() }
+            .refreshable { await refreshAndCheckProvider() }
             .fullScreenCover(item: $preview) { item in
                 if item.isVideo {
                     GestureVideoPlayerSheet(
@@ -316,6 +330,22 @@ struct HomeView: View {
             root: root,
             path: asset.parentPath.isEmpty ? root.remotePath : asset.parentPath
         )
+    }
+
+    /// Pull-to-refresh and the toolbar button share this single path: it checks
+    /// the provider first, then reloads the cached overview.
+    private func refreshAndCheckProvider() async {
+        guard let client = model.apiClient, !checking else { return }
+        checking = true
+        scanMessage = ""
+        do {
+            let outcomes = try await client.checkDomainRootsForUpdates()
+            scanMessage = outcomes.refreshNotice
+            await refresh()
+        } catch {
+            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
+        }
+        checking = false
     }
 
     private func refresh(retryOnCancel: Bool = true) async {
