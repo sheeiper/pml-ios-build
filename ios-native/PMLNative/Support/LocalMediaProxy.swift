@@ -145,7 +145,7 @@ final class LocalMediaProxy: NSObject {
         }
         let transfer = ProxyTransfer(
             connection: connection,
-            stream: stream,
+            stream: box(for: stream),
             method: method,
             range: range,
             ifRange: ifRange
