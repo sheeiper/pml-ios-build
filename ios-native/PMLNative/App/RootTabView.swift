@@ -20,7 +20,7 @@ struct RootTabView: View {
                 .tabItem { Label("首页", systemImage: "house.fill") }
                 .tag(AppTab.home)
 
-            FourDomainHomeView()
+            BrowseView()
                 .tabItem { Label("浏览", systemImage: "folder.fill") }
                 .tag(AppTab.browse)
 
