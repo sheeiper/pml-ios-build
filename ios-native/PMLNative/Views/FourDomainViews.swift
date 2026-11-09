@@ -94,10 +94,9 @@ struct FourDomainHomeView: View {
         case "pending":
             PendingProjectsView()
         default:
-            DomainAssetListView(
+            DomainBrowserView(
                 domain: domain,
-                title: domainTitle(domain),
-                allowsSearch: domain == "vault"
+                title: domainTitle(domain)
             )
         }
     }
@@ -193,6 +192,186 @@ private struct DomainSummaryRow: View {
             Spacer()
         }
         .padding(.vertical, 4)
+    }
+}
+
+
+// MARK: - 域目录浏览
+
+struct DomainBrowserView: View {
+    let domain: String
+    let title: String
+    var path: String?
+
+    @EnvironmentObject private var model: AppModel
+    @State private var children: [DomainChild] = []
+    @State private var loading = false
+    @State private var errorText = ""
+    @State private var videoPreview: DomainPreview?
+    @State private var imagePreview: DomainImagePreview?
+    @State private var comicTarget: ComicArchiveTarget?
+
+    var body: some View {
+        List {
+            if !errorText.isEmpty {
+                Section {
+                    Text(errorText).font(.footnote).foregroundStyle(.red)
+                    Button("重试") { Task { await load() } }
+                }
+            }
+            if loading && children.isEmpty {
+                ProgressView().frame(maxWidth: .infinity)
+            }
+            ForEach(children) { child in
+                if child.isDirectory {
+                    NavigationLink {
+                        DomainBrowserView(
+                            domain: domain,
+                            title: child.name,
+                            path: child.path
+                        )
+                    } label: {
+                        DomainFolderRow(child: child)
+                    }
+                } else {
+                    Button {
+                        Task { await open(child) }
+                    } label: {
+                        DomainFileRow(child: child)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            if children.isEmpty && !loading && errorText.isEmpty {
+                ContentUnavailableView("空目录", systemImage: "folder")
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await load() }
+        .task { await load() }
+        .fullScreenCover(item: $videoPreview) { preview in
+            GestureVideoPlayerSheet(
+                url: preview.url,
+                title: preview.title,
+                assetId: preview.assetId,
+                fallbackURL: preview.fallbackURL,
+                sourceLabel: preview.sourceLabel
+            )
+            .environmentObject(model)
+        }
+        .fullScreenCover(item: $imagePreview) { preview in
+            AuthenticatedImageViewer(url: preview.url, title: preview.title)
+                .environmentObject(model)
+        }
+        .fullScreenCover(item: $comicTarget) { target in
+            ComicReaderView(target: target)
+                .environmentObject(model)
+        }
+    }
+
+    private func load() async {
+        guard let client = model.apiClient else {
+            errorText = "当前不是服务器模式"
+            return
+        }
+        loading = true
+        errorText = ""
+        do {
+            children = try await client.domainChildren(domain: domain, path: path)
+        } catch {
+            if !pmlIsCancellation(error) {
+                errorText = error.localizedDescription
+            }
+        }
+        loading = false
+    }
+
+    private func open(_ child: DomainChild) async {
+        guard let assetId = child.assetId else { return }
+        if child.isComic {
+            comicTarget = ComicArchiveTarget(id: assetId, title: child.name)
+            return
+        }
+        do {
+            guard let source = await model.playbackSource(assetId: assetId, remotePath: child.path) else {
+                errorText = "无法获取播放地址"
+                return
+            }
+            if child.isVideo {
+                videoPreview = DomainPreview(
+                    url: source.url,
+                    title: child.name,
+                    assetId: assetId,
+                    fallbackURL: source.fallbackURL,
+                    sourceLabel: source.label
+                )
+            } else if child.isImage {
+                imagePreview = DomainImagePreview(url: source.url, title: child.name)
+            }
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+}
+
+private struct DomainFolderRow: View {
+    let child: DomainChild
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.tint)
+                .frame(width: 44, height: 44)
+                .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(child.name).font(.subheadline.weight(.medium)).lineLimit(2)
+                Text("\(child.childCount) 个文件").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct DomainFileRow: View {
+    let child: DomainChild
+    @EnvironmentObject private var model: AppModel
+    @State private var image: UIImage?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Group {
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else {
+                    Image(systemName: child.isVideo ? "play.rectangle.fill" : child.isComic ? "book.closed.fill" : "photo.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 52, height: 52)
+            .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(child.name).font(.subheadline.weight(.medium)).lineLimit(2)
+                Text("\(child.mediaType ?? "file") · \(pmlFormatBytes(child.sizeBytes))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if child.isVideo {
+                Image(systemName: "play.circle.fill").font(.title3).foregroundStyle(.tint)
+            }
+        }
+        .padding(.vertical, 2)
+        .task(id: child.thumbnailAssetId ?? child.assetId) {
+            if let assetId = child.thumbnailAssetId ?? child.assetId {
+                image = await ThumbnailService.shared.image(assetId: assetId, client: model.apiClient)
+            }
+        }
     }
 }
 
