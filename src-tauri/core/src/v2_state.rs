@@ -123,7 +123,7 @@ pub(crate) fn set_progress(connection: &Connection, asset_id: &str, position: f6
            last_played_at=excluded.last_played_at,
            last_opened_at=excluded.last_opened_at,
            updated_at=excluded.updated_at",
-        params![asset_id, position.round().max(0.0) as i64, timestamp],
+        params![asset_id, position, timestamp],
     )?;
     Ok(())
 }
@@ -403,13 +403,13 @@ mod tests {
             "SELECT reading_page,favorite,progress_seconds,last_played_at,favorite_at FROM asset_state WHERE asset_id='comic'", [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         ).unwrap();
-        assert_eq!(state,(7,0,26.0,100,None));
+        assert_eq!(state,(7,0,25.6,100,None));
         assert!(toggle(&mut connection,"other",130).unwrap());
         assert!(!toggle(&mut connection,"other",140).unwrap());
         assert!(toggle(&mut connection,"invalid",150).is_err());
         assert_eq!(playback_progress(&connection,"absent").unwrap(),0.0);
         set_progress(&connection,"comic",f64::NAN,160).unwrap();
-        assert_eq!(playback_progress(&connection,"comic").unwrap(),26.0);
+        assert_eq!(playback_progress(&connection,"comic").unwrap(),25.6);
     }
 
     #[test]
