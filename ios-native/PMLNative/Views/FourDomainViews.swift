@@ -41,26 +41,6 @@ struct FourDomainHomeView: View {
                     }
                 } header: {
                     Text("四大区域")
-                } footer: {
-                    Text("每个区域独立扫描、独立清理。最新添加是物理临时区；待整理按第一层【Pending】目录分组。")
-                }
-
-                if !cleanMessage.isEmpty {
-                    Section { Text(cleanMessage).font(.footnote).foregroundStyle(.secondary) }
-                }
-
-                Section("快捷操作") {
-                    Button {
-                        Task { await scanAll() }
-                    } label: {
-                        Label(scanning == nil ? "扫描全部区域" : "正在扫描…", systemImage: "arrow.clockwise.circle")
-                    }
-                    .disabled(scanning != nil)
-                    NavigationLink {
-                        MoveConflictListView()
-                    } label: {
-                        Label("同名冲突", systemImage: "exclamationmark.triangle")
-                    }
                 }
 
                 if !errorText.isEmpty {
@@ -211,43 +191,33 @@ struct DomainBrowserView: View {
     @State private var imagePreview: DomainImagePreview?
     @State private var comicTarget: ComicArchiveTarget?
 
+    @AppStorage("pml.domain.browser.grid") private var gridMode = false
+    @AppStorage("pml.domain.browser.sort") private var sortRaw = "name"
+
     var body: some View {
-        List {
-            if !errorText.isEmpty {
-                Section {
-                    Text(errorText).font(.footnote).foregroundStyle(.red)
-                    Button("重试") { Task { await load() } }
-                }
-            }
-            if loading && children.isEmpty {
-                ProgressView().frame(maxWidth: .infinity)
-            }
-            ForEach(children) { child in
-                if child.isDirectory {
-                    NavigationLink {
-                        DomainBrowserView(
-                            domain: domain,
-                            title: child.name,
-                            path: child.path
-                        )
-                    } label: {
-                        DomainFolderRow(child: child)
-                    }
-                } else {
-                    Button {
-                        Task { await open(child) }
-                    } label: {
-                        DomainFileRow(child: child)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            if children.isEmpty && !loading && errorText.isEmpty {
-                ContentUnavailableView("空目录", systemImage: "folder")
-            }
+        Group {
+            if gridMode { gridView } else { listView }
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    gridMode.toggle()
+                } label: {
+                    Image(systemName: gridMode ? "list.bullet" : "square.grid.2x2")
+                }
+                Menu {
+                    Picker("排序", selection: $sortRaw) {
+                        Text("名称").tag("name")
+                        Text("最近修改").tag("newest")
+                        Text("大小").tag("size")
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
+                }
+            }
+        }
         .refreshable { await refreshFromRemote() }
         .task { await load() }
         .fullScreenCover(item: $videoPreview) { preview in
@@ -267,6 +237,103 @@ struct DomainBrowserView: View {
         .fullScreenCover(item: $comicTarget) { target in
             ComicReaderView(target: target)
                 .environmentObject(model)
+        }
+    }
+
+    private var sortedChildren: [DomainChild] {
+        let folders = children.filter(\.isDirectory).sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        let files = children.filter { !$0.isDirectory }.sorted { left, right in
+            switch sortRaw {
+            case "newest":
+                if left.modifiedAt != right.modifiedAt {
+                    return (left.modifiedAt ?? "") > (right.modifiedAt ?? "")
+                }
+            case "size":
+                if left.sizeBytes != right.sizeBytes {
+                    return left.sizeBytes > right.sizeBytes
+                }
+            default:
+                break
+            }
+            return left.name.localizedStandardCompare(right.name) == .orderedAscending
+        }
+        return folders + files
+    }
+
+    private var listView: some View {
+        List {
+            if !errorText.isEmpty {
+                Section {
+                    Text(errorText).font(.footnote).foregroundStyle(.red)
+                    Button("重试") { Task { await load() } }
+                }
+            }
+            if loading && children.isEmpty {
+                ProgressView().frame(maxWidth: .infinity)
+            }
+            ForEach(sortedChildren) { child in
+                if child.isDirectory {
+                    NavigationLink {
+                        DomainBrowserView(domain: domain, title: child.name, path: child.path)
+                    } label: {
+                        DomainFolderRow(child: child)
+                    }
+                } else {
+                    Button {
+                        Task { await open(child) }
+                    } label: {
+                        DomainFileRow(child: child)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            if children.isEmpty && !loading && errorText.isEmpty {
+                ContentUnavailableView("空目录", systemImage: "folder")
+            }
+        }
+    }
+
+    private var gridView: some View {
+        ScrollView {
+            if !errorText.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(errorText).font(.footnote).foregroundStyle(.red)
+                    Button("重试") { Task { await load() } }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+            }
+            if loading && children.isEmpty {
+                ProgressView().padding(.top, 60)
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
+                ForEach(sortedChildren) { child in
+                    if child.isDirectory {
+                        NavigationLink {
+                            DomainBrowserView(domain: domain, title: child.name, path: child.path)
+                        } label: {
+                            DomainGridCard(child: child)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Button {
+                            Task { await open(child) }
+                        } label: {
+                            DomainGridCard(child: child)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(16)
+
+            if children.isEmpty && !loading && errorText.isEmpty {
+                ContentUnavailableView("空目录", systemImage: "folder")
+                    .padding(.top, 60)
+            }
         }
     }
 
@@ -385,6 +452,48 @@ private struct DomainFileRow: View {
             if let assetId = child.thumbnailAssetId ?? child.assetId {
                 image = await ThumbnailService.shared.image(assetId: assetId, client: model.apiClient)
             }
+        }
+    }
+}
+
+private struct DomainGridCard: View {
+    let child: DomainChild
+    @EnvironmentObject private var model: AppModel
+    @State private var image: UIImage?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Group {
+                if child.isDirectory {
+                    Image(systemName: "folder.fill")
+                        .font(.system(size: 34, weight: .semibold))
+                        .foregroundStyle(.tint)
+                } else if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else {
+                    Image(systemName: child.isVideo ? "play.rectangle.fill" : child.isComic ? "book.closed.fill" : "photo.fill")
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 96, maxHeight: 96)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Text(child.name)
+                .font(.caption.weight(.medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+            Text(child.isDirectory ? "\(child.childCount) 个文件" : pmlFormatBytes(child.sizeBytes))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.secondary.opacity(0.04), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .task(id: child.thumbnailAssetId ?? child.assetId) {
+            guard !child.isDirectory, let assetId = child.thumbnailAssetId ?? child.assetId else { return }
+            image = await ThumbnailService.shared.image(assetId: assetId, client: model.apiClient)
         }
     }
 }
