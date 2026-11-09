@@ -74,7 +74,7 @@ struct PendingCandidate: Decodable, Hashable {
     let name: String
 }
 
-struct PendingItem: Decodable, Identifiable, Hashable {
+struct PendingDomainItem: Decodable, Identifiable, Hashable {
     let assetId: String
     let remotePath: String
     let fileName: String
@@ -180,7 +180,7 @@ extension PMLAPIClient {
         try await command("list_pending_projects")
     }
 
-    func pendingProjectItems(projectId: String) async throws -> [PendingItem] {
+    func pendingProjectItems(projectId: String) async throws -> [PendingDomainItem] {
         try await command("pending_project_items", arguments: ["projectId": projectId])
     }
 
@@ -195,7 +195,7 @@ extension PMLAPIClient {
         try await perform("assign_pending_item", arguments: arguments)
     }
 
-    func movePendingItem(assetId: String) async throws -> PendingMoveResult {
+    func movePendingDomainItem(assetId: String) async throws -> PendingMoveResult {
         try await command("move_pending_item", arguments: ["assetId": assetId])
     }
 
