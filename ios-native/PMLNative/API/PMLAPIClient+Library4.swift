@@ -8,10 +8,12 @@ extension PMLAPIClient {
     }
 
     func saveCuratorConfig(pendingPath: String?, targetVaultRoot: String?) async throws {
-        var arguments: [String: Any] = [:]
-        if let pendingPath { arguments["pendingPath"] = pendingPath }
-        if let targetVaultRoot { arguments["targetVaultRoot"] = targetVaultRoot }
-        try await perform("save_curator_config", arguments: arguments)
+        // Root paths are owned by the canonical V2 directory configuration.
+        // Preserve the other two domains while updating curation destinations.
+        var config = try await directoryConfig()
+        config.pendingPath = pendingPath
+        config.vaultPath = targetVaultRoot
+        _ = try await saveDirectoryConfig(config)
     }
 
     func curateMoveItem(sourcePath: String, targetPath: String, isDirectory: Bool) async throws -> CurateMoveItemResult {

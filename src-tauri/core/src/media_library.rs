@@ -9451,11 +9451,16 @@ pub fn get_curator_config_internal(app: &AppHandle) -> Result<CuratorConfig, Str
         .optional()
         .map_err(database_error)?;
 
-    match val {
+    let mut config: CuratorConfig = match val {
         Some(json_str) => serde_json::from_str(&json_str)
-            .map_err(|e| format!("解析收纳过滤词配置失败: {e}")),
-        None => Ok(CuratorConfig::default()),
-    }
+            .map_err(|e| format!("解析收纳过滤词配置失败: {e}"))?,
+        None => CuratorConfig::default(),
+    };
+    // Root paths have a single owner. Stale compatibility JSON must not
+    // resurrect a removed domain or silently redirect physical curation moves.
+    config.pending_path = canonical_domain_path(&connection, "pending")?;
+    config.target_vault_root = canonical_domain_path(&connection, "vault")?;
+    Ok(config)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -10302,6 +10307,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directory_config_uses_only_canonical_roots_and_preserves_clear() {
+        let c=Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE domain_roots(domain TEXT PRIMARY KEY,remote_path TEXT);
+            CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT);
+            INSERT INTO settings VALUES('dir.pending','/stale'),('curator_config','{\"pendingPath\":\"/stale\"}');
+            INSERT INTO domain_roots VALUES('pending','/canonical');").unwrap();
+        assert_eq!(directory_config_from_connection(&c).unwrap().pending_path.as_deref(),Some("/canonical"));
+        c.execute("DELETE FROM domain_roots",[]).unwrap();
+        assert!(directory_config_from_connection(&c).unwrap().pending_path.is_none());
+        assert!(canonical_domain_path(&c,"vault").unwrap().is_none());
+    }
+
+    #[test]
     fn v2_preview_preserves_identity_and_enforces_root_boundary() {
         let c=Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE domain_roots(domain TEXT,root_id TEXT,remote_path TEXT);
@@ -11021,12 +11039,20 @@ fn pml_basename(path: &str) -> String {
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_directory_config(app: AppHandle) -> Result<DirectoryConfig, String> {
     let connection = crate::v2_config::open(&app)?;
-    let curator = get_curator_config_internal(&app).unwrap_or_default();
+    directory_config_from_connection(&connection)
+}
+
+fn canonical_domain_path(connection: &Connection, domain: &str) -> Result<Option<String>, String> {
+    connection.query_row("SELECT remote_path FROM domain_roots WHERE domain=?1", [domain], |row| row.get(0))
+        .optional().map_err(database_error)
+}
+
+fn directory_config_from_connection(connection: &Connection) -> Result<DirectoryConfig, String> {
     Ok(DirectoryConfig {
-        recent_path: pml_dir_setting(&connection, DIR_RECENT_KEY),
-        pending_path: pml_dir_setting(&connection, DIR_PENDING_KEY).or(curator.pending_path),
-        vault_path: pml_dir_setting(&connection, DIR_VAULT_KEY).or(curator.target_vault_root),
-        comics_path: pml_dir_setting(&connection, DIR_COMICS_KEY),
+        recent_path: canonical_domain_path(connection, "recent")?,
+        pending_path: canonical_domain_path(connection, "pending")?,
+        vault_path: canonical_domain_path(connection, "vault")?,
+        comics_path: canonical_domain_path(connection, "comics")?,
     })
 }
 
