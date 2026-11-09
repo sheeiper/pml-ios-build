@@ -21,6 +21,20 @@ struct DirectoryRoute: Hashable {
 struct DirectoryView: View {
     let root: LibraryRoot
     let path: String
+    let domain: String?
+    let titleOverride: String?
+
+    init(
+        root: LibraryRoot,
+        path: String,
+        domain: String? = nil,
+        titleOverride: String? = nil
+    ) {
+        self.root = root
+        self.path = path
+        self.domain = domain
+        self.titleOverride = titleOverride
+    }
 
     @EnvironmentObject private var model: AppModel
 
@@ -122,10 +136,12 @@ struct DirectoryView: View {
                         Task { await uploadDirectoryCover(item) }
                     }
 
-                    Button {
-                        showRemoteSearch = true
-                    } label: {
-                        Image(systemName: "magnifyingglass")
+                    if domain == nil {
+                        Button {
+                            showRemoteSearch = true
+                        } label: {
+                            Image(systemName: "magnifyingglass")
+                        }
                     }
 
                     Button {
@@ -173,7 +189,8 @@ struct DirectoryView: View {
     }
 
     private var title: String {
-        path.split(separator: "/").last.map(String.init) ?? root.kindLabel
+        if let titleOverride, !titleOverride.isEmpty { return titleOverride }
+        return path.split(separator: "/").last.map(String.init) ?? root.kindLabel
     }
 
     private var gridColumns: [GridItem] {
@@ -317,7 +334,7 @@ struct DirectoryView: View {
 
         if entry.isDirectory {
             NavigationLink {
-                DirectoryView(root: root, path: entry.path)
+                DirectoryView(root: root, path: entry.path, domain: domain)
             } label: {
                 content
             }
@@ -339,7 +356,7 @@ struct DirectoryView: View {
     private func cell(for entry: RemoteBrowserEntry) -> some View {
         if entry.isDirectory {
             NavigationLink {
-                DirectoryView(root: root, path: entry.path)
+                DirectoryView(root: root, path: entry.path, domain: domain)
             } label: {
                 cellBody(entry)
             }
@@ -552,6 +569,36 @@ struct DirectoryView: View {
         guard let client = model.apiClient else { return }
         loading = true
         errorText = ""
+        if let domain {
+            do {
+                if force {
+                    _ = try? await client.refreshDomainPath(domain: domain, path: path)
+                }
+                let children = try await client.domainChildren(domain: domain, path: path)
+                entries = children.map { child in
+                    RemoteBrowserEntry(
+                        path: child.path,
+                        name: child.name,
+                        isDirectory: child.isDirectory,
+                        sizeBytes: child.sizeBytes,
+                        modifiedAt: child.modifiedAt,
+                        etag: nil,
+                        assetId: child.assetId,
+                        mediaType: child.mediaType,
+                        thumbnailSource: nil,
+                        coverAssetId: nil
+                    )
+                }
+                sortDomainEntries(&entries)
+                nextCursor = nil
+                prefetchThumbnails(entries)
+                loading = false
+            } catch {
+                if !pmlIsCancellation(error) { errorText = error.localizedDescription }
+                loading = false
+            }
+            return
+        }
         do {
             let page = try await client.remoteChildren(
                 rootId: root.id,
@@ -594,6 +641,25 @@ struct DirectoryView: View {
             }
             errorText = message
             loading = false
+        }
+    }
+
+    private func sortDomainEntries(_ items: inout [RemoteBrowserEntry]) {
+        items.sort { left, right in
+            if left.isDirectory != right.isDirectory { return left.isDirectory }
+            switch sort {
+            case .newest:
+                if left.modifiedAt != right.modifiedAt {
+                    return (left.modifiedAt ?? "") > (right.modifiedAt ?? "")
+                }
+            case .size:
+                if left.sizeBytes != right.sizeBytes {
+                    return left.sizeBytes > right.sizeBytes
+                }
+            case .name:
+                break
+            }
+            return left.name.localizedStandardCompare(right.name) == .orderedAscending
         }
     }
 
