@@ -49,7 +49,7 @@ struct RuntimeModeView: View {
             } header: {
                 Text("播放方式")
             } footer: {
-                Text("自动：优先直连，MOV 解析一次最终 CDN 地址；失败由播放器回退服务器。直连：强制 AList → 115 CDN。中转：全部走服务器 /media。")
+                Text("自动：MOV 走服务器中转，其他格式优先直连；直连：强制 AList → 115 CDN；中转：全部走服务器 /media。")
             }
 
                 SecureField("密码", text: $draft.serverPassword)
