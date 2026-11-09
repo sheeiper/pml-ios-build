@@ -295,7 +295,7 @@ struct LocalMediaProxyStreamBox {
 
 private extension LocalMediaProxy {
     /// Bridge private Stream to the transfer box.
-    func box(for stream: Stream) -> LocalMediaProxyStreamBox {
+    private func box(for stream: Stream) -> LocalMediaProxyStreamBox {
         LocalMediaProxyStreamBox(direct: stream.direct, fallback: stream.fallback, fallbackHeaders: stream.fallbackHeaders)
     }
 }
