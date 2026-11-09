@@ -248,7 +248,7 @@ struct DomainBrowserView: View {
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
-        .refreshable { await load() }
+        .refreshable { await refreshFromRemote() }
         .task { await load() }
         .fullScreenCover(item: $videoPreview) { preview in
             GestureVideoPlayerSheet(
@@ -267,6 +267,20 @@ struct DomainBrowserView: View {
         .fullScreenCover(item: $comicTarget) { target in
             ComicReaderView(target: target)
                 .environmentObject(model)
+        }
+    }
+
+    private func refreshFromRemote() async {
+        guard let client = model.apiClient else { return }
+        do {
+            if let path, !path.isEmpty {
+                _ = try await client.refreshDomainPath(domain: domain, path: path)
+            } else {
+                _ = try await client.scanDomain(domain)
+            }
+            await load()
+        } catch {
+            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
         }
     }
 
