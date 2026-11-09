@@ -194,6 +194,10 @@ extension PMLAPIClient {
     }
 
 
+func refreshDomainPath(domain: String, path: String) async throws -> DomainScanResult {
+        try await command("refresh_domain_path", arguments: ["domain": domain, "path": path])
+    }
+
     func domainChildren(domain: String, path: String? = nil) async throws -> [DomainChild] {
         var arguments: [String: Any] = ["domain": domain]
         if let path, !path.isEmpty { arguments["path"] = path }
