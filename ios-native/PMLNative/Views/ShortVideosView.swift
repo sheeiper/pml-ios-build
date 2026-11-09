@@ -67,6 +67,7 @@ struct ShortVideosView: View {
     @State private var activateGeneration = 0
     @State private var lastSavedID: String?
     @State private var lastSavedAt: Double = 0
+    @State private var restoringProgressID: String?
 
     @State private var authorSheet: LibraryAuthor?
     @State private var systemPlayer: ShortVideoPlayerItem?
@@ -109,7 +110,6 @@ struct ShortVideosView: View {
             .toolbar(.hidden, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .tabBar)
             .task {
-                loadPreferences()
                 configureAudioSession()
                 addTimeObserver()
                 await loadFeed(reset: true)
@@ -410,13 +410,14 @@ struct ShortVideosView: View {
         return scope.title
     }
 
-    private func loadPreferences() {
-        favorites = Set(UserDefaults.standard.stringArray(forKey: "pml.shortVideo.favorites") ?? [])
-        seenIDs = Set(UserDefaults.standard.stringArray(forKey: "pml.shortVideo.seen") ?? [])
-    }
-
-    private func saveSeen() {
-        UserDefaults.standard.set(Array(seenIDs), forKey: "pml.shortVideo.seen")
+    /// Business state belongs to the selected core, not device-wide preferences.
+    @MainActor
+    private func hydrateState(client: PMLAPIClient) async throws {
+        async let favoriteIDs = client.favoriteIds()
+        async let historyIDs = client.playbackHistoryIds()
+        let (canonicalFavorites, canonicalHistory) = try await (favoriteIDs, historyIDs)
+        favorites = Set(canonicalFavorites)
+        seenIDs = Set(canonicalHistory)
     }
 
     private func matchesScope(_ asset: LibraryAsset) -> Bool {
@@ -432,6 +433,7 @@ struct ShortVideosView: View {
         loading = true
         if reset { errorText = "" }
         do {
+            if reset { try await hydrateState(client: client) }
             var collected = reset ? [] : items
             var cursor = reset ? nil : nextCursor
             var attempts = 0
@@ -474,6 +476,9 @@ struct ShortVideosView: View {
         activateGeneration += 1
         let generation = activateGeneration
         currentAsset = asset
+        restoringProgressID = id
+        lastSavedID = nil
+        lastSavedAt = 0
         player.pause()
         isPlaying = false
         progress = 0
@@ -493,10 +498,8 @@ struct ShortVideosView: View {
         player.isMuted = muted
         player.play()
         isPlaying = true
-        seenIDs.insert(id)
-        saveSeen()
         coversPrefetch()
-        Task { await restoreProgress(assetId: id) }
+        Task { await restoreProgressAndMarkSeen(assetId: id, generation: generation) }
         Task { await preloadNext(after: id) }
     }
 
@@ -526,31 +529,64 @@ struct ShortVideosView: View {
         return AVPlayerItem(asset: asset)
     }
 
-    private func restoreProgress(assetId: String) async {
-        guard let client = model.apiClient,
-              let saved = try? await client.playbackProgress(assetId: assetId),
-              saved > 2 else { return }
-        try? await Task.sleep(nanoseconds: 350_000_000)
-        guard currentID == assetId else { return }
-        _ = await player.seek(
-            to: CMTime(seconds: Double(saved), preferredTimescale: 600),
-            toleranceBefore: .init(seconds: 0.5, preferredTimescale: 600),
-            toleranceAfter: .init(seconds: 0.5, preferredTimescale: 600)
-        )
-        progress = Double(saved)
+    @MainActor
+    private func restoreProgressAndMarkSeen(assetId: String, generation: Int) async {
+        var loadedProgress = false
+        defer {
+            if loadedProgress, activateGeneration == generation, restoringProgressID == assetId {
+                restoringProgressID = nil
+            }
+        }
+        guard let client = model.apiClient else { return }
+        do {
+            // Fetch before writing: never replace an existing resume position
+            // with zero merely because a clip has just become visible.
+            let saved = try await client.playbackProgress(assetId: assetId)
+            loadedProgress = true
+            guard activateGeneration == generation, currentID == assetId else { return }
+            if saved > 2 {
+                try await Task.sleep(nanoseconds: 350_000_000)
+                guard activateGeneration == generation, currentID == assetId else { return }
+                _ = await player.seek(
+                    to: CMTime(seconds: saved, preferredTimescale: 600),
+                    toleranceBefore: .init(seconds: 0.5, preferredTimescale: 600),
+                    toleranceAfter: .init(seconds: 0.5, preferredTimescale: 600)
+                )
+                guard activateGeneration == generation, currentID == assetId else { return }
+                progress = saved
+            }
+            let current = player.currentTime().seconds
+            let position = max(saved, current.isFinite ? max(0, current) : 0)
+            try await client.setPlaybackProgress(assetId: assetId, seconds: position)
+            seenIDs.insert(assetId)
+        } catch {
+            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
+        }
     }
 
     private func saveProgress(force: Bool = false) {
-        guard let asset = currentAsset, !isSeeking else { return }
+        guard let asset = currentAsset, !isSeeking,
+              restoringProgressID != asset.id else { return }
         let seconds = player.currentTime().seconds
         guard seconds.isFinite, seconds > 0 else { return }
-        if !force, seconds - lastSavedAt < 2 { return }
+        if !force, lastSavedID == asset.id, abs(seconds - lastSavedAt) < 2 { return }
         lastSavedAt = seconds
         lastSavedID = asset.id
-        Task { try? await model.apiClient?.setPlaybackProgress(assetId: asset.id, seconds: seconds) }
+        guard let client = model.apiClient else { return }
+        Task {
+            do {
+                try await client.setPlaybackProgress(assetId: asset.id, seconds: seconds)
+                seenIDs.insert(asset.id)
+            } catch {
+                if !pmlIsCancellation(error) { errorText = error.localizedDescription }
+            }
+        }
     }
 
     private func resetAndReload() async {
+        saveProgress(force: true)
+        activateGeneration += 1
+        restoringProgressID = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
         preloadedID = nil
@@ -604,7 +640,6 @@ struct ShortVideosView: View {
         Task {
             if let liked = try? await client.toggleFavorite(assetId: asset.id) {
                 if liked { favorites.insert(asset.id) } else { favorites.remove(asset.id) }
-                UserDefaults.standard.set(Array(favorites), forKey: "pml.shortVideo.favorites")
             }
         }
         showHUD("heart.fill")

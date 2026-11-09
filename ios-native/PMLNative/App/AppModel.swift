@@ -119,9 +119,19 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            // 直连：把 AList /d 直接交给 AVPlayer，由播放器自己跟随 302。
-            // 不要先取最终 CDN URL 再复用：115 链接可能被首次请求消费/绑定。
+            // 直连：AList /d 交给 App 内本地代理，由代理跟随 302 并转发 Range。
             if let direct {
+                if mode == .direct {
+                    let fallback = await serverMediaURL(assetId: assetId)
+                    let headers = fallback.map { playbackHeaders(for: $0) } ?? [:]
+                    if let proxied = await LocalMediaProxy.shared.register(
+                        directURL: direct,
+                        fallbackURL: fallback,
+                        fallbackHeaders: headers
+                    ) {
+                        return PlaybackSource(url: proxied, fallbackURL: nil, label: "本地代理直连")
+                    }
+                }
                 return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
             }
 

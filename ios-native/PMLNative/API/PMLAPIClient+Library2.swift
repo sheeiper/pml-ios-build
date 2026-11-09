@@ -17,6 +17,10 @@ extension PMLAPIClient {
         try await command("list_playback_history", arguments: ["limit": limit])
     }
 
+    func playbackHistoryIds() async throws -> [String] {
+        try await command("list_playback_history_ids")
+    }
+
     func setPlaybackProgress(assetId: String, seconds: Double) async throws {
         try await perform(
             "set_asset_playback_progress",

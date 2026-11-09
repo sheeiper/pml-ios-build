@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "tauri")]
 use tauri::Manager;
+use crate::four_domains;
 use crate::AppHandle;
 use tower_http::services::ServeDir;
 
@@ -334,7 +335,11 @@ pub fn last_server_error() -> Option<String> {
 }
 
 fn build_router(state: ServerState, static_dir: String) -> Router {
+    let download_dir = std::env::var("PML_DOWNLOAD_DIR")
+        .unwrap_or_else(|_| "/data/downloads".to_owned());
+    let _ = std::fs::create_dir_all(&download_dir);
     Router::new()
+        .nest_service("/downloads", ServeDir::new(download_dir))
         .route("/api/health", get(health))
         .route("/api/covers/{asset_id}/{version}", get(cached_cover))
         .route("/api/comic-pages/{asset_id}/{page_index}", get(cached_comic_page))
@@ -574,6 +579,73 @@ async fn dispatch_command(
 ) -> Response {
     let app = &context.app;
     match command.as_str() {
+        "four_domain_summaries" => {
+            let app = app.clone();
+            blocking_result_response(move || four_domains::summaries(&app)).await
+        }
+        "refresh_domain_path" => {
+            let domain = payload.get("domain").and_then(Value::as_str).unwrap_or("").to_owned();
+            let path = payload.get("path").and_then(Value::as_str).unwrap_or("").to_owned();
+            result_response(four_domains::refresh_domain_path(app.clone(), app.state::<MediaLibraryState>(), &domain, &path).await)
+        }
+        "scan_domain" => {
+            let domain = payload.get("domain").and_then(Value::as_str).unwrap_or("").to_owned();
+            result_response(four_domains::scan_domain(app.clone(), app.state::<MediaLibraryState>(), &domain).await)
+        }
+        "clean_domain" => {
+            let domain = payload.get("domain").and_then(Value::as_str).unwrap_or("").to_owned();
+            let dry_run = payload.get("dryRun").and_then(Value::as_bool).unwrap_or(true);
+            let app = app.clone();
+            blocking_result_response(move || four_domains::clean(&app, &domain, dry_run)).await
+        }
+        "list_domain_children" => {
+            let domain = payload.get("domain").and_then(Value::as_str).unwrap_or("").to_owned();
+            let path = payload.get("path").and_then(Value::as_str).map(str::to_owned);
+            let app = app.clone();
+            blocking_result_response(move || four_domains::children(&app, &domain, path.as_deref())).await
+        }
+        "list_domain_assets" => {
+            let domain = payload.get("domain").and_then(Value::as_str).unwrap_or("").to_owned();
+            let media_type = payload.get("mediaType").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(100);
+            let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let app = app.clone();
+            blocking_result_response(move || four_domains::list_assets(&app, &domain, media_type.as_deref(), query.as_deref(), limit, offset)).await
+        }
+        "list_pending_projects" => {
+            let app = app.clone();
+            blocking_result_response(move || four_domains::projects(&app)).await
+        }
+        "pending_project_items" => {
+            let project_id = payload.get("projectId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || four_domains::project_items(&app, &project_id)).await
+        }
+        "assign_pending_item" => {
+            let asset_id = payload.get("assetId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let category_id = payload.get("categoryId").and_then(Value::as_str).map(str::to_owned);
+            let author_id = payload.get("authorId").and_then(Value::as_str).map(str::to_owned);
+            let app = app.clone();
+            blocking_result_response(move || four_domains::assign_pending(&app, &asset_id, category_id, author_id)).await
+        }
+        "move_pending_item" => {
+            let asset_id = payload.get("assetId").and_then(Value::as_str).unwrap_or("").to_owned();
+            result_response(four_domains::move_pending_item(app.clone(), app.state::<MediaLibraryState>(), asset_id).await)
+        }
+        "list_domain_meta" => {
+            let app = app.clone();
+            blocking_result_response(move || four_domains::metadata(&app)).await
+        }
+        "create_pending_project" => {
+            let name = payload.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+            let asset_ids = payload.get("assetIds").and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+            result_response(four_domains::create_pending_project(app.clone(), app.state::<MediaLibraryState>(), name, asset_ids).await)
+        }
+        "list_move_conflicts" => {
+            let app = app.clone();
+            blocking_result_response(move || four_domains::conflicts(&app)).await
+        }
         "get_library_status" => result_response(
             media_library::get_library_status(app.clone(), app.state::<MediaLibraryState>()).await,
         ),
@@ -599,18 +671,18 @@ async fn dispatch_command(
                 Ok(value) => value,
                 Err(error) => return error,
             };
-            result_response(
-                media_library::list_remote_children(
-                    app.clone(),
-                    app.state::<MediaLibraryState>(),
-                    args.root_id,
-                    args.path,
-                    args.cursor,
-                    args.refresh,
-                    args.sort,
-                )
-                .await,
+            let v2 = four_domains::compat_remote_children(
+                app.clone(),
+                app.state::<MediaLibraryState>(),
+                &args.root_id,
+                &args.path,
+                args.refresh.unwrap_or(false),
+                args.sort.as_deref().unwrap_or("name"),
             )
+            .await;
+            // A failed provider refresh must remain visible to the caller; returning
+            // V1 data here makes an unsuccessful refresh look like success.
+            result_response(v2)
         }
         "search_remote_files" => {
             let args: SearchRemoteRequest = match parse_args(&payload) {
@@ -882,6 +954,10 @@ async fn dispatch_command(
             let app = app.clone();
             blocking_result_response(move || media_library::list_playback_history(app, args.limit))
                 .await
+        }
+        "list_playback_history_ids" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::v2_state::list_playback_history_ids(app)).await
         }
         "clear_playback_history" => {
             let app = app.clone();
@@ -1191,7 +1267,7 @@ async fn dispatch_command(
                 Err(error) => return error,
             };
             result_response(rewrite_media_url(
-                media_library::open_media_source(
+                four_domains::compat_media_source(
                     app.clone(),
                     app.state::<MediaLibraryState>(),
                     args.asset_id,

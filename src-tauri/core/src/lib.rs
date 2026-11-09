@@ -1,4 +1,10 @@
+pub mod four_domains;
 pub mod media_library;
+pub mod v2_catalog;
+pub mod v2_state;
+mod v2_config;
+mod v2_import;
+mod v2_moves;
 pub mod rt;
 pub mod server;
 

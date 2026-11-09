@@ -182,6 +182,17 @@ pub struct LibraryRoot {
     created_at: i64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderEntry {
+    pub path: String,
+    pub name: String,
+    pub is_directory: bool,
+    pub size_bytes: i64,
+    pub modified_at: Option<String>,
+    pub etag: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteDirectoryEntry {
@@ -323,9 +334,9 @@ pub struct ShortVideoFeedPage {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackHistoryItem {
-    asset: LibraryAsset,
-    position_seconds: i64,
-    updated_at: i64,
+    pub(crate) asset: LibraryAsset,
+    pub(crate) position_seconds: i64,
+    pub(crate) updated_at: i64,
 }
 
 #[derive(Serialize)]
@@ -364,12 +375,12 @@ pub struct AutomationSettings {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryCategory {
-    id: String,
-    name: String,
-    parent_id: Option<String>,
-    media_count: i64,
-    author_count: i64,
-    collection_count: i64,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) media_count: i64,
+    pub(crate) author_count: i64,
+    pub(crate) collection_count: i64,
 }
 
 #[derive(Serialize)]
@@ -388,34 +399,34 @@ pub struct LibraryAuthor {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryCollection {
-    id: String,
-    name: String,
-    author_id: Option<String>,
-    author_name: Option<String>,
-    root_id: String,
-    media_count: i64,
-    image_count: i64,
-    video_count: i64,
-    comic_count: i64,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) author_id: Option<String>,
+    pub(crate) author_name: Option<String>,
+    pub(crate) root_id: String,
+    pub(crate) media_count: i64,
+    pub(crate) image_count: i64,
+    pub(crate) video_count: i64,
+    pub(crate) comic_count: i64,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryOverview {
-    roots: i64,
-    assets: i64,
-    images: i64,
-    videos: i64,
-    short_videos: i64,
-    comics: i64,
-    authors: i64,
-    collections: i64,
-    total_bytes: i64,
-    directories: i64,
-    unplayed: i64,
-    missing_thumbnails: i64,
-    last_scan_time: Option<i64>,
-    duplicate_groups: i64,
+    pub(crate) roots: i64,
+    pub(crate) assets: i64,
+    pub(crate) images: i64,
+    pub(crate) videos: i64,
+    pub(crate) short_videos: i64,
+    pub(crate) comics: i64,
+    pub(crate) authors: i64,
+    pub(crate) collections: i64,
+    pub(crate) total_bytes: i64,
+    pub(crate) directories: i64,
+    pub(crate) unplayed: i64,
+    pub(crate) missing_thumbnails: i64,
+    pub(crate) last_scan_time: Option<i64>,
+    pub(crate) duplicate_groups: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -493,6 +504,14 @@ pub struct ScanProgress {
 }
 
 impl ScanProgress {
+    pub fn is_running(&self) -> bool { self.running }
+    pub fn failure(&self) -> Option<String> {
+        if self.phase == "failed" {
+            Some(self.error.clone().unwrap_or_else(|| "扫描失败".to_owned()))
+        } else {
+            None
+        }
+    }
     fn idle() -> Self {
         Self {
             running: false,
@@ -741,6 +760,27 @@ pub async fn restore_alist_connection(
             ))
         }
     }
+}
+
+pub async fn list_provider_entries(
+    state: State<'_, MediaLibraryState>,
+    path: String,
+) -> Result<Vec<ProviderEntry>, String> {
+    let session = require_session(&state).await?;
+    let path = normalize_remote_path(&path)?;
+    let entries = list_directory_with_backoff(&session, &path).await?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.remote_path != path)
+        .map(|entry| ProviderEntry {
+            name: file_name(&entry.remote_path),
+            path: entry.remote_path,
+            is_directory: entry.is_collection,
+            size_bytes: entry.size_bytes,
+            modified_at: entry.modified_at,
+            etag: entry.etag,
+        })
+        .collect())
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -1181,77 +1221,36 @@ pub async fn list_remote_children(
     refresh: Option<bool>,
     sort: Option<String>,
 ) -> Result<RemoteBrowserPage, String> {
-    let started = Instant::now();
     let path = normalize_remote_path(&path)?;
     let sort = BrowseSort::parse(sort.as_deref().unwrap_or("name"))?;
-    let is_refresh = refresh.unwrap_or(false);
-
-    let app_lookup = app.clone();
-    let lookup_id = root_id.clone();
-    let lookup_path = path.clone();
-    let cursor_copy = cursor.clone();
-    let (root_kind, local_page) = tokio::task::spawn_blocking(move || {
-        let connection = open_database(&app_lookup)?;
-        let (root_kind_str, root_path_raw) = connection
-            .query_row(
-                "SELECT kind, remote_path FROM library_roots WHERE id = ?1",
-                params![lookup_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(database_error)?
-            .ok_or_else(|| "找不到资料库根目录".to_string())?;
-        let root_kind = LibraryRootKind::from_str(&root_kind_str)?;
-        let root_path = normalize_remote_path(&root_path_raw)?;
-        let root_prefix = format!("{}/", root_path.trim_end_matches('/'));
-        if lookup_path != root_path && !lookup_path.starts_with(&root_prefix) {
-            return Err("请求目录不属于当前资料库根目录".into());
-        }
-        if !is_refresh {
-            let page = browse_sorted_directory_page(
-                &connection,
-                &lookup_id,
-                &lookup_path,
-                sort,
-                cursor_copy.as_deref(),
-            )?;
-            return Ok::<_, String>((root_kind, page));
-        }
-        Ok((root_kind, None))
+    let offset = cursor.as_deref().map(|value| {
+        value.strip_prefix("v2-offset:").and_then(|value|value.parse::<usize>().ok())
+            .ok_or_else(||"目录页码无效，请刷新目录".to_owned())
+    }).transpose()?.unwrap_or(0);
+    let value = crate::four_domains::compat_remote_children(
+        app,state,&root_id,&path,refresh.unwrap_or(false),sort.as_str(),
+    ).await?;
+    let entries=value.get("items").and_then(|v|v.as_array()).ok_or("V2 目录响应缺少条目")?;
+    let total=entries.len();
+    let items=entries.iter().skip(offset).take(BROWSE_PAGE_SIZE).map(|entry| {
+        let text=|key:&str|entry.get(key).and_then(|v|v.as_str()).map(ToOwned::to_owned);
+        Ok(RemoteBrowserEntry {
+            path:text("path").ok_or("V2 目录条目缺少路径")?,
+            name:text("name").ok_or("V2 目录条目缺少名称")?,
+            is_directory:entry.get("isDirectory").and_then(|v|v.as_bool()).unwrap_or(false),
+            size_bytes:entry.get("sizeBytes").and_then(|v|v.as_i64()).unwrap_or(0),
+            modified_at:text("modifiedAt"),etag:text("etag"),asset_id:text("assetId"),
+            media_type:text("mediaType"),thumbnail_source:text("thumbnailSource"),thumbnail_url:None,
+            cover_asset_id:text("coverAssetId"),
+            duration_seconds:entry.get("durationSeconds").and_then(|v|v.as_i64()),
+            progress_seconds:entry.get("progressSeconds").and_then(|v|v.as_f64()).map(|n|n as i64),
+        })
+    }).collect::<Result<Vec<_>,String>>()?;
+    Ok(RemoteBrowserPage {
+        items,next_cursor:offset.checked_add(BROWSE_PAGE_SIZE).filter(|next|*next<total).map(|next|format!("v2-offset:{next}")),
+        from_local_cache:value.get("fromLocalCache").and_then(|v|v.as_bool()),sync_summary:None,
     })
-    .await
-    .map_err(|error| error.to_string())??;
-
-    if !is_refresh {
-        if let Some(page_data) = local_page {
-            eprintln!("directory_list source=sqlite sort={} items={} elapsed_ms={}",sort.as_str(),page_data.items.len(),started.elapsed().as_millis());
-            return Ok(page_data);
-        }
-        if cursor.is_some() { return Err("目录索引已变化，请刷新目录后继续".into()); }
-    }
-
-    let session = require_session(&state).await?;
-    // CD2 PROPFIND already returns the whole directory. Commit all entries,
-    // then page the committed index, never an incomplete remote slice.
-    let entries = list_directory(&session, &path).await?;
-    eprintln!("directory_list source=cd2 items={} fetch_ms={}",entries.len(),started.elapsed().as_millis());
-    let sync_app = app.clone();
-    let sync_root = root_id.clone();
-    let sync_path = path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut connection = open_database(&sync_app)?;
-        let summary = sync_directory_entries(&mut connection, &sync_root, root_kind, &sync_path, entries)?;
-        let mut result = browse_sorted_directory_page(&connection, &sync_root, &sync_path, sort, None)?
-            .ok_or("同步后无法读取目录")?;
-        result.sync_summary = Some(summary);
-        result.from_local_cache = Some(false);
-        Ok::<_, String>(result)
-    }).await.map_err(|error| error.to_string())??;
-    state.directory_cache.lock().await.clear();
-    eprintln!("directory_sync elapsed_ms={}",started.elapsed().as_millis());
-    Ok(result)
 }
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectorySyncSummary {
@@ -1370,11 +1369,11 @@ pub async fn search_remote_files(
 ) -> Result<RemoteSearchPage, String> {
     let root_app = app.clone();
     let lookup_id = root_id.clone();
-    let (root_kind, root_path) = tokio::task::spawn_blocking(move || {
-        let connection = open_database(&root_app)?;
+    let (domain, root_path) = tokio::task::spawn_blocking(move || {
+        let connection = open_media_database(&root_app)?;
         connection
             .query_row(
-                "SELECT kind, remote_path FROM library_roots WHERE id = ?1",
+                "SELECT domain, remote_path FROM domain_roots WHERE root_id = ?1",
                 params![lookup_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -1384,7 +1383,7 @@ pub async fn search_remote_files(
     })
     .await
     .map_err(|error| error.to_string())??;
-    let root_kind = LibraryRootKind::from_str(&root_kind)?;
+    let root_kind = if domain == "comics" {LibraryRootKind::Comics} else {LibraryRootKind::Media};
     let root_path = normalize_remote_path(&root_path)?;
     let parent_path = normalize_remote_path(&parent_path)?;
     let root_prefix = format!("{}/", root_path.trim_end_matches('/'));
@@ -1415,21 +1414,22 @@ pub async fn search_remote_files(
         let db_app = app.clone();
         let db_root_id = root_id.clone();
         let db_keywords = format!("%{keywords}%");
+        let db_parent_prefix = if parent_path == "/" {"/".to_owned()} else {format!("{}/",parent_path)};
         let (items, total) = tokio::task::spawn_blocking(move || -> Result<(Vec<RemoteBrowserEntry>, i64), String> {
-            let connection = open_database(&db_app)?;
+            let connection = open_media_database(&db_app)?;
             let total: i64 = connection.query_row(
-                "SELECT COUNT(*) FROM assets WHERE root_id = ?1 AND file_name LIKE ?2 AND missing = 0",
-                params![db_root_id, db_keywords],
+                "SELECT COUNT(*) FROM assets WHERE root_id = ?1 AND file_name LIKE ?2 AND missing = 0 AND substr(remote_path,1,length(?3))=?3",
+                params![db_root_id, db_keywords, db_parent_prefix],
                 |row| row.get(0),
-            ).unwrap_or(0);
+            ).map_err(database_error)?;
 
-            let offset = (page - 1) * (BROWSE_PAGE_SIZE as i64);
+            let offset = (page - 1).checked_mul(BROWSE_PAGE_SIZE as i64).ok_or("搜索页码过大")?;
             let mut stmt = connection.prepare(
                 "SELECT remote_path, file_name, size_bytes, id, media_type FROM assets
-                 WHERE root_id = ?1 AND file_name LIKE ?2 AND missing = 0
-                 ORDER BY file_name ASC LIMIT ?3 OFFSET ?4"
+                 WHERE root_id = ?1 AND file_name LIKE ?2 AND missing = 0 AND substr(remote_path,1,length(?3))=?3
+                 ORDER BY file_name COLLATE NOCASE,remote_path LIMIT ?4 OFFSET ?5"
             ).map_err(database_error)?;
-            let rows = stmt.query_map(params![db_root_id, db_keywords, BROWSE_PAGE_SIZE as i64, offset], |row| {
+            let rows = stmt.query_map(params![db_root_id, db_keywords, db_parent_prefix, BROWSE_PAGE_SIZE as i64, offset], |row| {
                 Ok(RemoteBrowserEntry {
                     path: row.get(0)?,
                     name: row.get(1)?,
@@ -1455,7 +1455,7 @@ pub async fn search_remote_files(
             Ok((result, total))
         }).await.map_err(|error| error.to_string())??;
 
-        let next_cursor = if (page * (BROWSE_PAGE_SIZE as i64)) < total {
+        let next_cursor = if page.saturating_mul(BROWSE_PAGE_SIZE as i64) < total {
             Some(format!("search:{}", page + 1))
         } else {
             None
@@ -1531,6 +1531,7 @@ pub async fn search_remote_files(
                 format!("{parent}/{name}")
             };
             let remote_path = normalize_remote_path(&child).ok()?;
+            if !remote_path.starts_with(&root_prefix) || !(parent_path == "/" || remote_path.starts_with(&format!("{}/",parent_path.trim_end_matches('/')))) { return None; }
             let is_directory = entry
                 .get("is_dir")
                 .or_else(|| entry.get("isDirectory"))
@@ -1573,7 +1574,7 @@ pub async fn search_remote_files(
             let asset_id = media_type.as_ref().map(|_| {
                 format!(
                     "asset-{:016x}",
-                    stable_hash(&format!("{root_id}|{remote_path}"))
+                    stable_hash(&format!("{domain}|{remote_path}"))
                 )
             });
             Some(RemoteBrowserEntry {
@@ -1609,12 +1610,15 @@ pub async fn search_remote_files(
         .cloned()
         .collect::<Vec<_>>();
     if !playable.is_empty() {
-        tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let mut connection = open_database(&app)?;
-            register_browsed_assets(&mut connection, &root_id, &parent_path, playable, timestamp)
+        let registered = tokio::task::spawn_blocking(move || -> Result<HashMap<String,String>, String> {
+            let mut connection = open_media_database(&app)?;
+            register_search_assets_v2(&mut connection, &domain, &root_id, playable, timestamp)
         })
         .await
         .map_err(|error| error.to_string())??;
+        for entry in &mut result {
+            if let Some(id) = registered.get(&entry.path) { entry.asset_id = Some(id.clone()); }
+        }
     }
     let has_more = result.len() >= BROWSE_PAGE_SIZE
         && (total <= 0 || page.saturating_mul(BROWSE_PAGE_SIZE as i64) < total);
@@ -1623,6 +1627,38 @@ pub async fn search_remote_files(
         total,
         next_cursor: has_more.then(|| format!("search:{}", page + 1)),
     })
+}
+
+fn register_search_assets_v2(
+    connection: &mut Connection,
+    domain: &str,
+    root_id: &str,
+    entries: Vec<RemoteBrowserEntry>,
+    timestamp: i64,
+) -> Result<HashMap<String,String>,String> {
+    let tx=connection.transaction().map_err(database_error)?;
+    let mut registered=HashMap::new();
+    for entry in entries {
+        let Some(id)=entry.asset_id else {continue};
+        let Some(media_type)=entry.media_type else {continue};
+        tx.execute(
+            "INSERT INTO assets(id,domain,root_id,remote_path,file_name,parent_path,media_type,size_bytes,etag,modified_at,missing,first_seen_at,last_seen_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?11)
+             ON CONFLICT(domain,remote_path) DO UPDATE SET root_id=excluded.root_id,file_name=excluded.file_name,parent_path=excluded.parent_path,
+             media_type=excluded.media_type,content_hash=CASE WHEN assets.size_bytes=excluded.size_bytes AND assets.etag IS excluded.etag THEN assets.content_hash ELSE NULL END,
+             size_bytes=excluded.size_bytes,etag=excluded.etag,modified_at=excluded.modified_at,missing=0,missing_since=NULL,missing_scan_count=0,last_seen_at=excluded.last_seen_at",
+            params![id,domain,root_id,entry.path,entry.name,parent_path(&entry.path),media_type,entry.size_bytes,entry.etag,entry.modified_at,timestamp],
+        ).map_err(database_error)?;
+        let actual_id:String=tx.query_row("SELECT id FROM assets WHERE domain=?1 AND remote_path=?2",params![domain,entry.path],|r|r.get(0)).map_err(database_error)?;
+        match domain {
+            "vault"=>{tx.execute("INSERT INTO vault_items(asset_id,updated_at) VALUES(?1,?2) ON CONFLICT(asset_id) DO NOTHING",params![actual_id,timestamp]).map_err(database_error)?;}
+            "comics" if media_type=="comicArchive"=>{tx.execute("INSERT INTO comic_archives(asset_id,updated_at) VALUES(?1,?2) ON CONFLICT(asset_id) DO NOTHING",params![actual_id,timestamp]).map_err(database_error)?;}
+            _=>{}
+        }
+        registered.insert(entry.path,actual_id);
+    }
+    tx.commit().map_err(database_error)?;
+    Ok(registered)
 }
 
 fn register_browsed_assets(
@@ -1762,8 +1798,12 @@ async fn browse_directory_page(
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn list_library_roots(app: AppHandle) -> Result<Vec<LibraryRoot>, String> {
-    let connection = open_database(&app)?;
-    let mut statement = connection.prepare("SELECT id, kind, remote_path, created_at FROM library_roots ORDER BY kind, remote_path")
+    let connection = crate::v2_config::open(&app)?;
+    let mut statement = connection.prepare(
+        "SELECT d.root_id,CASE WHEN d.domain='comics' THEN 'comics' ELSE 'media' END,
+                d.remote_path,COALESCE(r.created_at,d.updated_at)
+         FROM domain_roots d LEFT JOIN library_roots r ON r.id=d.root_id
+         ORDER BY d.domain,d.remote_path")
         .map_err(database_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -1795,54 +1835,14 @@ pub async fn add_library_root(
     kind: LibraryRootKind,
     remote_path: String,
 ) -> Result<LibraryRoot, String> {
-    let session = require_session(&state).await?;
-    let remote_path = normalize_remote_path(&remote_path)?;
-    list_directory(&session, &remote_path).await?;
-    let connection = open_database(&app)?;
-    let mut statement = connection
-        .prepare("SELECT remote_path FROM library_roots")
-        .map_err(database_error)?;
-    let existing = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?;
-    if existing
-        .iter()
-        .any(|path| paths_overlap(path, &remote_path))
-    {
-        return Err("该目录与已配置的资料库根目录相同或存在上下级关系".into());
-    }
-    let id = format!("root-{:016x}", stable_hash(&remote_path));
-    let created_at = now();
-    connection
-        .execute(
-            "INSERT INTO library_roots (id, kind, remote_path, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, kind.as_str(), remote_path, created_at],
-        )
-        .map_err(database_error)?;
-    Ok(LibraryRoot {
-        id,
-        kind,
-        remote_path,
-        created_at,
-    })
+    let _ = (app, state, kind, remote_path);
+    Err("V2 使用固定四域根目录，请通过目录配置指定域和路径".into())
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn remove_library_root(app: AppHandle, root_id: String) -> Result<(), String> {
-    let connection = open_database(&app)?;
-    connection
-        .execute("DELETE FROM library_roots WHERE id = ?1", params![root_id])
-        .map_err(database_error)?;
-    connection
-        .execute(
-            "DELETE FROM collections WHERE root_id = ?1",
-            params![root_id],
-        )
-        .map_err(database_error)?;
-    purge_orphaned_metadata(&connection)?;
-    Ok(())
+    let _ = (app, root_id);
+    Err("V2 不支持直接删除根目录，请通过目录配置清除对应域路径".into())
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -1852,153 +1852,59 @@ pub async fn scan_library(
     root_id: Option<String>,
     folder_path: Option<String>,
 ) -> Result<ScanResult, String> {
-    let session = require_session(&state).await?;
-    let all_roots = list_library_roots(app.clone())?;
-    if all_roots.is_empty() {
-        return Err("请先添加至少一个媒体或漫画根目录".into());
+    let connection = crate::v2_config::open(&app)?;
+    let mut statement = connection.prepare(
+        "SELECT domain,root_id,remote_path FROM domain_roots ORDER BY domain"
+    ).map_err(database_error)?;
+    let configured = statement.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))
+        .map_err(database_error)?.collect::<Result<Vec<_>,_>>().map_err(database_error)?;
+    let mut roots = Vec::new();
+    let mut targets = HashMap::new();
+    if root_id.is_none() && folder_path.is_some() {
+        return Err("指定扫描目录时必须同时指定域根目录".into());
     }
-
-    let (roots, targets) = match (root_id, folder_path) {
-        (Some(rid), Some(fpath)) => {
-            let matched_roots: Vec<_> = all_roots.into_iter().filter(|r| r.id == rid).collect();
-            if matched_roots.is_empty() {
-                return Err("找不到指定的资料库根目录".into());
+    for (domain,id,path) in configured {
+        if let Some(wanted) = root_id.as_ref() {
+            if wanted != &id { continue; }
+        } else if domain != "vault" && domain != "comics" {
+            continue;
+        }
+        if let Some(folder) = folder_path.as_ref() {
+            let folder = normalize_remote_path(folder)?;
+            if folder != path && !folder.starts_with(&(path.trim_end_matches('/').to_owned()+"/")) {
+                return Err("扫描目录不在指定域根目录下".into());
             }
-            let mut targets = HashMap::new();
-            targets.insert(rid, vec![fpath]);
-            (matched_roots, Some(targets))
+            targets.insert(id.clone(),vec![folder]);
         }
-        (Some(rid), None) => {
-            let matched_roots: Vec<_> = all_roots.into_iter().filter(|r| r.id == rid).collect();
-            if matched_roots.is_empty() {
-                return Err("找不到指定的资料库根目录".into());
-            }
-            (matched_roots, None)
-        }
-        _ => {
-            let curator_config = get_curator_config_internal(&app).ok();
-            let pending_path = curator_config
-                .as_ref()
-                .and_then(|c| c.pending_path.as_ref())
-                .map(|p| p.trim_end_matches('/').to_string());
-            let vault_path = curator_config
-                .as_ref()
-                .and_then(|c| c.target_vault_root.as_ref())
-                .map(|p| p.trim_end_matches('/').to_string());
-
-            let filtered_roots: Vec<_> = all_roots
-                .into_iter()
-                .filter(|r| {
-                    let r_norm = r.remote_path.trim_end_matches('/');
-
-                    // 1. 严格排除待收纳 (pending) 目录及其子路径
-                    if let Some(pending) = &pending_path {
-                        if r_norm == pending || pending.starts_with(&format!("{r_norm}/")) || r_norm.starts_with(&format!("{pending}/")) {
-                            return false;
-                        }
-                    }
-
-                    // 2. 严格排除 INBOX / 离线新增文件目录（云下载作为主资料库保留）
-                    let r_lower = r_norm.to_lowercase();
-                    if r_lower.contains("inbox") || r_lower.contains("download") {
-                        return false;
-                    }
-
-                    // 3. 严格排除未分类/暂存目录
-                    if r_lower.contains("未分类") || r_lower.contains("暂存") || r_lower.contains("pending") {
-                        return false;
-                    }
-
-                    // 4. 若已指定已收纳文件库 (target_vault_root)，且根目录是媒体类型，则优先限制仅扫描已收纳库或漫画库
-                    if let Some(vault) = &vault_path {
-                        if r.kind == LibraryRootKind::Media {
-                            let is_vault_match = r_norm == vault || r_norm.starts_with(&format!("{vault}/")) || vault.starts_with(&format!("{r_norm}/"));
-                            if !is_vault_match {
-                                return false;
-                            }
-                        }
-                    }
-
-                    true
-                })
-                .collect();
-            (filtered_roots, None)
-        }
-    };
-
-    launch_scan(
-        app,
-        session,
-        roots,
-        state.scan_progress.clone(),
-        state.duplicate_progress.clone(),
-        state.duplicate_cancel.clone(),
-        targets,
-    )
+        roots.push(LibraryRoot { id,kind:if domain=="comics" {LibraryRootKind::Comics} else {LibraryRootKind::Media},remote_path:path,created_at:0 });
+    }
+    drop(statement);
+    drop(connection);
+    launch_scan(app,roots,state.scan_progress.clone(),if targets.is_empty(){None}else{Some(targets)})
 }
 
 fn launch_scan(
     app: AppHandle,
-    session: Session,
     roots: Vec<LibraryRoot>,
     progress: Arc<StdMutex<ScanProgress>>,
-    duplicate_progress: Arc<StdMutex<DuplicateScanProgress>>,
-    duplicate_cancel: Arc<AtomicBool>,
     targets: Option<HashMap<String, Vec<String>>>,
 ) -> Result<ScanResult, String> {
-    if roots.is_empty() {
-        return Err("请先添加至少一个媒体或漫画根目录".into());
-    }
+    if roots.is_empty() { return Err("没有可扫描的域根目录".into()); }
     {
-        let mut current = progress.lock().unwrap_or_else(|error| error.into_inner());
+        let mut current = progress.lock().unwrap_or_else(|e|e.into_inner());
         if current.running {
-            return Ok(ScanResult {
-                roots_scanned: current.roots_completed,
-                files_indexed: current.files_found,
-                message: "扫描正在进行中，请稍候查看进度".into(),
-            });
+            return Ok(ScanResult { roots_scanned:current.roots_completed,files_indexed:current.files_found,message:"扫描正在进行中，请稍候查看进度".into() });
         }
-        *current = ScanProgress {
-            running: true,
-            phase: "scanning".into(),
-            roots_total: roots.len(),
-            roots_completed: 0,
-            current_root: roots.first().map(|root| root.remote_path.clone()),
-            current_directory: roots.first().map(|root| root.remote_path.clone()),
-            files_found: 0,
-            directories_scanned: 0,
-            skipped_directories: 0,
-            failed_directories: Vec::new(),
-            indexing_total: 0,
-            indexing_completed: 0,
-            analysis_total: 0,
-            analysis_completed: 0,
-            percent: 0.0,
-            message: format!("正在扫描 {} 个资料库根目录", roots.len()),
-            error: None,
-        };
+        *current = ScanProgress::idle();
+        current.running=true;
+        current.phase="scanning".into();
+        current.roots_total=roots.len();
+        current.current_root=roots.first().map(|r|r.remote_path.clone());
+        current.message=format!("正在扫描 {} 个域根目录",roots.len());
     }
-
-    crate::rt::spawn(async move {
-        run_scan_library(
-            app,
-            session,
-            roots,
-            progress,
-            duplicate_progress,
-            duplicate_cancel,
-            targets,
-        )
-        .await;
-    });
-
-    Ok(ScanResult {
-        roots_scanned: 0,
-        files_indexed: 0,
-        message: "扫描任务已在后台启动，可在主页查看实时进度".into(),
-    })
+    crate::rt::spawn(async move {run_scan_library(app,roots,progress,targets).await;});
+    Ok(ScanResult {roots_scanned:0,files_indexed:0,message:"扫描任务已在后台启动，可查看实时进度".into()})
 }
-
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_scan_progress(state: State<'_, MediaLibraryState>) -> ScanProgress {
     state
@@ -2055,7 +1961,7 @@ pub struct MediaStreamInfo {
 /// 判断当前媒体是否满足 115 直连加速条件，供播放器显示来源标记。
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_media_stream_info(app: AppHandle, asset_id: String) -> Result<MediaStreamInfo, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let remote_path: String = connection
         .query_row(
             "SELECT remote_path FROM assets WHERE id = ?1 AND missing = 0",
@@ -2092,7 +1998,6 @@ pub async fn rescan_failed_directories(
     app: AppHandle,
     state: State<'_, MediaLibraryState>,
 ) -> Result<ScanResult, String> {
-    let session = require_session(&state).await?;
     let targets = load_failed_directories(&app)?;
     if targets.is_empty() {
         return Ok(ScanResult {
@@ -2106,19 +2011,11 @@ pub async fn rescan_failed_directories(
         .into_iter()
         .filter(|root| targets.contains_key(&root.id))
         .collect::<Vec<_>>();
-    launch_scan(
-        app,
-        session,
-        selected,
-        state.scan_progress.clone(),
-        state.duplicate_progress.clone(),
-        state.duplicate_cancel.clone(),
-        Some(targets),
-    )
+    launch_scan(app, selected, state.scan_progress.clone(), Some(targets))
 }
 
 fn load_failed_directories(app: &AppHandle) -> Result<HashMap<String, Vec<String>>, String> {
-    let connection = open_database(app)?;
+    let connection = crate::v2_config::open(app)?;
     let raw = connection
         .query_row(
             "SELECT value FROM settings WHERE key = ?1",
@@ -2136,7 +2033,7 @@ fn save_failed_directories(
     app: &AppHandle,
     failed: &HashMap<String, Vec<String>>,
 ) -> Result<(), String> {
-    let connection = open_database(app)?;
+    let connection = crate::v2_config::open(app)?;
     connection.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![SCAN_FAILED_DIRECTORIES_KEY, serde_json::to_string(failed).map_err(|error| error.to_string())?]).map_err(database_error)?;
     Ok(())
 }
@@ -2151,324 +2048,66 @@ fn update_scan_progress(
 
 async fn run_scan_library(
     app: AppHandle,
-    session: Session,
     roots: Vec<LibraryRoot>,
     progress: Arc<StdMutex<ScanProgress>>,
-    duplicate_progress: Arc<StdMutex<DuplicateScanProgress>>,
-    duplicate_cancel: Arc<AtomicBool>,
     targets: Option<HashMap<String, Vec<String>>>,
 ) {
-    let result = async {
-        let mut total = 0usize;
-        let mut skipped_directories = Vec::new();
-        let mut hash_candidates = Vec::new();
-        for (root_index, root) in roots.iter().enumerate() {
-            update_scan_progress(&progress, |current| {
-                current.phase = "scanning".into();
-                current.current_root = Some(root.remote_path.clone());
-                current.current_directory = Some(root.remote_path.clone());
-                current.message = format!("正在扫描根目录 {}/{}", root_index + 1, roots.len());
-            });
-            let previous_snapshots = load_directory_snapshots(&app, &root.id)?;
-            let root_targets = targets.as_ref().and_then(|all| all.get(&root.id)).cloned();
-            let result = scan_root(
-                &session,
-                root,
-                &progress,
-                root_index,
-                roots.len(),
-                &previous_snapshots,
-                root_targets,
-            )
-            .await?;
-            let files = result.files;
-            let skipped = result.skipped_directories;
-            let snapshots = result.snapshots;
-            let reused_directories = result.reused_directories;
-            let partial_scan = targets.is_some();
-            let skipped_for_persist = skipped.clone();
-            let app_for_db = app.clone();
-            let root_for_db = root.clone();
-            let progress_for_db = progress.clone();
-            let indexing_total = snapshots.len();
-            let roots_total = roots.len();
-            update_scan_progress(&progress, |current| {
-                current.phase = "indexing".into();
-                current.current_directory = None;
-                current.indexing_total = indexing_total;
-                current.indexing_completed = 0;
-                current.message =
-                    format!("正在写入根目录 {}/{} 的索引（0/{}）", root_index + 1, roots.len(), indexing_total);
-            });
-            tokio::task::spawn_blocking(move || {
-                let (hash_candidates, metadata_changed) = persist_scanned_assets(
-                    &app_for_db,
-                    &root_for_db,
-                    files,
-                    &skipped_for_persist,
-                    &snapshots,
-                    &reused_directories,
-                    partial_scan,
-                    &progress_for_db,
-                    root_index,
-                    roots_total,
-                )?;
-                let _ = reconcile_cached_thumbnails(&app_for_db, &root_for_db.id);
-                if metadata_changed {
-                    update_scan_progress(&progress_for_db, |current| {
-                        current.phase = "analyzing".into();
-                    });
-                    refresh_automatic_metadata(&app_for_db, &root_for_db, &progress_for_db)?;
-                }
-                Ok::<Vec<HashCandidate>, String>(hash_candidates)
-            })
-            .await
-            .map_err(|error| format!("后台写入索引失败：{error}"))??
-            .into_iter()
-            .for_each(|candidate| hash_candidates.push(candidate));
-            total += count_indexed_assets(&app, &root.id)?;
-            skipped_directories.extend(skipped);
-            update_scan_progress(&progress, |current| {
-                current.failed_directories = skipped_directories.clone();
-            });
-            update_scan_progress(&progress, |current| {
-                current.roots_completed = root_index + 1;
-                current.files_found = total;
-                current.skipped_directories = skipped_directories.len();
-                current.percent = ((root_index + 1) as f64 / roots.len() as f64) * 90.0;
-            });
-        }
-        // Automatically verify same-size duplicate candidates during the scan's
-        // analysis phase so DuplicateView, SmartLibraryView, and DashboardView
-        // have complete duplicate statistics right after scanning.
-        let dup_already_running = duplicate_progress
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .running;
-        if !dup_already_running {
-            if let Ok(candidates) = load_duplicate_candidates(&app, None) {
-                let unhashed: Vec<DuplicateCandidate> = candidates
-                    .iter()
-                    .filter(|c| c.content_hash.is_none())
-                    .cloned()
-                    .collect();
-                if !unhashed.is_empty() {
-                    duplicate_cancel.store(false, Ordering::Relaxed);
-                    {
-                        let mut dup = duplicate_progress
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        *dup = DuplicateScanProgress {
-                            running: true,
-                            phase: "scanning".into(),
-                            scope_root_id: None,
-                            candidates_total: unhashed.len(),
-                            processed: 0,
-                            duplicate_groups: 0,
-                            matched_files: 0,
-                            percent: 0.0,
-                            message: format!("正在校验 {} 个同大小重复候选文件", unhashed.len()),
-                            error: None,
-                        };
-                    }
-                    update_scan_progress(&progress, |current| {
-                        current.phase = "analyzing".into();
-                        current.analysis_total = unhashed.len();
-                        current.analysis_completed = 0;
-                        current.message = format!(
-                            "正在校验同大小重复候选文件（0/{}）",
-                            unhashed.len()
-                        );
-                    });
-                    for (idx, candidate) in unhashed.iter().enumerate() {
-                        if duplicate_cancel.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if let Ok(url) = remote_url(&session.endpoint, &candidate.remote_path) {
-                            let source = ProxySource {
-                                url,
-                                fallback_url: None,
-                                session: session.clone(),
-                                content_type: media_content_type(&candidate.remote_path).to_owned(),
-                                remote_path: candidate.remote_path.clone(),
-                                allow_api_fallback: true,
-                                api_url_cache: Arc::new(StdMutex::new(None)),
-                                direct_url: false,
-                                thumbnail_cache_path: None,
-                                proxy_address: None,
-                                asset_id: Some(candidate.id.clone()),
-                                cache_base_path: None,
-                                activity_tracker: None,
-                                max_cache_bytes: None,
-                            };
-                            if let Ok(content_hash) = hash_remote_asset(&source).await {
-                                if let Ok(connection) = open_database(&app) {
-                                    let _ = connection.execute(
-                                        "UPDATE assets SET content_hash = ?1 WHERE id = ?2 AND remote_path = ?3 AND missing = 0 AND size_bytes = ?4 AND etag IS ?5",
-                                        params![
-                                            content_hash,
-                                            candidate.id,
-                                            candidate.remote_path,
-                                            candidate.size_bytes,
-                                            candidate.etag
-                                        ],
-                                    );
-                                }
-                            }
-                        }
-                        let done = idx + 1;
-                        let ratio = done as f64 / unhashed.len().max(1) as f64;
-                        update_scan_progress(&progress, |current| {
-                            current.analysis_completed = done;
-                            current.percent = (90.0 + ratio * 9.0).min(99.0);
-                            current.message = format!(
-                                "正在校验同大小重复候选文件（{}/{}）",
-                                done,
-                                unhashed.len()
-                            );
-                        });
-                        if let Ok(mut dup) = duplicate_progress.lock() {
-                            dup.processed = done;
-                            dup.percent = (ratio * 100.0).min(99.0);
-                            dup.message = format!("正在读取文件哈希（{}/{}）", done, unhashed.len());
-                        }
-                    }
-                }
-                let groups = open_database(&app)
-                    .ok()
-                    .and_then(|connection| duplicate_groups_from_connection(&connection, None).ok())
-                    .unwrap_or_default();
-                let mut dup = duplicate_progress
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                dup.running = false;
-                dup.phase = "completed".into();
-                dup.percent = 100.0;
-                dup.duplicate_groups = groups.len();
-                dup.matched_files = groups.iter().map(|group| group.assets.len()).sum();
-                dup.message = if groups.is_empty() {
-                    "检查完成，未发现重复文件".into()
-                } else {
-                    format!("检查完成，发现 {} 组重复文件", groups.len())
-                };
-            }
-        }
-        if let Ok(connection) = open_database(&app) {
-            let _ = connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE); PRAGMA optimize;");
-        }
-        let message = if skipped_directories.is_empty() {
-            format!("已完成 {} 个目录的全量索引与文件分析", roots.len())
-        } else {
-            let examples = skipped_directories
-                .iter()
-                .take(3)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("、");
-            let suffix = if skipped_directories.len() > 3 {
-                " 等"
-            } else {
-                ""
+    let started = Instant::now();
+    let result: Result<ScanResult,String> = async {
+        let mut failed = load_failed_directories(&app)?;
+        let mut total=0usize;
+        let mut errors=Vec::new();
+        for (index,root) in roots.iter().enumerate() {
+            let domain:String = {
+                let connection=crate::v2_config::open(&app)?;
+                connection.query_row("SELECT domain FROM domain_roots WHERE root_id=?1",params![root.id],|r|r.get(0))
+                    .map_err(database_error)?
             };
-            format!(
-                "已完成 {} 个目录的只读扫描；跳过 {} 个无法读取的子目录（{}{}）",
-                roots.len(),
-                skipped_directories.len(),
-                examples,
-                suffix
-            )
-        };
-        let mut failed_by_root = if targets.is_some() {
-            load_failed_directories(&app).unwrap_or_default()
-        } else {
-            HashMap::<String, Vec<String>>::new()
-        };
-        if let Some(target_map) = targets.as_ref() {
-            for root_id in target_map.keys() {
-                failed_by_root.remove(root_id);
+            let paths=targets.as_ref().and_then(|t|t.get(&root.id)).cloned();
+            let jobs=paths.clone().unwrap_or_else(||vec![root.remote_path.clone()]);
+            let mut root_failed=Vec::new();
+            for path in jobs {
+                update_scan_progress(&progress,|p| {
+                    p.current_root=Some(root.remote_path.clone());p.current_directory=Some(path.clone());
+                    p.message=format!("正在扫描域 {}/{}：{}",index+1,roots.len(),path);
+                });
+                let state=app.state::<MediaLibraryState>();
+                let outcome=if paths.is_some() {
+                    crate::four_domains::scan_domain_subtree(app.clone(),state,&domain,&path).await
+                } else {
+                    crate::four_domains::scan_domain(app.clone(),state,&domain).await
+                };
+                match outcome {
+                    Ok(summary)=>{total+=summary.scanned.max(0) as usize;}
+                    Err(error)=>{root_failed.push(path.clone());errors.push(format!("{path}: {error}"));}
+                }
             }
-        }
-        for directory in &skipped_directories {
-            if let Some(root) = roots.iter().find(|root| {
-                directory == &root.remote_path
-                    || directory
-                        .starts_with(&(root.remote_path.trim_end_matches('/').to_owned() + "/"))
-            }) {
-                failed_by_root
-                    .entry(root.id.clone())
-                    .or_default()
-                    .push(directory.clone());
-            }
-        }
-        for directories in failed_by_root.values_mut() {
-            directories.sort();
-            directories.dedup();
-        }
-        let _ = save_failed_directories(&app, &failed_by_root);
-        if !hash_candidates.is_empty() {
-            let app_for_hash = app.clone();
-            let session_for_hash = session.clone();
-            crate::rt::spawn(async move {
-                hash_assets_in_background(app_for_hash, session_for_hash, hash_candidates).await;
+            failed.remove(&root.id);
+            if !root_failed.is_empty(){failed.insert(root.id.clone(),root_failed);}
+            save_failed_directories(&app,&failed)?;
+            update_scan_progress(&progress,|p| {
+                p.roots_completed=index+1;p.files_found=total;
+                p.failed_directories=failed.values().flatten().cloned().collect();
+                p.skipped_directories=p.failed_directories.len();p.percent=((index+1) as f64/roots.len() as f64)*99.0;
             });
         }
-        Ok::<ScanResult, String>(ScanResult {
-            roots_scanned: roots.len(),
-            files_indexed: total,
-            message,
-        })
-    }
-    .await;
-
-    match result {
-        Ok(result) => update_scan_progress(&progress, |current| {
-            current.running = false;
-            current.phase = "completed".into();
-            current.roots_completed = result.roots_scanned;
-            current.files_found = result.files_indexed;
-            current.current_root = None;
-            current.current_directory = None;
-            current.percent = 100.0;
-            current.message = result.message;
-            current.error = None;
-        }),
-        Err(error) => update_scan_progress(&progress, |current| {
-            current.running = false;
-            current.phase = "failed".into();
-            current.message = format!("扫描失败：{error}");
-            current.error = Some(error);
-        }),
-    }
+        if !errors.is_empty(){return Err(errors.join("；"));}
+        let connection=crate::v2_config::open(&app)?;
+        pml_set_setting(&connection,SETTING_LAST_SCAN_TIME,Some(&now().to_string()))?;
+        pml_set_setting(&connection,SETTING_LAST_SCAN_DURATION,Some(&started.elapsed().as_secs().to_string()))?;
+        Ok(ScanResult {roots_scanned:roots.len(),files_indexed:total,message:format!("已完成 {} 个域的 V2 索引",roots.len())})
+    }.await;
+    update_scan_progress(&progress,|p| {
+        p.running=false;p.percent=100.0;p.current_root=None;p.current_directory=None;
+        match result {
+            Ok(result)=>{p.phase="completed".into();p.message=result.message;p.files_found=result.files_indexed;p.roots_completed=result.roots_scanned;}
+            Err(error)=>{p.phase="failed".into();p.message="扫描失败；未完成域的原索引已保留，可重试错误目录".into();p.error=Some(error);}
+        }
+    });
 }
-
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_library_overview(app: AppHandle) -> Result<LibraryOverview, String> {
-    let connection = open_database(&app)?;
-    connection.query_row(
-        "SELECT
-           (SELECT COUNT(*) FROM library_roots),
-           COUNT(*),
-           COALESCE(SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END), 0),
-           COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
-           COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
-           COALESCE(SUM(CASE WHEN media_type IN ('comicPage', 'comicArchive', 'pdf') THEN 1 ELSE 0 END), 0),
-           (SELECT COUNT(*) FROM authors),
-           (SELECT COUNT(*) FROM collections),
-           COALESCE(SUM(size_bytes), 0),
-           (SELECT COUNT(*) FROM library_nodes),
-           (SELECT COUNT(*) FROM assets a WHERE a.missing = 0 AND NOT EXISTS (SELECT 1 FROM playback_progress p WHERE p.asset_id = a.id)),
-           COALESCE(SUM(CASE WHEN media_type IN ('image', 'video') AND thumbnail_asset_id IS NULL THEN 1 ELSE 0 END), 0),
-           (SELECT MAX(scanned_at) FROM directory_sync_state),
-           (SELECT COUNT(*) FROM (SELECT content_hash, size_bytes FROM assets WHERE missing = 0 AND content_hash IS NOT NULL GROUP BY content_hash, size_bytes HAVING COUNT(*) > 1))
-         FROM assets WHERE missing = 0",
-        [],
-        |row| Ok(LibraryOverview {
-            roots: row.get(0)?, assets: row.get(1)?, images: row.get(2)?, videos: row.get(3)?,
-            short_videos: row.get(4)?, comics: row.get(5)?, authors: row.get(6)?, collections: row.get(7)?,
-            total_bytes: row.get(8)?, directories: row.get(9)?, unplayed: row.get(10)?,
-            missing_thumbnails: row.get(11)?, last_scan_time: row.get(12)?, duplicate_groups: row.get(13)?,
-        }),
-    ).map_err(database_error)
+    crate::v2_catalog::get_library_overview(app)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -2483,191 +2122,7 @@ pub fn list_library_assets(
     offset: Option<i64>,
     parent_path: Option<String>,
 ) -> Result<Vec<LibraryAsset>, String> {
-    let connection = open_database(&app)?;
-    let filter = filter.unwrap_or_else(|| "all".into());
-    let mut clauses = vec!["asset.missing = 0".to_string()];
-    let mut values: Vec<Box<dyn ToSql>> = Vec::new();
-    if let Some(parent_path) = parent_path.filter(|value| !value.trim().is_empty()) {
-        clauses.push("asset.parent_path = ?".into());
-        values.push(Box::new(parent_path));
-    }
-    match filter.as_str() {
-        "images" => {
-            clauses.push("root.kind = 'media'".into());
-            clauses.push("asset.media_type = 'image'".into());
-        }
-        "videos" => {
-            clauses.push("root.kind = 'media'".into());
-            clauses.push("asset.media_type = 'video'".into());
-        }
-        // The short-video route is a presentation mode, not a duration filter.
-        // It intentionally includes every indexed video.
-        "shortVideos" => {
-            clauses.push("root.kind = 'media'".into());
-            clauses.push("asset.media_type = 'video'".into());
-        }
-        "comics" => clauses.push("root.kind = 'comics'".into()),
-        "all" => clauses.push("root.kind = 'media'".into()),
-        "recent" => clauses.push("root.kind = 'media'".into()),
-        "unplayed" => {
-            clauses.push("root.kind = 'media'".into());
-            clauses.push("NOT EXISTS (SELECT 1 FROM playback_progress watched WHERE watched.asset_id = asset.id)".into());
-        }
-        "missingCovers" => {
-            clauses.push("root.kind = 'media'".into());
-            clauses.push("asset.media_type IN ('image', 'video') AND asset.thumbnail_asset_id IS NULL".into());
-        }
-        "largeFiles" => {
-            clauses.push("root.kind = 'media'".into());
-            clauses.push("asset.size_bytes >= 104857600".into());
-        }
-        "longVideos" => {
-            clauses.push("root.kind = 'media'".into());
-            clauses.push("asset.media_type = 'video' AND asset.duration_seconds >= 600".into());
-        }
-        "duplicates" => {
-            clauses.push("root.kind = 'media'".into());
-            clauses.push("asset.content_hash IS NOT NULL AND asset.content_hash IN (SELECT content_hash FROM assets WHERE missing = 0 AND content_hash IS NOT NULL GROUP BY content_hash, size_bytes HAVING COUNT(*) > 1)".into());
-        }
-        _ => return Err("不支持的媒体筛选条件".into()),
-    }
-    if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
-        clauses.push("(asset.file_name LIKE ? OR asset.remote_path LIKE ? OR author.name LIKE ? OR collection.name LIKE ?)".into());
-        let value = format!("%{}%", query.trim());
-        for _ in 0..4 {
-            values.push(Box::new(value.clone()));
-        }
-    }
-    if let Some(author_id) = author_id.filter(|value| !value.is_empty()) {
-        if author_id == "unassigned" {
-            clauses.push("metadata.author_id IS NULL".into());
-        } else {
-            clauses.push("metadata.author_id = ?".into());
-            values.push(Box::new(author_id));
-        }
-    }
-    if let Some(collection_id) = collection_id.filter(|value| !value.is_empty()) {
-        if collection_id == "unassigned" {
-            clauses.push("metadata.collection_id IS NULL".into());
-        } else {
-            clauses.push("metadata.collection_id IN (WITH RECURSIVE collection_sub(id) AS (SELECT id FROM collections WHERE id = ? UNION ALL SELECT c.id FROM collections c JOIN collection_sub s ON c.parent_id = s.id) SELECT id FROM collection_sub)".into());
-            values.push(Box::new(collection_id));
-        }
-    }
-    if let Some(category_id) = category_id.filter(|value| !value.is_empty()) {
-        if category_id == "uncategorized" {
-            clauses.push("metadata.category_id IS NULL".into());
-        } else {
-            clauses.push("metadata.category_id IN (WITH RECURSIVE cat_sub(id) AS (SELECT id FROM categories WHERE id = ? UNION ALL SELECT c.id FROM categories c JOIN cat_sub s ON c.parent_id = s.id) SELECT id FROM cat_sub)".into());
-            values.push(Box::new(category_id));
-        }
-    }
-    // Keep API responses bounded on low-memory NAS devices. Callers should
-    // paginate with offset for larger collections instead of requesting the
-    // entire index in one JSON response.
-    let limit = limit.unwrap_or(1000).clamp(1, 5_000);
-    let offset = offset.unwrap_or(0).max(0);
-    values.push(Box::new(limit));
-    values.push(Box::new(offset));
-    let order_clause = if filter == "recent" {
-        "ORDER BY asset.modified_ts DESC, asset.name_sort, asset.id"
-    } else if filter == "largeFiles" || filter == "longVideos" {
-        "ORDER BY asset.size_bytes DESC, asset.name_sort, asset.id"
-    } else if filter == "shortVideos" {
-        // Do not rank the entire video table at request time. The previous
-        // window function forced SQLite to sort every indexed video before it
-        // could return the first page. The scan order is stable and the feed
-        // client shuffles the returned page into a session queue.
-        "ORDER BY asset.file_name COLLATE NOCASE, asset.id"
-    } else {
-        "ORDER BY asset.file_name COLLATE NOCASE, asset.id"
-    };
-    let sql = format!(
-        "SELECT asset.id, asset.root_id, root.kind, asset.remote_path, asset.file_name, asset.parent_path,
-                asset.media_type, asset.size_bytes, asset.duration_seconds, metadata.category_id, category.name,
-                metadata.author_id, author.name, metadata.collection_id, collection.name, metadata.origin,
-                asset.content_hash, asset.thumbnail_asset_id
-         FROM assets asset
-         JOIN library_roots root ON root.id = asset.root_id
-         LEFT JOIN asset_metadata metadata ON metadata.asset_id = asset.id
-         LEFT JOIN categories category ON category.id = metadata.category_id
-         LEFT JOIN authors author ON author.id = metadata.author_id
-         LEFT JOIN collections collection ON collection.id = metadata.collection_id
-         WHERE {} {} LIMIT ? OFFSET ?", clauses.join(" AND "), order_clause
-    );
-    let mut statement = connection.prepare(&sql).map_err(database_error)?;
-    let params = values
-        .iter()
-        .map(|value| value.as_ref() as &dyn ToSql)
-        .collect::<Vec<_>>();
-    let rows = statement
-        .query_map(params.as_slice(), |row| {
-            let root_kind: String = row.get(2)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                root_kind,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<i64>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, Option<String>>(13)?,
-                row.get::<_, Option<String>>(14)?,
-                row.get::<_, Option<String>>(15)?,
-                row.get::<_, Option<String>>(16)?,
-                row.get::<_, Option<String>>(17)?,
-            ))
-        })
-        .map_err(database_error)?;
-    rows.map(|row| {
-        let (
-            id,
-            root_id,
-            root_kind,
-            remote_path,
-            file_name,
-            parent_path,
-            media_type,
-            size_bytes,
-            duration_seconds,
-            category_id,
-            category_name,
-            author_id,
-            author_name,
-            collection_id,
-            collection_name,
-            metadata_origin,
-            content_hash,
-            thumbnail_asset_id,
-        ) = row.map_err(database_error)?;
-        Ok(LibraryAsset {
-            id,
-            root_id,
-            root_kind: LibraryRootKind::from_str(&root_kind)?,
-            remote_path,
-            file_name,
-            parent_path,
-            media_type,
-            size_bytes,
-            duration_seconds,
-            category_id,
-            category_name,
-            author_id,
-            author_name,
-            collection_id,
-            collection_name,
-            metadata_origin,
-            content_hash,
-            thumbnail_asset_id,
-        })
-    })
-    .collect()
+    crate::v2_catalog::list_library_assets(app, filter, query, author_id, collection_id, category_id, limit, offset, parent_path)
 }
 
 struct VideoBoundsCache {
@@ -2740,277 +2195,7 @@ pub fn list_short_video_feed(
     author_id: Option<String>,
     max_duration_seconds: Option<i64>,
 ) -> Result<ShortVideoFeedPage, String> {
-    let connection = open_database(&app)?;
-    let limit = limit.unwrap_or(24).clamp(1, 48) as usize;
-
-    let mut page_items: Vec<(String, i64)> = Vec::with_capacity(limit);
-
-    // Case A: Filtered by specific author
-    if let Some(ref aid) = author_id.filter(|a| !a.trim().is_empty()) {
-        let mut sql = "SELECT asset.id, asset.rowid FROM assets asset
-                       JOIN asset_metadata metadata ON metadata.asset_id = asset.id
-                       WHERE asset.media_type = 'video' AND asset.missing = 0
-                         AND metadata.author_id = ?1
-                         AND (
-                           asset.file_name LIKE '%.mp4' OR asset.file_name LIKE '%.webm' OR
-                           asset.file_name LIKE '%.mov' OR asset.file_name LIKE '%.m4v'
-                         )".to_string();
-        if let Some(max_sec) = max_duration_seconds.filter(|s| *s > 0) {
-            sql.push_str(&format!(" AND (asset.duration_seconds IS NULL OR asset.duration_seconds <= {max_sec})"));
-        }
-        sql.push_str(" ORDER BY asset.rowid ASC");
-        let mut stmt = connection.prepare(&sql).map_err(database_error)?;
-        let mut author_items: Vec<(String, i64)> = Vec::new();
-        if let Ok(rows) = stmt.query_map(params![aid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
-            for item in rows.flatten() {
-                author_items.push(item);
-            }
-        }
-        if author_items.is_empty() {
-            return Ok(ShortVideoFeedPage {
-                items: Vec::new(),
-                next_cursor: None,
-                stream_sources: None,
-            });
-        }
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
-        author_items.shuffle(&mut rng);
-        author_items.truncate(limit);
-        page_items = author_items;
-    } else {
-        // Case B: Global multi-point discrete random sampling across library
-        let (min_rowid, max_rowid, total) = get_video_bounds(&connection)?;
-
-        if total == 0 || max_rowid < min_rowid {
-            return Ok(ShortVideoFeedPage {
-                items: Vec::new(),
-                next_cursor: None,
-                stream_sources: None,
-            });
-        }
-
-        let range = (max_rowid - min_rowid + 1).max(1) as u64;
-        let mut seen_ids = std::collections::HashSet::new();
-
-        let query_sql = if let Some(max_sec) = max_duration_seconds.filter(|s| *s > 0) {
-            format!(
-                "SELECT id, rowid FROM assets
-                 WHERE media_type = 'video' AND missing = 0
-                   AND remote_path NOT LIKE '%inbox%'
-                   AND remote_path NOT LIKE '%暂存%'
-                   AND remote_path NOT LIKE '%未分类%'
-                   AND remote_path NOT LIKE '%pending%'
-                   AND (
-                     file_name LIKE '%.mp4' OR file_name LIKE '%.webm' OR
-                     file_name LIKE '%.mov' OR file_name LIKE '%.m4v'
-                   )
-                   AND (duration_seconds IS NULL OR duration_seconds <= {max_sec})
-                   AND rowid >= ?1
-                 ORDER BY rowid ASC
-                 LIMIT 1"
-            )
-        } else {
-            "SELECT id, rowid FROM assets
-             WHERE media_type = 'video' AND missing = 0
-               AND remote_path NOT LIKE '%inbox%'
-               AND remote_path NOT LIKE '%暂存%'
-               AND remote_path NOT LIKE '%未分类%'
-               AND remote_path NOT LIKE '%pending%'
-               AND (
-                 file_name LIKE '%.mp4' OR file_name LIKE '%.webm' OR
-                 file_name LIKE '%.mov' OR file_name LIKE '%.m4v'
-               )
-               AND rowid >= ?1
-             ORDER BY rowid ASC
-             LIMIT 1".to_string()
-        };
-
-        let mut stmt = connection.prepare(&query_sql).map_err(database_error)?;
-        let max_probes = (limit * 4).max(48);
-        for _ in 0..max_probes {
-            if page_items.len() >= limit {
-                break;
-            }
-            let target_rowid = min_rowid + (OsRng.next_u64() % range) as i64;
-            let mut row_opt: Option<(String, i64)> = None;
-
-            if let Ok(mut rows) = stmt.query(params![target_rowid]) {
-                if let Ok(Some(row)) = rows.next() {
-                    if let (Ok(id), Ok(rid)) = (row.get::<_, String>(0), row.get::<_, i64>(1)) {
-                        row_opt = Some((id, rid));
-                    }
-                }
-            }
-
-            // If target was near the end of table, wrap around to min_rowid
-            if row_opt.is_none() {
-                if let Ok(mut rows) = stmt.query(params![min_rowid]) {
-                    if let Ok(Some(row)) = rows.next() {
-                        if let (Ok(id), Ok(rid)) = (row.get::<_, String>(0), row.get::<_, i64>(1)) {
-                            row_opt = Some((id, rid));
-                        }
-                    }
-                }
-            }
-
-            if let Some((id, rid)) = row_opt {
-                if seen_ids.insert(id.clone()) {
-                    page_items.push((id, rid));
-                }
-            }
-        }
-
-        // Safety fallback: if multi-point probe found fewer than needed (e.g. small library),
-        // grab remaining sequentially from min_rowid (native browser formats only!)
-        if page_items.len() < limit && total > page_items.len() {
-            let needed = limit - page_items.len();
-            let fallback_sql = if let Some(max_sec) = max_duration_seconds.filter(|s| *s > 0) {
-                format!(
-                    "SELECT id, rowid FROM assets
-                     WHERE media_type = 'video' AND missing = 0
-                       AND (file_name LIKE '%.mp4' OR file_name LIKE '%.webm' OR file_name LIKE '%.mov' OR file_name LIKE '%.m4v')
-                       AND (duration_seconds IS NULL OR duration_seconds <= {max_sec})
-                       AND rowid >= ?1
-                     ORDER BY rowid ASC
-                     LIMIT ?2"
-                )
-            } else {
-                "SELECT id, rowid FROM assets
-                 WHERE media_type = 'video' AND missing = 0
-                   AND (file_name LIKE '%.mp4' OR file_name LIKE '%.webm' OR file_name LIKE '%.mov' OR file_name LIKE '%.m4v')
-                   AND rowid >= ?1
-                 ORDER BY rowid ASC
-                 LIMIT ?2".to_string()
-            };
-            if let Ok(mut fallback_stmt) = connection.prepare(&fallback_sql) {
-                if let Ok(rows) = fallback_stmt.query_map(params![min_rowid, needed as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                }) {
-                    for (id, rid) in rows.filter_map(|r| r.ok()) {
-                        if seen_ids.insert(id.clone()) {
-                            page_items.push((id, rid));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if page_items.is_empty() {
-        return Ok(ShortVideoFeedPage {
-            items: Vec::new(),
-            next_cursor: None,
-            stream_sources: None,
-        });
-    }
-
-    let next_cursor = Some(format!("v8|{}", OsRng.next_u64()));
-    let page_ids: Vec<String> = page_items.into_iter().map(|(id, _)| id).collect();
-
-    // Query full asset records with author metadata for the selected batch
-    let placeholders = vec!["?"; page_ids.len()].join(",");
-    let query = format!(
-        "SELECT asset.id, asset.root_id, root.kind, asset.remote_path,
-                asset.file_name, asset.parent_path, asset.size_bytes,
-                asset.duration_seconds, asset.content_hash, asset.thumbnail_asset_id,
-                metadata.author_id, author.name, metadata.collection_id, collection.name,
-                metadata.category_id, category.name
-         FROM assets asset
-         JOIN library_roots root ON root.id = asset.root_id
-         LEFT JOIN asset_metadata metadata ON metadata.asset_id = asset.id
-         LEFT JOIN authors author ON author.id = metadata.author_id
-         LEFT JOIN collections collection ON collection.id = metadata.collection_id
-         LEFT JOIN categories category ON category.id = metadata.category_id
-         WHERE asset.id IN ({placeholders})"
-    );
-
-    let mut query_stmt = connection.prepare(&query).map_err(database_error)?;
-    let params_iter = page_ids.iter().map(|id| id as &dyn rusqlite::ToSql);
-    let params_vec: Vec<&dyn rusqlite::ToSql> = params_iter.collect();
-
-    let rows = query_stmt.query_map(params_vec.as_slice(), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, i64>(6)?,
-            row.get::<_, Option<i64>>(7)?,
-            row.get::<_, Option<String>>(8)?,
-            row.get::<_, Option<String>>(9)?,
-            row.get::<_, Option<String>>(10)?,
-            row.get::<_, Option<String>>(11)?,
-            row.get::<_, Option<String>>(12)?,
-            row.get::<_, Option<String>>(13)?,
-            row.get::<_, Option<String>>(14)?,
-            row.get::<_, Option<String>>(15)?,
-        ))
-    }).map_err(database_error)?;
-
-    let mut asset_map: HashMap<String, LibraryAsset> = HashMap::with_capacity(page_ids.len());
-    for row in rows {
-        let (
-            id,
-            root_id,
-            root_kind,
-            remote_path,
-            file_name,
-            parent_path,
-            size_bytes,
-            duration_seconds,
-            content_hash,
-            thumbnail_asset_id,
-            author_id,
-            author_name,
-            collection_id,
-            collection_name,
-            category_id,
-            category_name,
-        ) = row.map_err(database_error)?;
-        asset_map.insert(
-            id.clone(),
-            LibraryAsset {
-                id,
-                root_id,
-                root_kind: LibraryRootKind::from_str(&root_kind)?,
-                remote_path,
-                file_name,
-                parent_path,
-                media_type: "video".into(),
-                size_bytes,
-                duration_seconds,
-                category_id,
-                category_name,
-                author_id,
-                author_name,
-                collection_id,
-                collection_name,
-                metadata_origin: None,
-                content_hash,
-                thumbnail_asset_id,
-            },
-        );
-    }
-
-    // Preserve the exact random order from page_ids
-    let items: Vec<LibraryAsset> = page_ids
-        .iter()
-        .filter_map(|id| asset_map.remove(id))
-        .collect();
-
-    let stream_sources: HashMap<String, String> = items
-        .iter()
-        .map(|item| (item.id.clone(), format!("/media/{}", item.id)))
-        .collect();
-
-    Ok(ShortVideoFeedPage {
-        items,
-        next_cursor,
-        stream_sources: Some(stream_sources),
-    })
+    crate::v2_catalog::list_short_video_feed(app, _cursor, limit, author_id, max_duration_seconds)
 }
 
 #[derive(Clone, Serialize)]
@@ -3031,7 +2216,7 @@ pub fn list_comic_folders(
     root_id: String,
     parent_path: String,
 ) -> Result<Vec<ComicFolderSummary>, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let parent = if parent_path.trim().is_empty() {
         "/".to_owned()
     } else {
@@ -3058,7 +2243,7 @@ pub fn list_comic_folders(
                     WHEN media_type IN ('image','comicPage') THEN 1
                     ELSE 2
                END,
-               name_sort,
+               file_name COLLATE NOCASE,
                remote_path",
         )
         .map_err(database_error)?;
@@ -3166,89 +2351,7 @@ pub fn list_library_categories(
     filter: Option<String>,
     parent_id: Option<String>,
 ) -> Result<Vec<LibraryCategory>, String> {
-    let connection = open_database(&app)?;
-    let mut values: Vec<Box<dyn ToSql>> = Vec::new();
-    let parent_clause = match parent_id.clone().filter(|value| !value.is_empty()) {
-        Some(parent) => {
-            values.push(Box::new(parent));
-            "category.parent_id = ?"
-        }
-        None => "category.parent_id IS NULL",
-    };
-    // Categories are created only for live scanned assets and orphaned nodes
-    // are purged during scanning. The browser only needs the immediate folder
-    // names; calculating descendant counts here made every library open walk
-    // the entire asset index.
-    let sql = format!(
-        "WITH RECURSIVE
-           target_cats AS (
-             SELECT category.id, category.name, category.parent_id
-             FROM categories category
-             WHERE {parent_clause}
-           ),
-           cat_tree(root_id, id) AS (
-             SELECT id, id FROM target_cats
-             UNION ALL
-             SELECT ct.root_id, c.id FROM categories c JOIN cat_tree ct ON c.parent_id = ct.id
-           )
-         SELECT tc.id, tc.name, tc.parent_id,
-                COUNT(DISTINCT asset.id) AS media_count,
-                COUNT(DISTINCT metadata.author_id) AS author_count,
-                COUNT(DISTINCT metadata.collection_id) AS collection_count
-         FROM target_cats tc
-         LEFT JOIN cat_tree ct ON ct.root_id = tc.id
-         LEFT JOIN asset_metadata metadata ON metadata.category_id = ct.id
-         LEFT JOIN assets asset ON asset.id = metadata.asset_id AND asset.missing = 0
-         GROUP BY tc.id
-         ORDER BY tc.name COLLATE NOCASE"
-    );
-    let mut statement = connection.prepare(&sql).map_err(database_error)?;
-    let params = values
-        .iter()
-        .map(|value| value.as_ref() as &dyn ToSql)
-        .collect::<Vec<_>>();
-    let rows = statement
-        .query_map(params.as_slice(), |row| {
-            Ok(LibraryCategory {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                parent_id: row.get(2)?,
-                media_count: row.get(3).unwrap_or(0),
-                author_count: row.get(4).unwrap_or(0),
-                collection_count: row.get(5).unwrap_or(0),
-            })
-        })
-        .map_err(database_error)?;
-    let mut categories = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?;
-
-    categories.sort_by(|left, right| natural_category_cmp(&left.name, &right.name));
-
-    if parent_id.filter(|value| !value.is_empty()).is_none() {
-        let filter_clause = media_filter_clause(filter.as_deref())?;
-        let uncategorized_sql = format!(
-            "SELECT COUNT(DISTINCT asset.id), COUNT(DISTINCT metadata.author_id)
-             FROM assets asset
-             JOIN library_roots root ON root.id = asset.root_id
-             LEFT JOIN asset_metadata metadata ON metadata.asset_id = asset.id
-             WHERE asset.missing = 0 AND metadata.category_id IS NULL AND {filter_clause}"
-        );
-        let (uncat_media_count, uncat_author_count): (i64, i64) = connection
-            .query_row(&uncategorized_sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap_or((0, 0));
-        if uncat_media_count > 0 {
-            categories.push(LibraryCategory {
-                id: "uncategorized".into(),
-                name: "未分类".into(),
-                parent_id: None,
-                media_count: uncat_media_count,
-                author_count: uncat_author_count,
-                collection_count: 0,
-            });
-        }
-    }
-    Ok(categories)
+    crate::v2_catalog::list_library_categories(app, filter, parent_id)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -3257,95 +2360,7 @@ pub fn list_library_authors(
     category_id: Option<String>,
     filter: Option<String>,
 ) -> Result<Vec<LibraryAuthor>, String> {
-    let connection = open_database(&app)?;
-    let filter_clause = media_filter_clause(filter.as_deref())?;
-    let mut values: Vec<Box<dyn ToSql>> = Vec::new();
-    let category_clause = category_filter_clause(category_id, &mut values);
-    let sql = format!(
-        "SELECT author.id, author.name, author.aliases_json, author.avatar_asset_id, author.banner_asset_id,
-                COUNT(DISTINCT asset.id) AS media_count,
-                (SELECT asset_sub.id FROM assets asset_sub
-                 JOIN asset_metadata meta_sub ON meta_sub.asset_id = asset_sub.id
-                 WHERE meta_sub.author_id = author.id AND asset_sub.missing = 0
-                   AND asset_sub.remote_path NOT LIKE '%inbox%'
-                   AND asset_sub.remote_path NOT LIKE '%暂存%'
-                   AND asset_sub.remote_path NOT LIKE '%未分类%'
-                   AND asset_sub.remote_path NOT LIKE '%pending%'
-                 ORDER BY (asset_sub.media_type = 'image') DESC,
-                          asset_sub.rowid DESC LIMIT 1) AS latest_asset_id
-         FROM authors author
-         LEFT JOIN asset_metadata metadata ON metadata.author_id = author.id
-         LEFT JOIN assets asset ON asset.id = metadata.asset_id AND asset.missing = 0
-           AND asset.remote_path NOT LIKE '%inbox%'
-           AND asset.remote_path NOT LIKE '%暂存%'
-           AND asset.remote_path NOT LIKE '%未分类%'
-           AND asset.remote_path NOT LIKE '%pending%'
-         LEFT JOIN library_roots root ON root.id = asset.root_id
-         WHERE (metadata.author_id IS NOT NULL AND ({category_clause}) AND ({filter_clause}))
-         GROUP BY author.id
-         HAVING media_count > 0
-         ORDER BY media_count DESC, author.name COLLATE NOCASE"
-    );
-    let mut statement = connection.prepare(&sql).map_err(database_error)?;
-    let params = values
-        .iter()
-        .map(|value| value.as_ref() as &dyn ToSql)
-        .collect::<Vec<_>>();
-    let rows = statement
-        .query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        })
-        .map_err(database_error)?;
-    let mut authors = rows
-        .map(|row| {
-            let (id, name, aliases_json, avatar_asset_id, banner_asset_id, media_count, latest_asset_id) = row.map_err(database_error)?;
-            let aliases = serde_json::from_str(&aliases_json).unwrap_or_default();
-            Ok(LibraryAuthor {
-                id,
-                name,
-                aliases,
-                media_count,
-                collection_count: 0,
-                avatar_asset_id: avatar_asset_id.clone().or_else(|| latest_asset_id.clone()),
-                cover_asset_id: latest_asset_id,
-                banner_asset_id,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    let unassigned_sql = format!(
-        "SELECT EXISTS(
-             SELECT 1
-         FROM assets asset
-         JOIN library_roots root ON root.id = asset.root_id
-         LEFT JOIN asset_metadata metadata ON metadata.asset_id = asset.id
-         WHERE asset.missing = 0 AND metadata.author_id IS NULL AND {category_clause} AND {filter_clause}
-         LIMIT 1)"
-    );
-    let has_unassigned: bool = connection
-        .query_row(&unassigned_sql, params.as_slice(), |row| row.get(0))
-        .map_err(database_error)?;
-    if has_unassigned {
-        authors.push(LibraryAuthor {
-            id: "unassigned".into(),
-            name: "未识别作者".into(),
-            aliases: Vec::new(),
-            media_count: 0,
-            collection_count: 0,
-            avatar_asset_id: None,
-            cover_asset_id: None,
-            banner_asset_id: None,
-        });
-    }
-    Ok(authors)
+    crate::v2_catalog::list_library_authors(app, category_id, filter)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -3355,78 +2370,7 @@ pub fn list_library_collections(
     parent_id: Option<String>,
     category_id: Option<String>,
 ) -> Result<Vec<LibraryCollection>, String> {
-    let connection = open_database(&app)?;
-    // A parent collection may have no assets directly attached to it; its
-    // files are attached to leaf collections created by the path parser. Join
-    // the complete descendant tree so every visible folder has real content.
-    let mut sql = "WITH RECURSIVE descendants(ancestor_id, id) AS (
-                       SELECT id, id FROM collections
-                       UNION ALL
-                       SELECT d.ancestor_id, c.id FROM collections c JOIN descendants d ON c.parent_id = d.id
-                   )
-                   SELECT DISTINCT collection.id, collection.name, collection.author_id, author.name, collection.root_id
-                   FROM collections collection
-                   JOIN descendants d ON d.ancestor_id = collection.id
-                   JOIN asset_metadata metadata ON metadata.collection_id = d.id
-                   JOIN assets asset ON asset.id = metadata.asset_id AND asset.missing = 0
-                   LEFT JOIN authors author ON author.id = collection.author_id
-                   JOIN library_roots root ON root.id = collection.root_id
-                   WHERE root.kind = 'media'".to_owned();
-    let mut values: Vec<Box<dyn ToSql>> = Vec::new();
-    if let Some(author_id) = author_id.filter(|value| !value.is_empty()) {
-        if author_id == "unassigned" {
-            sql.push_str(" AND collection.author_id IS NULL");
-        } else {
-            sql.push_str(" AND collection.author_id = ?");
-            values.push(Box::new(author_id));
-        }
-    }
-    if let Some(category_id) = category_id.filter(|value| !value.is_empty()) {
-        if category_id == "uncategorized" {
-            sql.push_str(" AND metadata.category_id IS NULL");
-        } else {
-            sql.push_str(" AND metadata.category_id IN (WITH RECURSIVE category_sub(id) AS (SELECT id FROM categories WHERE id = ? UNION ALL SELECT c.id FROM categories c JOIN category_sub s ON c.parent_id = s.id) SELECT id FROM category_sub)");
-            values.push(Box::new(category_id));
-        }
-    }
-    if let Some(parent_id) = parent_id.filter(|value| !value.is_empty()) {
-        sql.push_str(" AND collection.parent_id = ?");
-        values.push(Box::new(parent_id));
-    } else {
-        sql.push_str(" AND collection.parent_id IS NULL");
-    }
-    sql.push_str(" ORDER BY collection.name COLLATE NOCASE");
-    let mut statement = connection.prepare(&sql).map_err(database_error)?;
-    let params = values
-        .iter()
-        .map(|value| value.as_ref() as &dyn ToSql)
-        .collect::<Vec<_>>();
-    let rows = statement
-        .query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
-        .map_err(database_error)?;
-    rows.map(|row| {
-        let (id, name, author_id, author_name, root_id) = row.map_err(database_error)?;
-        Ok(LibraryCollection {
-            id,
-            name,
-            author_id,
-            author_name,
-            root_id,
-            media_count: 0,
-            image_count: 0,
-            video_count: 0,
-            comic_count: 0,
-        })
-    })
-    .collect()
+    crate::v2_catalog::list_library_collections(app, author_id, parent_id, category_id)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -3436,13 +2380,20 @@ pub fn assign_asset_metadata(
     author_name: Option<String>,
     collection_name: Option<String>,
 ) -> Result<(), String> {
-    let connection = open_database(&app)?;
-    let (root_id, category_id): (String, Option<String>) = connection.query_row(
-        "SELECT asset.root_id, metadata.category_id FROM assets asset LEFT JOIN asset_metadata metadata ON metadata.asset_id = asset.id WHERE asset.id = ?1",
+    let mut connection = open_media_database(&app)?;
+    let connection = connection.transaction().map_err(database_error)?;
+    let (root_id, domain, category_id): (String, String, Option<String>) = connection.query_row(
+        "SELECT asset.root_id, asset.domain, metadata.category_id FROM assets asset
+         LEFT JOIN vault_items metadata ON metadata.asset_id = asset.id WHERE asset.id = ?1 AND asset.missing = 0",
         params![asset_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-        .map_err(|_| "找不到要归属的媒体文件".to_string())?;
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).map_err(|_| "找不到要归属的媒体文件".to_string())?;
+    if domain != "vault" && domain != "pending" {
+        return Err("仅媒体库和待整理域支持手动媒体归属".into());
+    }
+    if domain == "pending" && collection_name.as_ref().is_some_and(|name| !name.trim().is_empty()) {
+        return Err("待整理项目暂不支持手动合集，请移入媒体库后设置".into());
+    }
     let author_name = author_name
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
@@ -3463,13 +2414,32 @@ pub fn assign_asset_metadata(
         )?),
         None => None,
     };
-    connection.execute(
-        "INSERT INTO asset_metadata (asset_id, category_id, author_id, collection_id, origin, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'user', ?5)
-         ON CONFLICT(asset_id) DO UPDATE SET category_id = excluded.category_id, author_id = excluded.author_id, collection_id = excluded.collection_id, origin = 'user', updated_at = excluded.updated_at",
-        params![asset_id, category_id, author_id, collection_id, now()],
-    ).map_err(database_error)?;
-    Ok(())
+    if domain == "pending" {
+        let updated = connection.execute(
+            "UPDATE pending_items SET manual_author_id = ?2,
+             assignment_status = CASE WHEN ?2 IS NOT NULL AND COALESCE(manual_category_id,recommended_category_id) IS NOT NULL THEN 'ready' ELSE 'triage' END,
+             conflict_reason = NULL, updated_at = ?3 WHERE asset_id = ?1",
+            params![asset_id, author_id, now()],
+        ).map_err(database_error)?;
+        if updated == 0 {
+            return Err("待整理媒体缺少项目记录，请先刷新待整理目录".into());
+        }
+        connection.execute(
+            "UPDATE pending_projects SET
+             triage_count=(SELECT COUNT(*) FROM pending_items WHERE project_id=pending_projects.id AND assignment_status='triage'),
+             ready_count=(SELECT COUNT(*) FROM pending_items WHERE project_id=pending_projects.id AND assignment_status='ready' AND conflict_reason IS NULL),
+             updated_at=?2 WHERE id=(SELECT project_id FROM pending_items WHERE asset_id=?1)",
+            params![asset_id, now()],
+        ).map_err(database_error)?;
+    } else {
+        connection.execute(
+            "INSERT INTO vault_items (asset_id, category_id, author_id, collection_id, source, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'user', ?5)
+             ON CONFLICT(asset_id) DO UPDATE SET author_id = excluded.author_id, collection_id = excluded.collection_id, source = 'user', updated_at = excluded.updated_at",
+            params![asset_id, category_id, author_id, collection_id, now()],
+        ).map_err(database_error)?;
+    }
+    connection.commit().map_err(database_error)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -3481,7 +2451,7 @@ pub fn set_asset_duration(
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         return Ok(());
     }
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     connection
         .execute(
             "UPDATE assets SET duration_seconds = ?1 WHERE id = ?2 AND media_type = 'video'",
@@ -3493,17 +2463,7 @@ pub fn set_asset_duration(
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_asset_playback_progress(app: AppHandle, asset_id: String) -> Result<f64, String> {
-    let connection = open_database(&app)?;
-    let position = connection
-        .query_row(
-            "SELECT position_seconds FROM playback_progress WHERE asset_id = ?1",
-            params![asset_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(database_error)?
-        .unwrap_or(0);
-    Ok(position.max(0) as f64)
+    crate::v2_state::get_asset_playback_progress(app, asset_id)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -3512,34 +2472,7 @@ pub fn set_asset_playback_progress(
     asset_id: String,
     position_seconds: f64,
 ) -> Result<(), String> {
-    if !position_seconds.is_finite() || position_seconds < 0.0 {
-        return Ok(());
-    }
-    let connection = open_database(&app)?;
-    let position = position_seconds.round().max(0.0) as i64;
-    let mut last_err = None;
-    for _ in 0..3 {
-        match connection.execute(
-            "INSERT INTO playback_progress (asset_id, position_seconds, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(asset_id) DO UPDATE SET position_seconds = excluded.position_seconds, updated_at = excluded.updated_at",
-            params![asset_id, position, now()],
-        ) {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("busy") || msg.contains("locked") {
-                    std::thread::sleep(std::time::Duration::from_millis(60));
-                    last_err = Some(e);
-                    continue;
-                }
-                return Err(database_error(e));
-            }
-        }
-    }
-    if let Some(e) = last_err {
-        return Err(database_error(e));
-    }
-    Ok(())
+    crate::v2_state::set_asset_playback_progress(app, asset_id, position_seconds)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -3547,49 +2480,7 @@ pub fn list_playback_history(
     app: AppHandle,
     limit: Option<i64>,
 ) -> Result<Vec<PlaybackHistoryItem>, String> {
-    let connection = open_database(&app)?;
-    let limit = limit.unwrap_or(100).clamp(1, 500);
-    let mut statement = connection.prepare(
-        "SELECT asset.id, asset.root_id, root.kind, asset.remote_path, asset.file_name, asset.parent_path,
-                asset.media_type, asset.size_bytes, asset.duration_seconds,
-                asset.content_hash, asset.thumbnail_asset_id, progress.position_seconds, progress.updated_at
-         FROM playback_progress progress
-         JOIN assets asset ON asset.id = progress.asset_id
-         JOIN library_roots root ON root.id = asset.root_id
-         WHERE asset.missing = 0 AND asset.media_type = 'video'
-         ORDER BY progress.updated_at DESC LIMIT ?1",
-    ).map_err(database_error)?;
-    let rows = statement
-        .query_map(params![limit], |row| {
-            let root_kind: String = row.get(2)?;
-            Ok(PlaybackHistoryItem {
-                asset: LibraryAsset {
-                    id: row.get(0)?,
-                    root_id: row.get(1)?,
-                    root_kind: LibraryRootKind::from_str(&root_kind)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    remote_path: row.get(3)?,
-                    file_name: row.get(4)?,
-                    parent_path: row.get(5)?,
-                    media_type: row.get(6)?,
-                    size_bytes: row.get(7)?,
-                    duration_seconds: row.get(8)?,
-                    category_id: None,
-                    category_name: None,
-                    author_id: None,
-                    author_name: None,
-                    collection_id: None,
-                    collection_name: None,
-                    metadata_origin: None,
-                    content_hash: row.get(9)?,
-                    thumbnail_asset_id: row.get(10)?,
-                },
-                position_seconds: row.get(11)?,
-                updated_at: row.get(12)?,
-            })
-        })
-        .map_err(database_error)?;
-    rows.map(|row| row.map_err(database_error)).collect()
+    crate::v2_state::list_playback_history(app, limit)
 }
 
 /// Return only immediate indexed directory children. This is deliberately a
@@ -3600,7 +2491,7 @@ pub fn list_library_nodes(
     root_id: String,
     parent_path: String,
 ) -> Result<Vec<LibraryNode>, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let parent = if parent_path.trim().is_empty() {
         "/".to_owned()
     } else {
@@ -3608,10 +2499,20 @@ pub fn list_library_nodes(
     };
     let mut statement = connection
         .prepare(
-            "SELECT remote_path, name
-             FROM library_nodes
-             WHERE root_id = ?1 AND parent_path = ?2
-             ORDER BY name COLLATE NOCASE",
+            "WITH prefix AS (
+                SELECT CASE WHEN ?2 = '/' THEN '/' ELSE ?2 || '/' END AS path
+             ), descendants AS (
+                SELECT substr(a.remote_path,length(p.path)+1) AS relative,p.path AS prefix
+                FROM assets a CROSS JOIN prefix p
+                WHERE a.root_id = ?1 AND a.missing = 0 AND substr(a.remote_path,1,length(p.path)) = p.path
+             ), nodes AS (
+                SELECT remote_path,name FROM provider_directory_entries
+                WHERE root_id = ?1 AND parent_path = ?2 AND is_directory = 1
+                UNION
+                SELECT prefix || substr(relative,1,instr(relative,'/')-1),
+                       substr(relative,1,instr(relative,'/')-1)
+                FROM descendants WHERE instr(relative,'/') > 0
+             ) SELECT remote_path,name FROM nodes ORDER BY name COLLATE NOCASE",
         )
         .map_err(database_error)?;
     let rows = statement
@@ -3627,37 +2528,12 @@ pub fn list_library_nodes(
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn clear_playback_history(app: AppHandle) -> Result<(), String> {
-    let connection = open_database(&app)?;
-    connection
-        .execute("DELETE FROM playback_progress", [])
-        .map_err(database_error)?;
-    Ok(())
+    crate::v2_state::clear_playback_history(app)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn toggle_favorite(app: AppHandle, asset_id: String) -> Result<bool, String> {
-    let connection = open_database(&app)?;
-    let exists: bool = connection
-        .query_row(
-            "SELECT 1 FROM favorites WHERE asset_id = ?1",
-            params![asset_id],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if exists {
-        connection
-            .execute("DELETE FROM favorites WHERE asset_id = ?1", params![asset_id])
-            .map_err(database_error)?;
-        Ok(false)
-    } else {
-        connection
-            .execute(
-                "INSERT INTO favorites (asset_id, created_at) VALUES (?1, ?2) ON CONFLICT(asset_id) DO NOTHING",
-                params![asset_id, now()],
-            )
-            .map_err(database_error)?;
-        Ok(true)
-    }
+    crate::v2_state::toggle_favorite(app, asset_id)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -3666,106 +2542,36 @@ pub fn list_favorite_assets(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<LibraryAsset>, String> {
-    let connection = open_database(&app)?;
-    let limit = limit.unwrap_or(50).clamp(1, 200);
-    let offset = offset.unwrap_or(0).max(0);
-    let mut statement = connection
-        .prepare(
-            "SELECT asset.id, asset.root_id, root.kind, asset.remote_path, asset.file_name, asset.parent_path,
-                    asset.media_type, asset.size_bytes, asset.duration_seconds,
-                    asset.content_hash, asset.thumbnail_asset_id
-             FROM favorites fav
-             JOIN assets asset ON asset.id = fav.asset_id
-             JOIN library_roots root ON root.id = asset.root_id
-             WHERE asset.missing = 0
-             ORDER BY fav.created_at DESC LIMIT ?1 OFFSET ?2",
-        )
-        .map_err(database_error)?;
-    let rows = statement
-        .query_map(params![limit, offset], |row| {
-            let root_kind: String = row.get(2)?;
-            Ok(LibraryAsset {
-                id: row.get(0)?,
-                root_id: row.get(1)?,
-                root_kind: LibraryRootKind::from_str(&root_kind)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                remote_path: row.get(3)?,
-                file_name: row.get(4)?,
-                parent_path: row.get(5)?,
-                media_type: row.get(6)?,
-                size_bytes: row.get(7)?,
-                duration_seconds: row.get(8)?,
-                category_id: None,
-                category_name: None,
-                author_id: None,
-                author_name: None,
-                collection_id: None,
-                collection_name: None,
-                metadata_origin: None,
-                content_hash: row.get(9)?,
-                thumbnail_asset_id: row.get(10)?,
-            })
-        })
-        .map_err(database_error)?;
-    rows.map(|r| r.map_err(database_error)).collect()
+    crate::v2_state::list_favorite_assets(app, limit, offset)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn list_favorite_ids(app: AppHandle) -> Result<Vec<String>, String> {
-    let connection = open_database(&app)?;
-    let mut statement = connection
-        .prepare("SELECT asset_id FROM favorites ORDER BY created_at DESC")
-        .map_err(database_error)?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(database_error)?;
-    rows.map(|r| r.map_err(database_error)).collect()
+    crate::v2_state::list_favorite_ids(app)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn sync_favorites(app: AppHandle, asset_ids: Vec<String>) -> Result<(), String> {
-    if asset_ids.is_empty() {
-        return Ok(());
-    }
-    let mut connection = open_database(&app)?;
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(database_error)?;
-    let current_time = now();
-    {
-        let mut stmt = tx
-            .prepare("INSERT OR IGNORE INTO favorites (asset_id, created_at) VALUES (?1, ?2)")
-            .map_err(database_error)?;
-        for id in asset_ids {
-            let _ = stmt.execute(params![id, current_time]);
-        }
-    }
-    tx.commit().map_err(database_error)?;
-    Ok(())
+    crate::v2_state::sync_favorites(app, asset_ids)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_favorite_count(app: AppHandle) -> Result<i64, String> {
-    let connection = open_database(&app)?;
-    let count = connection
-        .query_row(
-            "SELECT COUNT(*) FROM favorites fav JOIN assets asset ON asset.id = fav.asset_id WHERE asset.missing = 0",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    Ok(count)
+    crate::v2_state::get_favorite_count(app)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_cache_stats(app: AppHandle) -> Result<CacheStats, String> {
     let cache_base = cache_base_path(&app)?;
-    let database_bytes = fs::metadata(database_path(&app)?)
+    let connection = open_media_database(&app)?;
+    let database_bytes = fs::metadata(connection.path().ok_or("V2 数据库没有文件路径")?)
         .map(|meta| meta.len())
         .unwrap_or(0);
     let (short_video_history_count, total_indexed_files, total_indexed_directories) = {
-        let conn = open_database(&app)?;
+        let conn = open_media_database(&app)?;
         let history = conn
             .query_row(
-                "SELECT COUNT(*) FROM playback_progress progress JOIN assets asset ON asset.id = progress.asset_id WHERE asset.media_type = 'video'",
+                "SELECT COUNT(*) FROM asset_state progress JOIN assets asset ON asset.id = progress.asset_id WHERE asset.media_type = 'video' AND progress.progress_seconds IS NOT NULL",
                 [],
                 |row| row.get(0),
             )
@@ -3774,7 +2580,7 @@ pub fn get_cache_stats(app: AppHandle) -> Result<CacheStats, String> {
             .query_row("SELECT COUNT(*) FROM assets WHERE missing = 0", [], |row| row.get(0))
             .unwrap_or(0);
         let dirs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM library_nodes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM (SELECT domain,remote_path FROM provider_directory_entries WHERE is_directory=1 UNION SELECT domain,parent_path FROM assets WHERE missing=0)", [], |row| row.get(0))
             .unwrap_or(0);
         (history, files, dirs)
     };
@@ -3805,11 +2611,10 @@ pub fn clear_cache(app: AppHandle, target: String) -> Result<(), String> {
     let cache_base = cache_base_path(&app)?;
     match target.as_str() {
         "thumbnails" => {
+            let connection = open_media_database(&app)?;
             remove_cache_directory(&cache_base.join("thumbnails"))?;
             invalidate_thumbnail_file_index();
-            if let Ok(connection) = open_database(&app) {
-                let _ = connection.execute("UPDATE assets SET thumbnail_asset_id = NULL", []);
-            }
+            connection.execute("UPDATE assets SET thumbnail_asset_id = NULL", []).map_err(database_error)?;
             Ok(())
         }
         "comics" => {
@@ -3824,9 +2629,9 @@ pub fn clear_cache(app: AppHandle, target: String) -> Result<(), String> {
             remove_cache_directory(&cache_base.join("comic-archives"))
         }
         "shortVideos" => {
-            open_database(&app)?
+            open_media_database(&app)?
                 .execute(
-                    "DELETE FROM playback_progress WHERE asset_id IN (SELECT id FROM assets WHERE media_type = 'video')",
+                    "UPDATE asset_state SET progress_seconds=NULL,last_opened_at=NULL,updated_at=strftime('%s','now') WHERE asset_id IN (SELECT id FROM assets WHERE media_type = 'video')",
                     [],
                 )
                 .map_err(database_error)?;
@@ -3845,7 +2650,7 @@ const SETTING_LAST_SCAN_DURATION: &str = "last_scan_duration_secs";
 const SETTING_SHORT_VIDEO_CACHE_MAX_BYTES: &str = "short_video_cache_max_bytes";
 
 pub fn get_automation_settings_internal(app: &AppHandle) -> Result<AutomationSettings, String> {
-    let connection = open_database(app)?;
+    let connection = crate::v2_config::open(app)?;
     let get_val = |k: &str| -> Option<String> {
         connection.query_row("SELECT value FROM settings WHERE key = ?1", params![k], |row| row.get(0)).ok()
     };
@@ -3882,7 +2687,7 @@ pub fn get_automation_settings(app: AppHandle) -> Result<AutomationSettings, Str
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn set_automation_settings(app: AppHandle, settings: AutomationSettings) -> Result<(), String> {
-    let connection = open_database(&app)?;
+    let connection = crate::v2_config::open(&app)?;
     let mut stmt = connection.prepare(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
     ).map_err(database_error)?;
@@ -3952,7 +2757,7 @@ pub fn invalidate_alist_accel_url_cache(path_part: &str) {
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_alist_accel_config(app: AppHandle) -> Result<AlistAccelConfig, String> {
-    let connection = open_database(&app)?;
+    let connection = crate::v2_config::open(&app)?;
     let get_val = |k: &str| -> Option<String> {
         connection.query_row("SELECT value FROM settings WHERE key = ?1", params![k], |row| row.get(0)).ok()
     };
@@ -3968,7 +2773,7 @@ pub fn get_alist_accel_config(app: AppHandle) -> Result<AlistAccelConfig, String
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn set_alist_accel_config(app: AppHandle, config: AlistAccelConfig) -> Result<(), String> {
-    let connection = open_database(&app)?;
+    let connection = crate::v2_config::open(&app)?;
     let mut stmt = connection.prepare(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
     ).map_err(database_error)?;
@@ -4228,7 +3033,7 @@ pub fn start_scheduled_scanner(app: AppHandle) {
                     prune_comic_archive_cache(&comic_dir, std::path::Path::new(""));
                 }
             }
-            if let Ok(connection) = open_database(&startup_app) {
+            if let Ok(connection) = crate::v2_config::open(&startup_app) {
                 let compacted: Option<String> = connection
                     .query_row(
                         "SELECT value FROM settings WHERE key = 'db_compact_v2'",
@@ -4309,22 +3114,7 @@ pub fn start_scheduled_scanner(app: AppHandle) {
                 }
 
                 last_run_day = Some(day_number);
-                let start_time = Instant::now();
-
-                let scan_res = scan_library(app.clone(), app.state::<MediaLibraryState>(), None, None).await;
-                if scan_res.is_ok() {
-                    let duration = start_time.elapsed().as_secs();
-                    if let Ok(connection) = open_database(&app) {
-                        let _ = connection.execute(
-                            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            params![SETTING_LAST_SCAN_TIME, now().to_string()],
-                        );
-                        let _ = connection.execute(
-                            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            params![SETTING_LAST_SCAN_DURATION, duration.to_string()],
-                        );
-                    }
-                }
+                let _ = scan_library(app.clone(), app.state::<MediaLibraryState>(), None, None).await;
             }
         }
     });
@@ -4535,7 +3325,7 @@ pub async fn open_media_thumbnail_source(
         return Ok(url);
     }
     let (remote_path, media_type) = {
-        let connection = open_database(&app)?;
+        let connection = open_media_database(&app)?;
         connection
             .query_row(
                 "SELECT remote_path, media_type FROM assets WHERE id=?1 AND missing=0",
@@ -4577,7 +3367,7 @@ pub async fn get_thumbnail_input(app: AppHandle, state: State<'_, MediaLibrarySt
         }
     }
     let (remote_path,media_type) = {
-        let c = open_database(&app)?;
+        let c = open_media_database(&app)?;
         c.query_row("SELECT remote_path,media_type FROM assets WHERE id=?1 AND missing=0",params![asset_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(database_error)?
     };
     let thumb_path = asset_thumbnail_path(&app,&asset_id)?;
@@ -4694,7 +3484,7 @@ fn persist_thumbnail_jpeg_bytes(
             .unwrap_or_else(|| now() as u128 * 1_000_000_000);
         record_thumbnail_file_in_index(directory, file_name, modified);
     }
-    if let Ok(connection) = open_database(app) {
+    if let Ok(connection) = open_media_database(app) {
         let _ = connection.execute(
             "UPDATE assets SET thumbnail_asset_id = id WHERE id = ?1",
             params![asset_id],
@@ -4761,7 +3551,7 @@ pub fn set_directory_cover(
     remote_path: String,
     cover_asset_id: String,
 ) -> Result<String, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -4817,19 +3607,12 @@ pub async fn upload_custom_cover(
         let virtual_asset_id = format!("dir_cover_{:016x}", stable_hash(&format!("{root}:{remote_path}")));
         let virtual_remote_path = format!("{remote_path}/__custom_dir_cover__.jpg");
 
-        let connection = open_database(&app)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        connection.execute(
-            "INSERT INTO assets (id, root_id, remote_path, file_name, parent_path, media_type, size_bytes, missing, scanned_at)
-             VALUES (?1, ?2, ?3, '.cover.jpg', '__pml_dir_covers__', 'image', ?4, 0, ?5)
-             ON CONFLICT(root_id, remote_path) DO UPDATE SET
-               id = ?1, missing = 0, size_bytes = ?4, scanned_at = ?5",
-            params![virtual_asset_id, root, virtual_remote_path, jpeg_bytes.len() as i64, now],
-        ).map_err(database_error)?;
+        let connection = open_media_database(&app)?;
+        let now = now();
+        upsert_directory_cover_asset(
+            &connection, &virtual_asset_id, &root, &virtual_remote_path,
+            jpeg_bytes.len() as i64, now,
+        )?;
 
         let saved_path = persist_thumbnail_jpeg_bytes(&app, &virtual_asset_id, &jpeg_bytes, None)?;
 
@@ -4860,6 +3643,30 @@ pub async fn upload_custom_cover(
         });
         Ok(url)
     }
+}
+
+fn upsert_directory_cover_asset(
+    connection: &Connection,
+    asset_id: &str,
+    root_id: &str,
+    remote_path: &str,
+    size_bytes: i64,
+    timestamp: i64,
+) -> Result<(), String> {
+    let domain: String = connection.query_row(
+        "SELECT domain FROM domain_roots WHERE root_id = ?1",
+        params![root_id], |row| row.get(0),
+    ).map_err(|_| "找不到目录封面对应的 V2 媒体根目录".to_string())?;
+    connection.execute(
+        "INSERT INTO assets (id, domain, root_id, remote_path, file_name, parent_path,
+                             media_type, size_bytes, missing, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, ?3, ?4, '.cover.jpg', '__pml_dir_covers__', 'image', ?5, 0, ?6, ?6)
+         ON CONFLICT(domain, remote_path) DO UPDATE SET
+             missing = 0, missing_since = NULL, missing_scan_count = 0,
+             size_bytes = ?5, last_seen_at = ?6",
+        params![asset_id, domain, root_id, remote_path, size_bytes, timestamp],
+    ).map_err(database_error)?;
+    Ok(())
 }
 
 static THUMBNAIL_FILE_INDEX: OnceLock<StdMutex<Option<(PathBuf, Instant, HashMap<String, u128>)>>> = OnceLock::new();
@@ -4929,7 +3736,7 @@ fn load_thumbnail_file_index(directory: &std::path::Path) -> HashMap<String, u12
 fn reconcile_cached_thumbnails(app: &AppHandle, root_id: &str) -> Result<(), String> {
     let cache_dir = cache_base_path(app)?.join("thumbnails");
     let thumb_index = load_thumbnail_file_index(&cache_dir);
-    let mut connection = open_database(app)?;
+    let mut connection = open_media_database(app)?;
     let rows = {
         let mut stmt = connection
             .prepare(
@@ -4996,7 +3803,7 @@ fn asset_thumbnail_path(app: &AppHandle, asset_id: &str) -> Result<PathBuf, Stri
         Option<String>,
         Option<String>,
     ) = {
-        let connection = open_database(app)?;
+        let connection = open_media_database(app)?;
         let mut row_res = None;
         for _ in 0..3 {
             match connection.query_row(
@@ -5057,6 +3864,12 @@ fn get_thumbnail_file_modified(directory: &std::path::Path, file_name: &str) -> 
     }
     let map = load_thumbnail_file_index(directory);
     map.get(file_name).copied()
+}
+
+/// Resolve only a locally cached cover using canonical V2 asset metadata.
+pub(crate) fn cached_asset_cover_url(app: &AppHandle, asset_id: &str) -> Option<String> {
+    let path = asset_thumbnail_path(app, asset_id).ok()?;
+    cached_cover_url(asset_id, &path)
 }
 
 fn cached_cover_url(asset_id:&str,path:&std::path::Path)->Option<String>{
@@ -5263,7 +4076,7 @@ pub async fn get_comic_archive_manifest(
     asset_id: String,
 ) -> Result<ComicArchiveManifest, String> {
     let remote_path = {
-        let connection = open_database(&app)?;
+        let connection = open_media_database(&app)?;
         connection
             .query_row(
                 "SELECT remote_path FROM assets WHERE id = ?1 AND missing = 0",
@@ -5383,7 +4196,7 @@ async fn ensure_comic_archive_cached_inner(
     asset_id: &str,
 ) -> Result<PathBuf, String> {
     let (remote_path, media_type, expected_size, expected_etag, expected_modified) = {
-        let connection = open_database(app)?;
+        let connection = open_media_database(app)?;
         connection
             .query_row(
                 "SELECT remote_path, media_type, size_bytes, etag, modified_at FROM assets WHERE id = ?1 AND missing = 0",
@@ -6003,7 +4816,7 @@ async fn ensure_remote_zip_meta(
     }
 
     let (remote_path, expected_size, expected_etag, expected_modified) = {
-        let connection = open_database(app)?;
+        let connection = open_media_database(app)?;
         connection
             .query_row(
                 "SELECT remote_path, size_bytes, etag, modified_at FROM assets WHERE id = ?1 AND missing = 0",
@@ -6062,7 +4875,7 @@ async fn fetch_remote_zip_page(
     entry: &ZipEntryMeta,
 ) -> Result<(String, Vec<u8>), String> {
     let (remote_path, expected_size) = {
-        let connection = open_database(app)?;
+        let connection = open_media_database(app)?;
         connection
             .query_row(
                 "SELECT remote_path, size_bytes FROM assets WHERE id = ?1 AND missing = 0",
@@ -6200,7 +5013,7 @@ async fn extract_rar_cover_from_prefix(
     asset_id: &str,
 ) -> Result<(String, Vec<u8>), String> {
     let (remote_path, expected_size) = {
-        let connection = open_database(app)?;
+        let connection = open_media_database(app)?;
         connection
             .query_row(
                 "SELECT remote_path, size_bytes FROM assets WHERE id = ?1 AND missing = 0",
@@ -6613,7 +5426,7 @@ fn comic_image_mime(name: &str) -> &'static str {
 fn status_from(app: Option<&AppHandle>, configured: bool, connected: bool, message: &str) -> LibraryStatus {
     let mut endpoint = None;
     if let Some(app) = app {
-        if let Ok(connection) = open_database(app) {
+        if let Ok(connection) = crate::v2_config::open(app) {
             let cd2_ep: Option<String> = connection
                 .query_row("SELECT value FROM settings WHERE key = 'cd2_endpoint'", [], |r| r.get(0))
                 .ok();
@@ -6658,296 +5471,27 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let directory = if let Ok(value) = std::env::var("PML_DATA_DIR") {
-        PathBuf::from(value)
-    } else {
-        app.path()
-            .app_data_dir()
-            .map_err(|error| format!("无法获取应用数据目录：{error}"))?
-    };
-    fs::create_dir_all(&directory).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
-    Ok(directory.join("personal-media-library.sqlite3"))
-}
 
-fn open_database(app: &AppHandle) -> Result<Connection, String> {
-    let connection = Connection::open(database_path(app)?).map_err(database_error)?;
-    #[cfg(not(target_os = "ios"))]
-    let pragma_init = "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -65536; PRAGMA mmap_size = 1073741824;";
-    #[cfg(target_os = "ios")]
-    let pragma_init = "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -8192; PRAGMA mmap_size = 0;";
-    connection
-        .execute_batch(pragma_init)
-        .map_err(database_error)?;
-    static INITIALIZED_DATABASES: OnceLock<StdMutex<HashSet<PathBuf>>> = OnceLock::new();
-    let database_key = database_path(app)?;
-    let mut initialized = INITIALIZED_DATABASES
-        .get_or_init(|| StdMutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if initialized.contains(&database_key) {
-        return Ok(connection);
-    }
-    connection.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS library_roots (
-            id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('media', 'comics')),
-            remote_path TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS assets (
-            id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES library_roots(id) ON DELETE CASCADE,
-            remote_path TEXT NOT NULL, file_name TEXT NOT NULL, parent_path TEXT NOT NULL,
-            media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0, etag TEXT,
-            content_hash TEXT,
-            thumbnail_key TEXT, thumbnail_asset_id TEXT,
-            duration_seconds INTEGER, missing INTEGER NOT NULL DEFAULT 0, scanned_at INTEGER NOT NULL,
-            UNIQUE(root_id, remote_path)
-         );
-         CREATE TABLE IF NOT EXISTS directory_sync_state (
-            root_id TEXT NOT NULL REFERENCES library_roots(id) ON DELETE CASCADE,
-            remote_path TEXT NOT NULL, scanned_at INTEGER NOT NULL,
-            PRIMARY KEY(root_id, remote_path)
-         );
-         CREATE TABLE IF NOT EXISTS directory_snapshots (
-            root_id TEXT NOT NULL REFERENCES library_roots(id) ON DELETE CASCADE,
-            remote_path TEXT NOT NULL,
-            fingerprint TEXT NOT NULL,
-            scanned_at INTEGER NOT NULL,
-            PRIMARY KEY(root_id, remote_path)
-         );
-         CREATE TABLE IF NOT EXISTS library_nodes (
-            root_id TEXT NOT NULL REFERENCES library_roots(id) ON DELETE CASCADE,
-            remote_path TEXT NOT NULL,
-            parent_path TEXT NOT NULL,
-            name TEXT NOT NULL,
-            scanned_at INTEGER NOT NULL,
-            PRIMARY KEY(root_id, remote_path)
-         );
-         CREATE INDEX IF NOT EXISTS assets_video_feed ON assets(media_type, missing, id);
-         CREATE TABLE IF NOT EXISTS authors (
-            id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, aliases_json TEXT NOT NULL DEFAULT '[]', origin TEXT NOT NULL, created_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS categories (
-            id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, origin TEXT NOT NULL, created_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS collections (
-            id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES library_roots(id) ON DELETE CASCADE,
-            author_id TEXT REFERENCES authors(id) ON DELETE SET NULL, name TEXT NOT NULL,
-            anchor_path TEXT, origin TEXT NOT NULL, created_at INTEGER NOT NULL,
-            UNIQUE(root_id, author_id, name)
-         );
-         CREATE TABLE IF NOT EXISTS asset_metadata (
-            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
-            category_id TEXT REFERENCES categories(id) ON DELETE SET NULL,
-            author_id TEXT REFERENCES authors(id) ON DELETE SET NULL,
-            collection_id TEXT REFERENCES collections(id) ON DELETE SET NULL,
-            origin TEXT NOT NULL, updated_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS playback_progress (
-            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
-            position_seconds INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS favorites (
-            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
-            created_at INTEGER NOT NULL
-         );"
-    ).map_err(database_error)?;
-    let has_category_column = connection
-        .prepare("PRAGMA table_info(asset_metadata)")
-        .map_err(database_error)?
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?
-        .iter()
-        .any(|name| name == "category_id");
-    if !has_category_column {
-        connection.execute("ALTER TABLE asset_metadata ADD COLUMN category_id TEXT REFERENCES categories(id) ON DELETE SET NULL", [])
-            .map_err(database_error)?;
-    }
-    let author_cols = connection
-        .prepare("PRAGMA table_info(authors)")
-        .map_err(database_error)?
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?;
-    if !author_cols.iter().any(|name| name == "avatar_asset_id") {
-        let _ = connection.execute("ALTER TABLE authors ADD COLUMN avatar_asset_id TEXT", []);
-    }
-    if !author_cols.iter().any(|name| name == "banner_asset_id") {
-        let _ = connection.execute("ALTER TABLE authors ADD COLUMN banner_asset_id TEXT", []);
-    }
-
-    let has_author_fk: bool = connection
-        .prepare("PRAGMA foreign_key_list(authors)")
-        .and_then(|mut stmt| {
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let from_col: String = row.get(3)?;
-                if from_col == "avatar_asset_id" || from_col == "banner_asset_id" {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })
-        .unwrap_or(false);
-
-    if has_author_fk {
-        let _ = connection.execute_batch("
-            PRAGMA foreign_keys = OFF;
-            BEGIN TRANSACTION;
-            CREATE TABLE IF NOT EXISTS authors_new (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-                aliases_json TEXT NOT NULL DEFAULT '[]',
-                origin TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                avatar_asset_id TEXT,
-                banner_asset_id TEXT
-            );
-            INSERT OR REPLACE INTO authors_new SELECT id, name, aliases_json, origin, created_at, avatar_asset_id, banner_asset_id FROM authors;
-            DROP TABLE authors;
-            ALTER TABLE authors_new RENAME TO authors;
-            COMMIT;
-            PRAGMA foreign_keys = ON;
-        ");
-    }
-    connection
-        .execute(
-            "CREATE INDEX IF NOT EXISTS asset_metadata_category ON asset_metadata(category_id)",
-            [],
-        )
-        .map_err(database_error)?;
-    connection
-        .execute(
-            "CREATE INDEX IF NOT EXISTS asset_metadata_category_asset ON asset_metadata(category_id, asset_id)",
-            [],
-        )
-        .map_err(database_error)?;
-    connection
-        .execute_batch(
-            "CREATE INDEX IF NOT EXISTS asset_metadata_author ON asset_metadata(author_id);
-             CREATE INDEX IF NOT EXISTS asset_metadata_collection ON asset_metadata(collection_id);
-             CREATE INDEX IF NOT EXISTS asset_metadata_author_asset ON asset_metadata(author_id, asset_id);
-             CREATE INDEX IF NOT EXISTS asset_metadata_collection_asset ON asset_metadata(collection_id, asset_id);
-             CREATE INDEX IF NOT EXISTS assets_library_page ON assets(missing, root_id, media_type, file_name COLLATE NOCASE);
-             CREATE INDEX IF NOT EXISTS assets_short_video_order ON assets(root_id, missing, media_type, file_name COLLATE NOCASE, id);
-             CREATE INDEX IF NOT EXISTS playback_progress_updated ON playback_progress(updated_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_playback_history_v2 ON playback_progress(updated_at DESC, asset_id);
-             CREATE INDEX IF NOT EXISTS idx_favorites_created ON favorites(created_at DESC);
-             DROP INDEX IF EXISTS assets_root_path;
-             DROP INDEX IF EXISTS assets_media_type;
-             DROP INDEX IF EXISTS assets_missing_root;
-             DROP INDEX IF EXISTS assets_root_parent;
-             DROP INDEX IF EXISTS library_nodes_parent;
-             DROP INDEX IF EXISTS assets_short_video_cursor;
-             DROP INDEX IF EXISTS idx_assets_video_lookup;
-             DROP INDEX IF EXISTS assets_thumbnail_lookup;",
-        )
-        .map_err(database_error)?;
-    let has_content_hash = connection
-        .prepare("PRAGMA table_info(assets)")
-        .map_err(database_error)?
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?
-        .iter()
-        .any(|name| name == "content_hash");
-    if !has_content_hash {
-        connection
-            .execute("ALTER TABLE assets ADD COLUMN content_hash TEXT", [])
-            .map_err(database_error)?;
-    }
-    let asset_columns = connection
-        .prepare("PRAGMA table_info(assets)")
-        .map_err(database_error)?
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?;
-    if !asset_columns.iter().any(|name| name == "modified_at") {
-        connection.execute("ALTER TABLE assets ADD COLUMN modified_at TEXT", []).map_err(database_error)?;
-    }
-    if !asset_columns.iter().any(|name| name == "thumbnail_key") {
-        connection
-            .execute("ALTER TABLE assets ADD COLUMN thumbnail_key TEXT", [])
-            .map_err(database_error)?;
-    }
-    if !asset_columns
-        .iter()
-        .any(|name| name == "thumbnail_asset_id")
-    {
-        connection
-            .execute("ALTER TABLE assets ADD COLUMN thumbnail_asset_id TEXT", [])
-            .map_err(database_error)?;
-    }
-    connection
-        .execute(
-            "CREATE INDEX IF NOT EXISTS assets_content_hash ON assets(content_hash) WHERE content_hash IS NOT NULL",
-            [],
-        )
-        .map_err(database_error)?;
-    connection
-        .execute(
-            "CREATE INDEX IF NOT EXISTS assets_duplicate_lookup ON assets(missing, size_bytes, root_id, content_hash)",
-            [],
-        )
-        .map_err(database_error)?;
-    connection
-        .execute(
-            "CREATE INDEX IF NOT EXISTS idx_assets_playable_video ON assets(missing) WHERE media_type = 'video' AND missing = 0 AND (file_name LIKE '%.mp4' OR file_name LIKE '%.webm' OR file_name LIKE '%.mov' OR file_name LIKE '%.m4v')",
-            [],
-        )
-        .map_err(database_error)?;
-    // 树形分类/合集：加 parent_id 列以支持多级导航。
-    let has_category_parent = connection
-        .prepare("PRAGMA table_info(categories)")
-        .map_err(database_error)?
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?
-        .iter()
-        .any(|name| name == "parent_id");
-    if !has_category_parent {
-        connection
-            .execute("ALTER TABLE categories ADD COLUMN parent_id TEXT", [])
-            .map_err(database_error)?;
-    }
-    let has_collection_parent = connection
-        .prepare("PRAGMA table_info(collections)")
-        .map_err(database_error)?
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?
-        .iter()
-        .any(|name| name == "parent_id");
-    if !has_collection_parent {
-        connection
-            .execute("ALTER TABLE collections ADD COLUMN parent_id TEXT", [])
-            .map_err(database_error)?;
-    }
-    connection
-        .execute(
-            "CREATE INDEX IF NOT EXISTS categories_parent ON categories(parent_id)",
-            [],
-        )
-        .map_err(database_error)?;
-    connection
-        .execute(
-            "CREATE INDEX IF NOT EXISTS collections_parent ON collections(parent_id)",
-            [],
-        )
-        .map_err(database_error)?;
-    migrate_directory_order(&connection)?;
-    initialized.insert(database_key);
+// Media ids are canonical V2 ids. Never probe V1 before resolving playback or cache metadata.
+fn open_media_database(app: &AppHandle) -> Result<Connection, String> {
+    crate::four_domains::ensure_v2(app)?;
+    let connection = crate::four_domains::open_v2(app)?;
+    ensure_media_cover_metadata(&connection)?;
     Ok(connection)
 }
+
+fn ensure_media_cover_metadata(connection: &Connection) -> Result<(), String> {
+    // Custom covers are provider-directory metadata, not scan completion records.
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS directory_sync_state (
+            root_id TEXT NOT NULL, remote_path TEXT NOT NULL,
+            scanned_at INTEGER NOT NULL, revision TEXT NOT NULL DEFAULT '',
+            cover_asset_id TEXT,
+            PRIMARY KEY(root_id, remote_path)
+        );",
+    ).map_err(database_error)
+}
+
 
 fn database_error(error: rusqlite::Error) -> String {
     format!("本地媒体库数据库错误：{error}")
@@ -6986,7 +5530,7 @@ pub struct ProviderConfig {
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_provider_config(app: AppHandle) -> Result<ProviderConfig, String> {
-    let connection = open_database(&app)?;
+    let connection = crate::v2_config::open(&app)?;
     let get_val = |k: &str| -> Option<String> {
         connection.query_row("SELECT value FROM settings WHERE key = ?1", params![k], |r| r.get(0)).ok()
     };
@@ -7011,7 +5555,7 @@ pub fn save_provider_config(
     app: AppHandle,
     config: ProviderConfig,
 ) -> Result<(), String> {
-    let connection = open_database(&app)?;
+    let connection = crate::v2_config::open(&app)?;
     let set_val = |k: &str, v: Option<&str>| -> Result<(), String> {
         if let Some(val) = v.filter(|s| !s.trim().is_empty()) {
             connection.execute(
@@ -7037,7 +5581,7 @@ pub fn save_provider_config(
 fn library_provider_configuration(app: Option<&AppHandle>) -> Result<(ProviderKind, String, String), String> {
     // 1. 优先从 SQLite settings 读取用户界面配置（移动端与桌面端自适应持久化）
     if let Some(app) = app {
-        if let Ok(connection) = open_database(app) {
+        if let Ok(connection) = crate::v2_config::open(app) {
             let get_setting = |key: &str| -> Option<String> {
                 connection.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0)).ok()
             };
@@ -7800,94 +6344,6 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-async fn scan_root(
-    session: &Session,
-    root: &LibraryRoot,
-    progress: &Arc<StdMutex<ScanProgress>>,
-    root_index: usize,
-    roots_total: usize,
-    previous_snapshots: &HashMap<String, String>,
-    start_directories: Option<Vec<String>>,
-) -> Result<RootScanResult, String> {
-    let mut directories =
-        VecDeque::from(start_directories.unwrap_or_else(|| vec![root.remote_path.clone()]));
-    let mut visited = HashSet::new();
-    let mut files = Vec::new();
-    let mut skipped_directories = Vec::new();
-    let mut snapshots = Vec::new();
-    let mut reused_directories = Vec::new();
-    let mut first_request = true;
-    while let Some(directory) = directories.pop_front() {
-        if !visited.insert(directory.clone()) {
-            continue;
-        }
-        update_scan_progress(progress, |current| {
-            current.current_root = Some(root.remote_path.clone());
-            current.current_directory = Some(directory.clone());
-            current.directories_scanned += 1;
-            // Directory totals are not known up front. Keep the bar moving
-            // within the current root while the exact root completion remains
-            // the authoritative percentage.
-            let root_start = root_index as f64 / roots_total as f64 * 100.0;
-            let root_span = 100.0 / roots_total as f64;
-            current.percent = (root_start + (root_span * 0.7).min(root_span - 0.1)).min(99.0);
-        });
-        if !first_request {
-            tokio::time::sleep(std::time::Duration::from_millis(SCAN_REQUEST_DELAY_MS)).await;
-        }
-        first_request = false;
-        let entries = match list_directory_with_backoff(session, &directory).await {
-            Ok(entries) => entries,
-            // Some AList storage drivers advertise directories that can no longer
-            // be enumerated through AList. A broken child must not invalidate a
-            // full-library scan, but an unreadable configured root remains an error.
-            Err(error) if is_skippable_scan_error(&error) => {
-                skipped_directories.push(directory);
-                continue;
-            }
-            Err(error) => return Err(format!("扫描目录 {directory} 失败：{error}")),
-        };
-        let fingerprint = directory_fingerprint(&entries);
-        snapshots.push(DirectorySnapshot {
-            remote_path: directory.clone(),
-            fingerprint: fingerprint.clone(),
-            entries: entries.clone(),
-        });
-        let can_reuse = directory_has_reusable_fingerprint(&directory, &entries);
-        if can_reuse && previous_snapshots.get(&directory) == Some(&fingerprint) {
-            reused_directories.push(directory);
-            update_scan_progress(progress, |current| {
-                current.message = "发现未变化目录，复用已有索引".into();
-            });
-            continue;
-        }
-        for entry in entries {
-            if entry.remote_path == directory {
-                continue;
-            }
-            if entry.is_collection {
-                directories.push_back(entry.remote_path);
-            } else if media_type_for(root.kind, &entry.remote_path).is_some() {
-                files.push(entry);
-            }
-            if files.len() + directories.len() > MAX_SCAN_ENTRIES {
-                return Err(format!(
-                    "目录超过 {MAX_SCAN_ENTRIES} 项，请拆分为更小的资料库根目录"
-                ));
-            }
-        }
-        update_scan_progress(progress, |current| {
-            current.files_found = files.len();
-            current.skipped_directories = skipped_directories.len();
-        });
-    }
-    Ok(RootScanResult {
-        files,
-        skipped_directories,
-        snapshots,
-        reused_directories,
-    })
-}
 
 async fn list_directory_with_backoff(
     session: &Session,
@@ -7917,6 +6373,8 @@ fn is_retryable_scan_error(error: &str) -> bool {
         || normalized.contains("http 504")
         || normalized.contains("timeout")
         || normalized.contains("timed out")
+        || normalized.contains("decoding response body")
+        || normalized.contains("error decoding")
         || normalized.contains("请求失败")
 }
 
@@ -7977,6 +6435,8 @@ fn is_skippable_scan_error(error: &str) -> bool {
         || normalized.contains("http 504")
         || normalized.contains("timeout")
         || normalized.contains("timed out")
+        || normalized.contains("decoding response body")
+        || normalized.contains("error decoding")
         || normalized.contains("potential threats")
         || normalized.contains("<!doctype")
         || normalized.contains("<html")
@@ -8082,201 +6542,9 @@ fn media_type_for(kind: LibraryRootKind, path: &str) -> Option<&'static str> {
     }
 }
 
-fn load_directory_snapshots(
-    app: &AppHandle,
-    root_id: &str,
-) -> Result<HashMap<String, String>, String> {
-    let connection = open_database(app)?;
-    let mut statement = connection
-        .prepare("SELECT remote_path, fingerprint FROM directory_snapshots WHERE root_id = ?1")
-        .map_err(database_error)?;
-    let rows = statement
-        .query_map(params![root_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(database_error)?;
-    rows.collect::<Result<HashMap<_, _>, _>>()
-        .map_err(database_error)
-}
 
-fn count_indexed_assets(app: &AppHandle, root_id: &str) -> Result<usize, String> {
-    let connection = open_database(app)?;
-    connection
-        .query_row(
-            "SELECT COUNT(*) FROM assets WHERE root_id = ?1 AND missing = 0",
-            params![root_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count.max(0) as usize)
-        .map_err(database_error)
-}
 
-fn persist_scanned_assets(
-    app: &AppHandle,
-    root: &LibraryRoot,
-    files: Vec<DavEntry>,
-    skipped_directories: &[String],
-    snapshots: &[DirectorySnapshot],
-    reused_directories: &[String],
-    partial_scan: bool,
-    progress: &Arc<StdMutex<ScanProgress>>,
-    root_index: usize,
-    roots_total: usize,
-) -> Result<(Vec<HashCandidate>, bool), String> {
-    let metadata_changed = !files.is_empty() || reused_directories.len() < snapshots.len();
-    let hashing_enabled = content_hashing_enabled();
-    let mut connection = open_database(app)?;
-    let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(database_error)?;
-    let mut hash_candidates = Vec::new();
-    let indexing_total = snapshots.len().max(1);
-    let mut indexing_completed = 0usize;
-    let report_indexing = |completed: usize, progress: &Arc<StdMutex<ScanProgress>>| {
-        if completed == indexing_total || completed == 1 || completed % 25 == 0 {
-            let root_start = root_index as f64 / roots_total.max(1) as f64 * 100.0;
-            let root_span = 100.0 / roots_total.max(1) as f64;
-            let fraction = completed as f64 / indexing_total.max(1) as f64;
-            update_scan_progress(progress, |current| {
-                current.indexing_total = indexing_total;
-                current.indexing_completed = completed;
-                current.percent = (root_start + root_span * (0.70 + fraction * 0.20)).min(99.0);
-                current.message = format!(
-                    "正在写入根目录 {}/{} 的索引（{}/{}）",
-                    root_index + 1,
-                    roots_total,
-                    completed,
-                    indexing_total
-                );
-            });
-        }
-    };
-    if !partial_scan {
-        transaction
-            .execute(
-                "UPDATE assets SET missing = 1 WHERE root_id = ?1",
-                params![root.id],
-            )
-            .map_err(database_error)?;
 
-        transaction
-            .execute(
-                "DELETE FROM directory_snapshots WHERE root_id = ?1",
-                params![root.id],
-            )
-            .map_err(database_error)?;
-    }
-    if hashing_enabled {
-        for file in &files {
-            if media_type_for(root.kind, &file.remote_path).is_some() {
-                let id = format!(
-                    "asset-{:016x}",
-                    stable_hash(&format!("{}|{}", root.id, file.remote_path))
-                );
-                hash_candidates.push(HashCandidate {
-                    asset_id: id,
-                    remote_path: file.remote_path.clone(),
-                    size_bytes: file.size_bytes,
-                    etag: file.etag.clone(),
-                });
-            }
-        }
-    }
-    let timestamp = now();
-    for snapshot in snapshots {
-        sync_directory_entries_tx(&transaction, &root.id, root.kind, &snapshot.remote_path, snapshot.entries.clone())?;
-        transaction
-            .execute(
-                "INSERT INTO directory_snapshots (root_id, remote_path, fingerprint, scanned_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(root_id, remote_path) DO UPDATE SET fingerprint = excluded.fingerprint, scanned_at = excluded.scanned_at",
-                params![root.id, snapshot.remote_path, snapshot.fingerprint, timestamp],
-            )
-            .map_err(database_error)?;
-        let parent = parent_path(&snapshot.remote_path);
-        let name = file_name(&snapshot.remote_path);
-        let name_sort = natural_name_key(&name);
-        transaction
-            .execute(
-                "INSERT INTO library_nodes (root_id, remote_path, parent_path, name, scanned_at, name_sort)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(root_id, remote_path) DO UPDATE SET
-                   parent_path = excluded.parent_path,
-                   name = excluded.name,
-                   scanned_at = excluded.scanned_at,
-                   name_sort = CASE WHEN library_nodes.name_sort = '' THEN excluded.name_sort ELSE library_nodes.name_sort END",
-                params![root.id, snapshot.remote_path, parent, name, timestamp, name_sort],
-            )
-            .map_err(database_error)?;
-        indexing_completed += 1;
-        report_indexing(indexing_completed, progress);
-    }
-    // Preserve the previous index below directories that AList currently
-    // advertises but refuses to enumerate, and below reused unchanged subtrees.
-    for directory in skipped_directories.iter().chain(reused_directories.iter()) {
-        let trimmed = directory.trim_end_matches('/');
-        let prefix_start = format!("{trimmed}/");
-        let prefix_end = format!("{trimmed}0");
-        transaction.execute(
-            "UPDATE assets SET missing = 0 WHERE root_id = ?1 AND (remote_path = ?2 OR (remote_path >= ?3 AND remote_path < ?4))",
-            params![root.id, directory, prefix_start, prefix_end],
-        ).map_err(database_error)?;
-    }
-    propagate_directory_covers(&transaction)?;
-    transaction.commit().map_err(database_error)?;
-    Ok((hash_candidates, metadata_changed))
-}
-
-async fn hash_assets_in_background(
-    app: AppHandle,
-    session: Session,
-    candidates: Vec<HashCandidate>,
-) {
-    // Keep this deliberately sequential. A full hash reads the remote file;
-    // parallel hashing would multiply bandwidth and can overwhelm storage
-    // drivers such as 115. The scan and UI remain available while this runs.
-    for candidate in candidates {
-        let source = ProxySource {
-            url: match remote_url(&session.endpoint, &candidate.remote_path) {
-                Ok(url) => url,
-                Err(error) => {
-                    eprintln!("跳过文件哈希 {}：{error}", candidate.remote_path);
-                    continue;
-                }
-            },
-            fallback_url: None,
-            session: session.clone(),
-            content_type: media_content_type(&candidate.remote_path).to_owned(),
-            remote_path: candidate.remote_path.clone(),
-            allow_api_fallback: true,
-            api_url_cache: Arc::new(StdMutex::new(None)),
-            direct_url: false,
-            thumbnail_cache_path: None,
-            proxy_address: None,
-            asset_id: Some(candidate.asset_id.clone()),
-            cache_base_path: None,
-            activity_tracker: None,
-            max_cache_bytes: None,
-        };
-        match hash_remote_asset(&source).await {
-            Ok(content_hash) => {
-                if let Ok(connection) = open_database(&app) {
-                    let _ = connection.execute(
-                        "UPDATE assets SET content_hash = ?1
-                         WHERE id = ?2 AND remote_path = ?3 AND missing = 0
-                           AND size_bytes = ?4 AND etag IS ?5",
-                        params![
-                            content_hash,
-                            candidate.asset_id,
-                            candidate.remote_path,
-                            candidate.size_bytes,
-                            candidate.etag,
-                        ],
-                    );
-                }
-            }
-            Err(error) => eprintln!("文件哈希失败 {}：{error}", candidate.remote_path),
-        }
-    }
-}
 
 // 借鉴 czkawka 极速分块哈希算法思想：
 // 针对网盘/NAS 场景，如果对几十 GB 的视频全量计算 SHA-256，会消耗巨大带宽和时间；
@@ -8327,7 +6595,7 @@ struct DuplicateCandidate {
 }
 
 fn load_duplicate_candidates(app: &AppHandle, root_id: Option<&str>) -> Result<Vec<DuplicateCandidate>, String> {
-    let connection = open_database(app)?;
+    let connection = open_media_database(app)?;
     let sql = "SELECT id, root_id, remote_path, file_name, parent_path, media_type, size_bytes, etag, modified_at, content_hash
                FROM assets
                WHERE missing = 0 AND size_bytes > 0 AND (?1 IS NULL OR root_id = ?1)
@@ -8438,9 +6706,15 @@ async fn duplicate_scan_worker(
                 }
             };
             if let Ok(content_hash) = hash_remote_asset(&source).await {
-                if let Ok(connection) = open_database(&app) {
-                    let _ = connection.execute("UPDATE assets SET content_hash = ?1 WHERE id = ?2 AND remote_path = ?3 AND missing = 0 AND size_bytes = ?4 AND etag IS ?5",
-                        params![content_hash, candidate.id, candidate.remote_path, candidate.size_bytes, candidate.etag]);
+                let written=open_media_database(&app).and_then(|connection| {
+                    connection.execute("UPDATE assets SET content_hash = ?1 WHERE id = ?2 AND root_id = ?3 AND remote_path = ?4 AND missing = 0 AND size_bytes = ?5 AND etag IS ?6 AND modified_at IS ?7 AND content_hash IS NULL",
+                        params![content_hash,candidate.id,candidate.root_id,candidate.remote_path,candidate.size_bytes,candidate.etag,candidate.modified_at]).map_err(database_error)
+                });
+                if let Err(error)=written {
+                    let mut current=progress.lock().unwrap_or_else(|e|e.into_inner());
+                    current.running=false;current.phase="failed".into();current.error=Some(error);
+                    current.message="重复文件检查失败：无法保存 V2 哈希".into();
+                    return;
                 }
             }
         }
@@ -8449,7 +6723,15 @@ async fn duplicate_scan_worker(
         current.percent = ((index + 1) as f64 / candidates.len().max(1) as f64 * 100.0).min(99.0);
         current.message = format!("正在读取文件哈希（{}/{})", index + 1, candidates.len());
     }
-    let groups = open_database(&app).ok().and_then(|connection| duplicate_groups_from_connection(&connection, root_id.as_deref()).ok()).unwrap_or_default();
+    let groups = match open_media_database(&app).and_then(|connection|duplicate_groups_from_connection(&connection,root_id.as_deref())) {
+        Ok(groups)=>groups,
+        Err(error)=>{
+            let mut current=progress.lock().unwrap_or_else(|e|e.into_inner());
+            current.running=false;current.phase="failed".into();current.error=Some(error);
+            current.message="重复文件检查失败：无法读取 V2 分组".into();
+            return;
+        }
+    };
     let mut current = progress.lock().unwrap_or_else(|error| error.into_inner());
     current.running = false; current.phase = "completed".into(); current.percent = 100.0;
     current.duplicate_groups = groups.len(); current.matched_files = groups.iter().map(|group| group.assets.len()).sum();
@@ -8458,137 +6740,11 @@ async fn duplicate_scan_worker(
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn list_duplicate_groups(app: AppHandle, root_id: Option<String>) -> Result<Vec<DuplicateGroup>, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     duplicate_groups_from_connection(&connection, root_id.as_deref())
 }
 
-fn refresh_automatic_metadata(
-    app: &AppHandle,
-    root: &LibraryRoot,
-    progress: &Arc<StdMutex<ScanProgress>>,
-) -> Result<(), String> {
-    let connection = open_database(app)?;
-    // Rebuild automatic classification from the current full root snapshot.
-    // User-assigned metadata is intentionally preserved and only receives the
-    // newly parsed category path below.
-    connection
-        .execute(
-            "DELETE FROM asset_metadata
-             WHERE origin = 'automatic'
-               AND asset_id IN (SELECT id FROM assets WHERE root_id = ?1)",
-            params![root.id],
-        )
-        .map_err(database_error)?;
-    drop(connection);
-    rebuild_automatic_metadata(app, root, progress)
-}
 
-fn rebuild_automatic_metadata(
-    app: &AppHandle,
-    root: &LibraryRoot,
-    progress: &Arc<StdMutex<ScanProgress>>,
-) -> Result<(), String> {
-    let mut connection = open_database(app)?;
-    let assets = load_indexed_assets(&connection, root)?;
-    let analysis_total = assets.len();
-    let (analysis_start_percent, analysis_span) = {
-        let current = progress.lock().unwrap_or_else(|error| error.into_inner());
-        (current.percent, 30.0 / current.roots_total.max(1) as f64)
-    };
-    update_scan_progress(progress, |current| {
-        current.analysis_total = analysis_total;
-        current.analysis_completed = 0;
-        current.percent = analysis_start_percent;
-        current.message = format!("正在分析分类、作者和合集（0/{analysis_total}）");
-    });
-    // Keep sparse author folders as a collection segment. The decision is
-    // derived from the actual AList paths in this root, so it never changes
-    // remote files or user-assigned metadata.
-    let mut author_stats: HashMap<String, (usize, HashSet<String>)> = HashMap::new();
-    for asset in &assets {
-        let parsed = parse_asset_path(&root.remote_path, &asset.remote_path);
-        if let Some(author) = parsed.author {
-            let entry = author_stats
-                .entry(author)
-                .or_insert_with(|| (0, HashSet::new()));
-            entry.0 += 1;
-            entry.1.insert(parsed.collections.join("/"));
-        }
-    }
-    let sparse_authors = author_stats
-        .into_iter()
-        .filter(|(_, (files, collections))| *files < 10 && collections.len() < 2)
-        .map(|(author, _)| author)
-        .collect::<HashSet<_>>();
-    let mut groups: HashMap<String, Vec<IndexedAsset>> = HashMap::new();
-    for asset in assets {
-        groups
-            .entry(effective_group_anchor(
-                &root.remote_path,
-                &asset.remote_path,
-                &sparse_authors,
-            ))
-            .or_default()
-            .push(asset);
-    }
-    let mut analysis_completed = 0usize;
-    let timestamp = now();
-    let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(database_error)?;
-    for (_, group_assets) in groups {
-        if group_assets.is_empty() {
-            continue;
-        }
-        let parsed = effective_parse_asset_path(
-            &root.remote_path,
-            &group_assets[0].remote_path,
-            &sparse_authors,
-        );
-        let category_id = ensure_category_path(&transaction, &parsed.categories, "automatic")?;
-        let author_id = parsed
-            .author
-            .as_deref()
-            .map(|name| ensure_author(&transaction, name, "automatic"))
-            .transpose()?;
-        let collection_id = if parsed.collections.is_empty() {
-            None
-        } else {
-            Some(ensure_collection_path(
-                &transaction,
-                &root.id,
-                author_id.as_deref(),
-                &parsed.collections,
-                "automatic",
-            )?)
-        };
-        for asset in group_assets {
-            transaction.execute(
-                "INSERT INTO asset_metadata (asset_id, category_id, author_id, collection_id, origin, updated_at) VALUES (?1, ?2, ?3, ?4, 'automatic', ?5)
-                 ON CONFLICT(asset_id) DO UPDATE SET
-                   category_id = COALESCE(excluded.category_id, asset_metadata.category_id),
-                   author_id = CASE WHEN asset_metadata.origin = 'manual' THEN asset_metadata.author_id ELSE excluded.author_id END,
-                   collection_id = CASE WHEN asset_metadata.origin = 'manual' THEN asset_metadata.collection_id ELSE excluded.collection_id END,
-                   updated_at = excluded.updated_at",
-                params![asset.id, category_id, author_id, collection_id, timestamp],
-            ).map_err(database_error)?;
-            analysis_completed += 1;
-            if analysis_completed == analysis_total || analysis_completed % 100 == 0 {
-                update_scan_progress(progress, |current| {
-                    current.analysis_completed = analysis_completed;
-                    current.percent = (analysis_start_percent
-                        + analysis_span * analysis_completed as f64 / analysis_total.max(1) as f64)
-                        .min(99.0);
-                    current.message = format!(
-                        "正在分析分类、作者和合集（{}/{}）",
-                        analysis_completed, analysis_total
-                    );
-                });
-            }
-        }
-    }
-    transaction.commit().map_err(database_error)?;
-    purge_orphaned_metadata(&connection)?;
-    Ok(())
-}
 
 fn load_indexed_assets(
     connection: &Connection,
@@ -9029,7 +7185,7 @@ async fn register_media_source(
         Option<String>,
         Option<String>,
     ) = {
-        let connection = open_database(app)?;
+        let connection = open_media_database(app)?;
         connection
             .query_row(
                 "SELECT remote_path, media_type, size_bytes, COALESCE(etag, modified_at), content_hash FROM assets WHERE id = ?1 AND missing = 0",
@@ -11285,7 +9441,7 @@ pub struct CurateBatchMoveResult {
 }
 
 pub fn get_curator_config_internal(app: &AppHandle) -> Result<CuratorConfig, String> {
-    let connection = open_database(app)?;
+    let connection = crate::v2_config::open(app)?;
     let val: Option<String> = connection
         .query_row(
             "SELECT value FROM settings WHERE key = ?1",
@@ -11309,7 +9465,7 @@ pub fn get_curator_config(app: AppHandle) -> Result<CuratorConfig, String> {
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn save_curator_config(app: AppHandle, config: CuratorConfigUpdate) -> Result<(), String> {
-    let connection = open_database(&app)?;
+    let connection = crate::v2_config::open(&app)?;
     let mut current = get_curator_config_internal(&app).unwrap_or_default();
     if let Some(words) = config.filter_words {
         current.filter_words = words;
@@ -11482,92 +9638,16 @@ fn sync_db_after_move(
     app: &AppHandle,
     source_path: &str,
     target_path: &str,
-    is_directory: bool,
+    _is_directory: bool,
 ) -> Result<(), String> {
-    let connection = open_database(app)?;
-    let target_file_name = file_name(target_path);
-    let target_parent = parent_path(target_path);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    crate::v2_moves::reconcile(app, source_path, target_path)
+}
 
-    let roots: Vec<(String, String)> = {
-        let mut stmt = connection
-            .prepare("SELECT id, remote_path FROM library_roots")
-            .map_err(database_error)?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-            .map_err(database_error)?;
-        rows.filter_map(Result::ok).collect()
-    };
-
-    let target_root_id = roots
-        .iter()
-        .filter(|(_, root_path)| target_path.starts_with(root_path.as_str()))
-        .max_by_key(|(_, root_path)| root_path.len())
-        .map(|(id, _)| id.clone());
-
-    if let Some(root_id) = &target_root_id {
-        let _ = connection.execute(
-            "UPDATE assets SET root_id = ?1, remote_path = ?2, parent_path = ?3, file_name = ?4, scanned_at = ?5 WHERE remote_path = ?6",
-            params![root_id, target_path, target_parent, target_file_name, now, source_path],
-        );
-
-        let _ = connection.execute(
-            "UPDATE library_nodes SET root_id = ?1, remote_path = ?2, parent_path = ?3, name = ?4, scanned_at = ?5 WHERE remote_path = ?6",
-            params![root_id, target_path, target_parent, target_file_name, now, source_path],
-        );
-
-        if is_directory {
-            let source_prefix = if source_path.ends_with('/') {
-                source_path.to_string()
-            } else {
-                format!("{source_path}/")
-            };
-            let target_prefix = if target_path.ends_with('/') {
-                target_path.to_string()
-            } else {
-                format!("{target_path}/")
-            };
-            let prefix_len = source_prefix.len() as i64;
-            let source_like = format!("{source_prefix}%");
-
-            let _ = connection.execute(
-                "UPDATE assets SET root_id = ?1, remote_path = ?2 || substr(remote_path, ?3 + 1), parent_path = ?2 || substr(parent_path, ?3 + 1), scanned_at = ?4 WHERE remote_path LIKE ?5",
-                params![root_id, target_prefix, prefix_len, now, source_like],
-            );
-
-            let _ = connection.execute(
-                "UPDATE library_nodes SET root_id = ?1, remote_path = ?2 || substr(remote_path, ?3 + 1), parent_path = ?2 || substr(parent_path, ?3 + 1), scanned_at = ?4 WHERE remote_path LIKE ?5",
-                params![root_id, target_prefix, prefix_len, now, source_like],
-            );
-        }
-    } else {
-        let _ = connection.execute(
-            "UPDATE assets SET remote_path = ?1, parent_path = ?2, file_name = ?3, scanned_at = ?4 WHERE remote_path = ?5",
-            params![target_path, target_parent, target_file_name, now, source_path],
-        );
-        let _ = connection.execute(
-            "UPDATE library_nodes SET remote_path = ?1, parent_path = ?2, name = ?3, scanned_at = ?4 WHERE remote_path = ?5",
-            params![target_path, target_parent, target_file_name, now, source_path],
-        );
+fn moved_index_message(result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => "物理移动成功，已同步库索引".into(),
+        Err(error) => format!("物理移动已成功，但 V2 库索引同步失败：{error}。请刷新索引；请勿重试物理移动。"),
     }
-
-    if is_directory {
-        let source_like = format!("{}%", source_path);
-        let target_like = format!("{}%", target_path);
-        let _ = connection.execute(
-            "DELETE FROM directory_sync_state WHERE remote_path = ?1 OR remote_path LIKE ?2 OR remote_path = ?3 OR remote_path LIKE ?4",
-            params![source_path, source_like, target_path, target_like],
-        );
-        let _ = connection.execute(
-            "DELETE FROM directory_snapshots WHERE remote_path = ?1 OR remote_path LIKE ?2 OR remote_path = ?3 OR remote_path LIKE ?4",
-            params![source_path, source_like, target_path, target_like],
-        );
-    }
-
-    Ok(())
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -11601,7 +9681,7 @@ pub async fn curate_move_item(
     let move_res = webdav_move_item(&session, &source_path, &target_path, is_dir).await;
     match move_res {
         Ok(()) => {
-            let _ = sync_db_after_move(&app, &source_path, &target_path, is_dir);
+            let message = moved_index_message(sync_db_after_move(&app, &source_path, &target_path, is_dir));
             // 移动成功后清理持久化指定记录
             let _ = save_curator_config(app.clone(), CuratorConfigUpdate {
                 manual_assignments: Some([(source_path.clone(), None)].into_iter().collect()),
@@ -11610,7 +9690,7 @@ pub async fn curate_move_item(
             Ok(CurateMoveItemResult {
                 success: true,
                 status: "MOVED".into(),
-                message: "物理移动成功，已同步库索引".into(),
+                message,
                 source_path,
                 target_path,
             })
@@ -11633,11 +9713,11 @@ pub async fn curate_move_item(
             // 建目完成后再次执行移动
             match webdav_move_item(&session, &source_path, &target_path, is_dir).await {
                 Ok(()) => {
-                    let _ = sync_db_after_move(&app, &source_path, &target_path, is_dir);
+                    let message = moved_index_message(sync_db_after_move(&app, &source_path, &target_path, is_dir));
                     Ok(CurateMoveItemResult {
                         success: true,
                         status: "MOVED".into(),
-                        message: "物理移动成功，已同步库索引".into(),
+                        message,
                         source_path,
                         target_path,
                     })
@@ -11801,25 +9881,23 @@ pub async fn delete_empty_pending_batch(
     if normalized == "/" || normalized.is_empty() {
         return Err("禁止删除根目录".into());
     }
+    {
+        let connection=open_media_database(&app)?;
+        validate_pending_subtree(&connection,&normalized)?;
+    }
     let session = require_session(&state).await?;
 
     let entries = match list_directory(&session, &normalized).await {
         Ok(list) => list,
-        Err(_) => {
-            match webdav_check_exists(&session, &normalized).await {
-                Ok(false) => return Ok(true),
-                _ => Vec::new(),
-            }
+        Err(list_error) => match webdav_check_exists(&session, &normalized).await {
+            Ok(false) => { purge_pending_assets(app,normalized)?; return Ok(true); }
+            Ok(true) => return Err(format!("无法确认目录为空，已阻止删除：{list_error}")),
+            Err(check_error) => return Err(format!("无法确认目录状态，已阻止删除：{list_error}; {check_error}")),
         }
     };
 
-    let non_hidden: Vec<_> = entries
-        .into_iter()
-        .filter(|e| {
-            let name = file_name(&e.remote_path);
-            !name.starts_with('.') && name != "desktop.ini" && name != "Thumbs.db"
-        })
-        .collect();
+    // Hidden files are still content: deleting them would not be an empty-directory operation.
+    let non_hidden = entries;
 
     if !non_hidden.is_empty() {
         return Err(format!(
@@ -11843,20 +9921,7 @@ pub async fn delete_empty_pending_batch(
         .map_err(|e| format!("删除网络请求失败: {e}"))?;
     let status = res.status();
     if status == StatusCode::NO_CONTENT || status == StatusCode::OK || status == StatusCode::NOT_FOUND {
-        if let Ok(connection) = open_database(&app) {
-            let _ = connection.execute(
-                "DELETE FROM library_nodes WHERE remote_path = ?1",
-                params![normalized],
-            );
-            let _ = connection.execute(
-                "DELETE FROM directory_sync_state WHERE remote_path = ?1",
-                params![normalized],
-            );
-            let _ = connection.execute(
-                "DELETE FROM directory_snapshots WHERE remote_path = ?1",
-                params![normalized],
-            );
-        }
+        purge_pending_assets(app,normalized)?;
         Ok(true)
     } else {
         Err(format!("删除空目录失败: HTTP {status}"))
@@ -11915,29 +9980,33 @@ pub async fn pack_inbox_to_pending_batch(
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn purge_pending_assets(app: AppHandle, pending_path: String) -> Result<usize, String> {
-    let connection = open_database(&app)?;
+    let mut connection = open_media_database(&app)?;
     let normalized = normalize_remote_path(&pending_path)?;
-    let prefix = if normalized.ends_with('/') {
-        normalized.clone()
-    } else {
-        format!("{normalized}/")
-    };
-    let prefix_like = format!("{prefix}%");
-    let count = connection
-        .execute(
-            "DELETE FROM assets WHERE remote_path = ?1 OR remote_path LIKE ?2",
-            params![normalized, prefix_like],
-        )
-        .map_err(database_error)?;
-    let _ = connection.execute(
-        "DELETE FROM library_nodes WHERE remote_path = ?1 OR remote_path LIKE ?2",
-        params![normalized, prefix_like],
-    );
-    let _ = connection.execute(
-        "DELETE FROM directory_sync_state WHERE remote_path = ?1 OR remote_path LIKE ?2",
-        params![normalized, prefix_like],
-    );
+    let root_id=validate_pending_subtree(&connection,&normalized)?;
+    let prefix=format!("{}/",normalized.trim_end_matches('/'));
+    let parent=parent_path(&normalized);
+    let tx=connection.transaction().map_err(database_error)?;
+    let count=tx.execute("DELETE FROM assets WHERE domain='pending' AND (remote_path=?1 OR substr(remote_path,1,length(?2))=?2)",params![normalized,prefix]).map_err(database_error)?;
+    tx.execute("DELETE FROM provider_directory_entries WHERE domain='pending' AND (remote_path=?1 OR substr(remote_path,1,length(?2))=?2 OR parent_path=?3)",params![normalized,prefix,parent]).map_err(database_error)?;
+    tx.execute("DELETE FROM provider_directory_snapshots WHERE domain='pending' AND (parent_path=?1 OR substr(parent_path,1,length(?2))=?2 OR parent_path=?3)",params![normalized,prefix,parent]).map_err(database_error)?;
+    tx.execute("DELETE FROM directory_sync_state WHERE root_id=?1 AND (remote_path=?2 OR substr(remote_path,1,length(?3))=?3 OR remote_path=?4)",params![root_id,normalized,prefix,parent]).map_err(database_error)?;
+    tx.execute("UPDATE pending_projects SET
+        total_count=(SELECT COUNT(*) FROM pending_items WHERE project_id=pending_projects.id),
+        triage_count=(SELECT COUNT(*) FROM pending_items WHERE project_id=pending_projects.id AND assignment_status='triage'),
+        ready_count=(SELECT COUNT(*) FROM pending_items WHERE project_id=pending_projects.id AND assignment_status='ready' AND conflict_reason IS NULL),
+        updated_at=strftime('%s','now') WHERE root_id=?1",params![root_id]).map_err(database_error)?;
+    tx.execute("DELETE FROM pending_projects WHERE root_id=?1 AND total_count=0 AND (source_path=?2 OR substr(source_path,1,length(?3))=?3)",params![root_id,normalized,prefix]).map_err(database_error)?;
+    tx.commit().map_err(database_error)?;
     Ok(count)
+}
+
+fn validate_pending_subtree(connection:&Connection,path:&str)->Result<String,String> {
+    let (root_id,root):(String,String)=connection.query_row("SELECT root_id,remote_path FROM domain_roots WHERE domain='pending'",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(database_error)?;
+    let root=normalize_remote_path(&root)?;
+    if path==root || !path.starts_with(&format!("{}/",root.trim_end_matches('/'))) {
+        return Err("仅允许清理待收纳域内的批次子目录，禁止清理域根目录或其他域".into());
+    }
+    Ok(root_id)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -11946,7 +10015,7 @@ pub fn set_author_avatar(
     author_id: String,
     asset_id: Option<String>,
 ) -> Result<(), String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     connection
         .execute(
             "UPDATE authors SET avatar_asset_id = ?1 WHERE id = ?2",
@@ -11962,7 +10031,7 @@ pub fn upload_author_avatar(
     author_id: String,
     data_base64: String,
 ) -> Result<String, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let clean_base64 = data_base64
         .split(',')
         .nth(1)
@@ -11999,7 +10068,7 @@ pub fn set_author_banner(
     author_id: String,
     asset_id: Option<String>,
 ) -> Result<(), String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let updated = connection
         .execute(
             "UPDATE authors SET banner_asset_id = ?1 WHERE id = ?2 OR name = ?2",
@@ -12024,7 +10093,7 @@ pub fn upload_author_banner(
     author_id: String,
     data_base64: String,
 ) -> Result<String, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let clean_base64 = data_base64
         .split(',')
         .nth(1)
@@ -12061,7 +10130,7 @@ pub fn update_author_aliases(
     author_id: String,
     aliases: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let clean_aliases: Vec<String> = aliases
         .into_iter()
         .map(|a| a.trim().to_string())
@@ -12118,59 +10187,24 @@ fn build_asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryAsse
 }
 
 pub fn ensure_preview_file_asset(connection: &Connection, root_id: &str, path: &str) -> Result<LibraryAsset, String> {
-    let clean_path = normalize_remote_path(path)?;
-    if let Ok(asset) = connection.query_row(
-        "SELECT id, root_id, remote_path, file_name, parent_path, media_type, size_bytes, duration_seconds, thumbnail_asset_id
-         FROM assets WHERE remote_path = ?1 AND missing = 0",
-        params![clean_path],
-        build_asset_from_row,
-    ) {
-        return Ok(asset);
+    let clean_path=normalize_remote_path(path)?;
+    let (domain,root):(String,String)=connection.query_row("SELECT domain,remote_path FROM domain_roots WHERE root_id=?1",params![root_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(database_error)?;
+    let root=normalize_remote_path(&root)?;
+    if clean_path==root || !clean_path.starts_with(&format!("{}/",root.trim_end_matches('/'))) {
+        return Err("预览文件不在指定域根目录内".into());
     }
-    let file_name = clean_path.rsplit('/').next().unwrap_or(&clean_path).to_string();
-    let parent_path = if let Some(idx) = clean_path.rfind('/') {
-        clean_path[..idx].to_string()
-    } else {
-        String::new()
-    };
-    let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
-    let media_type = if ["mp4", "mkv", "avi", "mov", "flv", "wmv", "webm", "m4v", "ts"].contains(&ext.as_str()) {
-        "video"
-    } else if ["zip", "cbz", "rar", "cbr", "7z"].contains(&ext.as_str()) {
-        "comicArchive"
-    } else if ext == "pdf" {
-        "pdf"
-    } else {
-        "image"
-    }.to_string();
-
-    let asset_id = format!("asset-{:016x}", stable_hash(&clean_path));
-    connection.execute(
-        "INSERT OR REPLACE INTO assets (id, root_id, remote_path, file_name, parent_path, media_type, size_bytes, missing, scanned_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)",
-        params![asset_id, root_id, clean_path, file_name, parent_path, media_type, now()],
-    ).map_err(database_error)?;
-
-    Ok(LibraryAsset {
-        id: asset_id,
-        root_id: root_id.to_string(),
-        root_kind: LibraryRootKind::Media,
-        remote_path: clean_path,
-        file_name,
-        parent_path,
-        media_type,
-        size_bytes: 0,
-        duration_seconds: None,
-        category_id: None,
-        category_name: None,
-        author_id: None,
-        author_name: None,
-        collection_id: None,
-        collection_name: None,
-        metadata_origin: None,
-        content_hash: None,
-        thumbnail_asset_id: None,
-    })
+    let root_kind=if domain=="comics" {LibraryRootKind::Comics} else {LibraryRootKind::Media};
+    let media_type=media_type_for(root_kind,&clean_path)
+        .or_else(||media_type_for(LibraryRootKind::Comics,&clean_path))
+        .ok_or("不支持预览此文件类型")?;
+    let id=format!("asset-{:016x}",stable_hash(&format!("{domain}|{clean_path}")));
+    connection.execute("INSERT INTO assets(id,domain,root_id,remote_path,file_name,parent_path,media_type,size_bytes,missing,first_seen_at,last_seen_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,0,0,?8,?8)
+        ON CONFLICT(domain,remote_path) DO UPDATE SET root_id=excluded.root_id,missing=0,missing_since=NULL,missing_scan_count=0,last_seen_at=excluded.last_seen_at",
+        params![id,domain,root_id,clean_path,file_name(&clean_path),parent_path(&clean_path),media_type,now()]).map_err(database_error)?;
+    let mut asset=connection.query_row("SELECT id,root_id,remote_path,file_name,parent_path,media_type,size_bytes,duration_seconds,thumbnail_asset_id FROM assets WHERE domain=?1 AND remote_path=?2 AND missing=0",params![domain,clean_path],build_asset_from_row).map_err(database_error)?;
+    asset.root_kind=root_kind;
+    Ok(asset)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -12185,22 +10219,22 @@ pub async fn prepare_curation_preview(
     let path_clone = clean_path.clone();
 
     tokio::task::spawn_blocking(move || {
-        let connection = open_database(&app_handle)?;
+        let connection = open_media_database(&app_handle)?;
         let root_id = {
-            let mut stmt = connection.prepare("SELECT id, remote_path FROM library_roots").map_err(database_error)?;
+            let mut stmt = connection.prepare("SELECT root_id, remote_path FROM domain_roots").map_err(database_error)?;
             let roots = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(database_error)?;
             let mut best = String::new();
             let mut longest = 0;
             for r in roots {
                 if let Ok((rid, rpath)) = r {
-                    if path_clone.starts_with(&rpath) && rpath.len() >= longest {
+                    if (path_clone == rpath || path_clone.starts_with(&format!("{}/", rpath.trim_end_matches('/')))) && rpath.len() >= longest {
                         longest = rpath.len();
                         best = rid;
                     }
                 }
             }
             if best.is_empty() {
-                connection.query_row("SELECT id FROM library_roots LIMIT 1", [], |r| r.get(0)).unwrap_or_else(|_| "root-default".to_string())
+                return Err("预览路径不属于任何已配置域根目录".into());
             } else {
                 best
             }
@@ -12216,18 +10250,15 @@ pub async fn prepare_curation_preview(
         } else {
             let mut stmt = connection.prepare(
                 "SELECT id, root_id, remote_path, file_name, parent_path, media_type, size_bytes, duration_seconds, thumbnail_asset_id
-                 FROM assets WHERE parent_path = ?1 AND missing = 0 ORDER BY file_name ASC LIMIT 200"
+                 FROM assets WHERE parent_path = ?1 AND root_id=?2 AND missing = 0 ORDER BY file_name COLLATE NOCASE,remote_path LIMIT 200"
             ).map_err(database_error)?;
-            let children = stmt.query_map(params![path_clone], build_asset_from_row).map_err(database_error)?;
-            let mut assets: Vec<LibraryAsset> = children.filter_map(|r| r.ok()).collect();
+            let children = stmt.query_map(params![path_clone,root_id], build_asset_from_row).map_err(database_error)?;
+            let mut assets = children.collect::<Result<Vec<_>,_>>().map_err(database_error)?;
+            let domain:String=connection.query_row("SELECT domain FROM domain_roots WHERE root_id=?1",params![root_id],|r|r.get(0)).map_err(database_error)?;
+            if domain=="comics" { for asset in &mut assets { asset.root_kind=LibraryRootKind::Comics; } }
 
             if assets.is_empty() {
-                let dir_asset = ensure_preview_file_asset(&connection, &root_id, &path_clone)?;
-                return Ok(CurationPreviewPayload {
-                    asset: dir_asset.clone(),
-                    comic_pages: Vec::new(),
-                    playlist_items: vec![dir_asset],
-                });
+                return Err("目录没有已索引的可预览媒体，请先刷新目录".into());
             }
 
             let first_video = assets.iter().find(|a| a.media_type == "video").cloned();
@@ -12270,9 +10301,70 @@ pub async fn prepare_curation_preview(
 mod tests {
     use super::*;
 
+    #[test]
+    fn v2_preview_preserves_identity_and_enforces_root_boundary() {
+        let c=Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE domain_roots(domain TEXT,root_id TEXT,remote_path TEXT);
+            INSERT INTO domain_roots VALUES('vault','root','/vault');
+            CREATE TABLE assets(id TEXT PRIMARY KEY,domain TEXT,root_id TEXT,remote_path TEXT,file_name TEXT,parent_path TEXT,media_type TEXT,size_bytes INTEGER,missing INTEGER,first_seen_at INTEGER,last_seen_at INTEGER,missing_since INTEGER,missing_scan_count INTEGER DEFAULT 0,duration_seconds INTEGER,thumbnail_asset_id TEXT,UNIQUE(domain,remote_path));
+            INSERT INTO assets(id,domain,root_id,remote_path,file_name,parent_path,media_type,size_bytes,missing,first_seen_at) VALUES('imported','vault','root','/vault/a.mp4','a.mp4','/vault','video',77,1,5);").unwrap();
+        let asset=ensure_preview_file_asset(&c,"root","/vault/a.mp4").unwrap();
+        assert_eq!(asset.id,"imported");assert_eq!(asset.size_bytes,77);
+        assert_eq!(c.query_row("SELECT first_seen_at FROM assets",[],|r|r.get::<_,i64>(0)).unwrap(),5);
+        assert!(ensure_preview_file_asset(&c,"root","/vault-other/a.mp4").is_err());
+        assert!(ensure_preview_file_asset(&c,"root","/vault").is_err());
+        assert!(ensure_preview_file_asset(&c,"root","/vault/unsupported.txt").is_err());
+    }
+
+    #[test]
+    fn v2_search_registration_preserves_existing_identity() {
+        let mut connection=Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE assets(id TEXT PRIMARY KEY,domain TEXT,root_id TEXT,remote_path TEXT,file_name TEXT,parent_path TEXT,media_type TEXT,size_bytes INTEGER,etag TEXT,modified_at TEXT,content_hash TEXT,missing INTEGER,missing_since INTEGER,missing_scan_count INTEGER DEFAULT 0,first_seen_at INTEGER,last_seen_at INTEGER,UNIQUE(domain,remote_path));
+            CREATE TABLE vault_items(asset_id TEXT PRIMARY KEY,updated_at INTEGER);
+            INSERT INTO assets(id,domain,root_id,remote_path,file_name,parent_path,media_type,size_bytes,missing,first_seen_at,last_seen_at) VALUES('imported','vault','root','/vault/nested/a.mp4','a.mp4','/vault/nested','video',1,1,5,5);").unwrap();
+        let entry=RemoteBrowserEntry {path:"/vault/nested/a.mp4".into(),name:"a.mp4".into(),is_directory:false,size_bytes:2,modified_at:None,etag:None,asset_id:Some("generated".into()),media_type:Some("video".into()),thumbnail_source:None,thumbnail_url:None,cover_asset_id:None,duration_seconds:None,progress_seconds:None};
+        let ids=register_search_assets_v2(&mut connection,"vault","root",vec![entry],10).unwrap();
+        assert_eq!(ids.get("/vault/nested/a.mp4").map(String::as_str),Some("imported"));
+        let row:(String,i64,i64,i64)=connection.query_row("SELECT parent_path,first_seen_at,last_seen_at,missing FROM assets",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(row,("/vault/nested".into(),5,10,0));
+        assert_eq!(connection.query_row("SELECT asset_id FROM vault_items",[],|r|r.get::<_,String>(0)).unwrap(),"imported");
+    }
+
+    #[test]
+    fn v2_directory_cover_assets_keep_domain_and_first_seen() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE domain_roots(domain TEXT PRIMARY KEY, root_id TEXT);
+             INSERT INTO domain_roots VALUES('vault', 'vault-root');
+             CREATE TABLE assets(
+                 id TEXT PRIMARY KEY, domain TEXT NOT NULL, root_id TEXT NOT NULL,
+                 remote_path TEXT NOT NULL, file_name TEXT NOT NULL, parent_path TEXT NOT NULL,
+                 media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, missing INTEGER NOT NULL,
+                 first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                 missing_since INTEGER, missing_scan_count INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE(domain, remote_path)
+             );",
+        ).unwrap();
+        ensure_media_cover_metadata(&connection).unwrap();
+        ensure_media_cover_metadata(&connection).unwrap();
+        upsert_directory_cover_asset(&connection, "dir_cover_test", "vault-root", "/vault/book/__custom_dir_cover__.jpg", 100, 10).unwrap();
+        connection.execute("UPDATE assets SET missing=1,missing_since=11,missing_scan_count=2", []).unwrap();
+        upsert_directory_cover_asset(&connection, "dir_cover_test", "vault-root", "/vault/book/__custom_dir_cover__.jpg", 200, 20).unwrap();
+        let row: (String, i64, i64, i64, i64, Option<i64>, i64) = connection.query_row(
+            "SELECT domain,size_bytes,first_seen_at,last_seen_at,missing,missing_since,missing_scan_count FROM assets",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+        ).unwrap();
+        assert_eq!(row, ("vault".into(), 200, 10, 20, 0, None, 0));
+        assert!(upsert_directory_cover_asset(&connection, "bad", "unknown-root", "/bad.jpg", 1, 30).is_err());
+        connection.execute(
+            "INSERT INTO directory_sync_state(root_id,remote_path,scanned_at,cover_asset_id) VALUES('vault-root','/vault/book',20,'dir_cover_test')", [],
+        ).unwrap();
+        assert_eq!(connection.query_row("SELECT cover_asset_id FROM directory_sync_state", [], |r| r.get::<_, String>(0)).unwrap(), "dir_cover_test");
+    }
+
     fn sync_test_database() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE assets(id TEXT PRIMARY KEY,root_id TEXT,remote_path TEXT,file_name TEXT,parent_path TEXT,media_type TEXT,size_bytes INTEGER,etag TEXT,modified_at TEXT,content_hash TEXT,missing INTEGER,scanned_at INTEGER,UNIQUE(root_id,remote_path));
+        c.execute_batch("CREATE TABLE assets(id TEXT PRIMARY KEY,root_id TEXT,remote_path TEXT,file_name TEXT,parent_path TEXT,media_type TEXT,size_bytes INTEGER,etag TEXT,modified_at TEXT,content_hash TEXT,missing INTEGER,scanned_at INTEGER,duration_seconds INTEGER,UNIQUE(root_id,remote_path));
             CREATE TABLE library_nodes(root_id TEXT,remote_path TEXT,parent_path TEXT,name TEXT,scanned_at INTEGER,PRIMARY KEY(root_id,remote_path));
             CREATE TABLE directory_snapshots(root_id TEXT,remote_path TEXT,fingerprint TEXT,scanned_at INTEGER,PRIMARY KEY(root_id,remote_path));
             CREATE TABLE directory_sync_state(root_id TEXT,remote_path TEXT,scanned_at INTEGER,PRIMARY KEY(root_id,remote_path));
@@ -12403,7 +10495,7 @@ mod tests {
 
     #[test]
     fn browse_api_fetches_one_page_and_refreshes_only_on_request() {
-        tauri::async_runtime::block_on(async {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
             let requests = Arc::new(StdMutex::new(Vec::<serde_json::Value>::new()));
             let captured = requests.clone();
             let router = axum::Router::new().fallback(axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
@@ -12928,7 +11020,7 @@ fn pml_basename(path: &str) -> String {
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn get_directory_config(app: AppHandle) -> Result<DirectoryConfig, String> {
-    let connection = open_database(&app)?;
+    let connection = crate::v2_config::open(&app)?;
     let curator = get_curator_config_internal(&app).unwrap_or_default();
     Ok(DirectoryConfig {
         recent_path: pml_dir_setting(&connection, DIR_RECENT_KEY),
@@ -12985,45 +11077,55 @@ pub fn save_directory_config(app: AppHandle, config: DirectoryConfig) -> Result<
         comics_path: normalize(config.comics_path)?,
     };
 
-    {
-        let connection = open_database(&app)?;
-        pml_set_setting(&connection, DIR_RECENT_KEY, config.recent_path.as_deref())?;
-        pml_set_setting(&connection, DIR_PENDING_KEY, config.pending_path.as_deref())?;
-        pml_set_setting(&connection, DIR_VAULT_KEY, config.vault_path.as_deref())?;
-        pml_set_setting(&connection, DIR_COMICS_KEY, config.comics_path.as_deref())?;
-    }
-
-    // 四个目录都建根（用于浏览）；扫描范围由扫描中心显式限制为已整理 + 漫画。
-    let managed_paths: Vec<String> = [
-        config.recent_path.clone(),
-        config.pending_path.clone(),
-        config.vault_path.clone(),
-        config.comics_path.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    for root in list_library_roots(app.clone())? {
-        if !managed_paths.iter().any(|path| path == &root.remote_path) {
-            let _ = remove_library_root(app.clone(), root.id);
+    let mut configured_paths = HashSet::new();
+    for path in [&config.recent_path, &config.pending_path, &config.vault_path, &config.comics_path].into_iter().flatten() {
+        if !configured_paths.insert(path.as_str()) {
+            return Err("四个媒体域不能使用同一个根目录".into());
         }
     }
     {
-        let connection = open_database(&app)?;
-        if let Some(path) = config.recent_path.as_deref() {
-            pml_ensure_root(&connection, LibraryRootKind::Media, path)?;
+        let mut connection = crate::v2_config::open(&app)?;
+        let tx = connection.transaction().map_err(database_error)?;
+        for (domain, key, path) in [
+            ("recent", DIR_RECENT_KEY, config.recent_path.as_deref()),
+            ("pending", DIR_PENDING_KEY, config.pending_path.as_deref()),
+            ("vault", DIR_VAULT_KEY, config.vault_path.as_deref()),
+            ("comics", DIR_COMICS_KEY, config.comics_path.as_deref()),
+        ] {
+            pml_set_setting(&tx, key, path)?;
+            let old: Option<(String, String)> = tx.query_row(
+                "SELECT root_id,remote_path FROM domain_roots WHERE domain=?1",
+                params![domain], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional().map_err(database_error)?;
+            if old.as_ref().map(|(_, old_path)| old_path.as_str()) == path {
+                continue;
+            }
+            if let Some((root_id, _)) = old.as_ref() {
+                tx.execute("DELETE FROM library_roots WHERE id=?1", params![root_id]).map_err(database_error)?;
+            }
+            // Keep state/history, but never show old-root assets under a newly configured root.
+            tx.execute("UPDATE assets SET missing=1,missing_since=COALESCE(missing_since,?2) WHERE domain=?1", params![domain,now()]).map_err(database_error)?;
+            tx.execute("DELETE FROM provider_directory_entries WHERE domain=?1", params![domain]).map_err(database_error)?;
+            tx.execute("DELETE FROM provider_directory_snapshots WHERE domain=?1", params![domain]).map_err(database_error)?;
+            match path {
+                Some(path) => {
+                    let root_id = format!("root-{:016x}",stable_hash(path));
+                    tx.execute(
+                        "INSERT INTO library_roots(id,kind,remote_path,created_at) VALUES(?1,?2,?3,?4)
+                         ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,remote_path=excluded.remote_path",
+                        params![root_id,if domain=="comics" {"comics"} else {"media"},path,now()],
+                    ).map_err(database_error)?;
+                    tx.execute(
+                        "INSERT INTO domain_roots(domain,root_id,remote_path,updated_at) VALUES(?1,?2,?3,?4)
+                         ON CONFLICT(domain) DO UPDATE SET root_id=excluded.root_id,remote_path=excluded.remote_path,updated_at=excluded.updated_at",
+                        params![domain,root_id,path,now()],
+                    ).map_err(database_error)?;
+                }
+                None => { tx.execute("DELETE FROM domain_roots WHERE domain=?1",params![domain]).map_err(database_error)?; }
+            }
         }
-        if let Some(path) = config.pending_path.as_deref() {
-            pml_ensure_root(&connection, LibraryRootKind::Media, path)?;
-        }
-        if let Some(vault) = config.vault_path.as_deref() {
-            pml_ensure_root(&connection, LibraryRootKind::Media, vault)?;
-        }
-        if let Some(comics) = config.comics_path.as_deref() {
-            pml_ensure_root(&connection, LibraryRootKind::Comics, comics)?;
-        }
+        tx.commit().map_err(database_error)?;
     }
-
     // 兼容旧版：待整理/收纳目标同步到 curator 配置。
     let _ = save_curator_config(
         app.clone(),
@@ -13217,7 +11319,7 @@ pub async fn find_asset_subtitles(
     asset_id: String,
 ) -> Result<Vec<SubtitleTrack>, String> {
     let (remote_path, parent_path): (String, String) = {
-        let connection = open_database(&app)?;
+        let connection = open_media_database(&app)?;
         connection
             .query_row(
                 "SELECT remote_path, parent_path FROM assets WHERE id = ?1",
@@ -13269,7 +11371,7 @@ pub struct SiblingVideo {
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn list_sibling_videos(app: AppHandle, asset_id: String) -> Result<Vec<SiblingVideo>, String> {
-    let connection = open_database(&app)?;
+    let connection = open_media_database(&app)?;
     let (root_id, parent_path, media_type): (String, String, String) = connection
         .query_row(
             "SELECT root_id, parent_path, media_type FROM assets WHERE id = ?1",

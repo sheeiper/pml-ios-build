@@ -569,41 +569,17 @@ struct DirectoryView: View {
         guard let client = model.apiClient else { return }
         loading = true
         errorText = ""
-        if let domain {
-            do {
-                if force {
-                    _ = try? await client.refreshDomainPath(domain: domain, path: path)
-                }
-                let children = try await client.domainChildren(domain: domain, path: path)
-                entries = children.map { child in
-                    RemoteBrowserEntry(
-                        path: child.path,
-                        name: child.name,
-                        isDirectory: child.isDirectory,
-                        sizeBytes: child.sizeBytes,
-                        modifiedAt: child.modifiedAt,
-                        etag: nil,
-                        assetId: child.assetId,
-                        mediaType: child.mediaType,
-                        thumbnailSource: nil,
-                        coverAssetId: nil
-                    )
-                }
-                sortDomainEntries(&entries)
-                nextCursor = nil
-                prefetchThumbnails(entries)
-                loading = false
-            } catch {
-                if !pmlIsCancellation(error) { errorText = error.localizedDescription }
-                loading = false
-            }
-            return
-        }
         do {
+            if let domain, force {
+                // Do not hide provider failures behind a cached child listing.
+                _ = try await client.refreshDomainPath(domain: domain, path: path)
+            }
+            // Use the compatibility DTO in both routes so directory covers,
+            // thumbnails, duration and progress survive domain navigation too.
             let page = try await client.remoteChildren(
                 rootId: root.id,
                 path: path,
-                refresh: force,
+                refresh: force && domain == nil,
                 sort: sort.rawValue
             )
             entries = page.items
@@ -641,25 +617,6 @@ struct DirectoryView: View {
             }
             errorText = message
             loading = false
-        }
-    }
-
-    private func sortDomainEntries(_ items: inout [RemoteBrowserEntry]) {
-        items.sort { left, right in
-            switch sort {
-            case .newest:
-                if left.modifiedAt != right.modifiedAt {
-                    return (left.modifiedAt ?? "") > (right.modifiedAt ?? "")
-                }
-            case .size:
-                if left.sizeBytes != right.sizeBytes {
-                    return left.sizeBytes > right.sizeBytes
-                }
-            case .name:
-                break
-            }
-            if left.isDirectory != right.isDirectory { return left.isDirectory }
-            return left.name.localizedStandardCompare(right.name) == .orderedAscending
         }
     }
 
