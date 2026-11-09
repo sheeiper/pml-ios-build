@@ -1082,8 +1082,39 @@ async fn scan_provider_tree(
     })
 }
 
-fn validate_provider_listing(parent: &str, entries: &[media_library::ProviderEntry]) -> Result<(), String> {
-    let mut seen = HashSet::new();
+/// Case-insensitive, numeric-aware name order: "第2集" sorts before "第10集".
+/// Chinese characters are compared by code point here; clients that can use a
+/// locale collator (pinyin) still re-sort locally for display.
+fn natural_name_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let left: Vec<char> = left.to_lowercase().chars().collect();
+    let right: Vec<char> = right.to_lowercase().chars().collect();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < left.len() && j < right.len() {
+        if left[i].is_ascii_digit() && right[j].is_ascii_digit() {
+            let start_left = i;
+            while i < left.len() && left[i].is_ascii_digit() { i += 1; }
+            let start_right = j;
+            while j < right.len() && right[j].is_ascii_digit() { j += 1; }
+            let a: String = left[start_left..i].iter().collect();
+            let b: String = right[start_right..j].iter().collect();
+            let a = a.trim_start_matches('0');
+            let b = b.trim_start_matches('0');
+            let ordering = a.len().cmp(&b.len()).then_with(|| a.cmp(b));
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        } else {
+            if left[i] != right[j] {
+                return left[i].cmp(&right[j]);
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (left.len() - i).cmp(&(right.len() - j))
+}
+
+fn validate_provider_listing(parent: &str, entries: &[media_library::ProviderEntry]) -> Result<(), String> {    let mut seen = HashSet::new();
     for entry in entries {
         if parent_path(&entry.path) != parent || entry.path.ends_with('/')
             || matches!(entry.path.rsplit('/').next(), Some("" | "." | ".."))
@@ -1964,13 +1995,10 @@ pub async fn compat_remote_children(
             "newest" => modified_key(right.modified_at.as_deref())
                 .cmp(&modified_key(left.modified_at.as_deref())),
             "size" => right.size_bytes.cmp(&left.size_bytes),
-            _ => left
-                .name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase()),
+            _ => natural_name_cmp(&left.name, &right.name),
         };
         if result == std::cmp::Ordering::Equal {
-            left.name.to_lowercase().cmp(&right.name.to_lowercase())
+            natural_name_cmp(&left.name, &right.name)
         } else {
             result
         }
@@ -2034,9 +2062,12 @@ pub async fn compat_remote_children(
         }));
     }
     let from_cache = refresh_summary.is_none();
+    // "total" is what the user just saw listed (files and folders), while the
+    // added/updated/removed counters describe asset-level reconciliation.
+    let listed = items.len() as i64;
     let sync_summary = refresh_summary.map(|summary| {
         serde_json::json!({
-            "total": summary.scanned,
+            "total": listed,
             "added": summary.added,
             "updated": summary.updated,
             "removed": summary.deleted,
@@ -2156,6 +2187,15 @@ mod directory_snapshot_tests {
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         assert_eq!(counts, (1,0,1));
         assert_eq!(connection.query_row("SELECT count(*) FROM pending_projects WHERE id='empty'", [], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn natural_name_sort_orders_numbers_and_ignores_case() {
+        assert_eq!(natural_name_cmp("第2集", "第10集"), std::cmp::Ordering::Less);
+        assert_eq!(natural_name_cmp("ep2", "EP10"), std::cmp::Ordering::Less);
+        assert_eq!(natural_name_cmp("a2", "a02"), std::cmp::Ordering::Equal);
+        assert_eq!(natural_name_cmp("abc", "abd"), std::cmp::Ordering::Less);
+        assert_eq!(natural_name_cmp("2.jpg", "10.jpg"), std::cmp::Ordering::Less);
     }
 
     #[test]

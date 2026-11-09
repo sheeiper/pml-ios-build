@@ -64,9 +64,33 @@ struct DirectoryView: View {
 
     @ObservedObject private var thumbs = ThumbnailService.shared
 
+    /// Sort locally so name order follows the system locale (拼音/自然数字) and
+    /// switching sort takes effect immediately, instead of waiting for a reload.
+    private var sortedEntries: [RemoteBrowserEntry] {
+        entries.sorted { left, right in
+            if left.isDirectory != right.isDirectory { return left.isDirectory }
+            switch sort {
+            case .name:
+                break
+            case .newest:
+                let l = left.modifiedAt ?? ""
+                let r = right.modifiedAt ?? ""
+                if l != r { return l > r }
+            case .size:
+                if left.sizeBytes != right.sizeBytes { return left.sizeBytes > right.sizeBytes }
+            }
+            let ordered = left.name.localizedStandardCompare(right.name)
+            if ordered == .orderedSame {
+                return left.path < right.path
+            }
+            return ordered == .orderedAscending
+        }
+    }
+
     private var visibleEntries: [RemoteBrowserEntry] {
-        guard !searchText.isEmpty else { return entries }
-        return entries.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        let sorted = sortedEntries
+        guard !searchText.isEmpty else { return sorted }
+        return sorted.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
     private var imageEntries: [RemoteBrowserEntry] {

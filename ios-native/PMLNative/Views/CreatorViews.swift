@@ -181,6 +181,7 @@ struct CreatorCategoryView: View {
     @State private var errorText = ""
     @State private var searchText = ""
     @State private var sortByMedia = true
+    @AppStorage("pml.authors.cardLayout") private var cardLayout = "grid"
 
     private var displayedAuthors: [LibraryAuthor] {
         let filtered = searchText.isEmpty
@@ -195,79 +196,125 @@ struct CreatorCategoryView: View {
         }
     }
 
+    private var topCreatorIds: Set<String> {
+        let pool = authors.filter { $0.mediaCount > 0 }.sorted { $0.mediaCount > $1.mediaCount }
+        let cutoff = max(1, Int(ceil(Double(pool.count) * 0.1)))
+        return Set(pool.prefix(cutoff).map(\.id))
+    }
+
     var body: some View {
-        List {
-            if loading && children.isEmpty && authors.isEmpty {
-                HStack { ProgressView(); Text("加载中…").foregroundStyle(.secondary) }
-            }
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 16) {
+                if loading && children.isEmpty && authors.isEmpty {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("加载中…").foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 30)
+                }
 
-            if !children.isEmpty {
-                Section("子分类") {
-                    ForEach(children) { child in
-                        NavigationLink {
-                            CreatorCategoryView(category: child)
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: "folder.fill").foregroundStyle(.tint)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(pmlDisplayName(child.name))
-                                    Text("\(child.authorCount) 位创作者 · \(child.mediaCount) 项")
+                if !children.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("子分类")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(children) { child in
+                            NavigationLink {
+                                CreatorCategoryView(category: child)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "folder.fill").foregroundStyle(.tint)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(pmlDisplayName(child.name))
+                                        Text("\(child.authorCount) 位创作者 · \(child.mediaCount) 项")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
                                         .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(.tertiary)
                                 }
-                                Spacer()
+                                .padding(12)
+                                .background(
+                                    Color(.secondarySystemBackground),
+                                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                if !displayedAuthors.isEmpty {
+                    if cardLayout == "list" {
+                        LazyVStack(spacing: 14) {
+                            ForEach(displayedAuthors) { author in
+                                cardLink(author, bannerHeight: 190)
+                            }
+                        }
+                    } else {
+                        LazyVGrid(
+                            columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
+                            spacing: 14
+                        ) {
+                            ForEach(displayedAuthors) { author in
+                                cardLink(author, bannerHeight: 108)
                             }
                         }
                     }
                 }
-            }
 
-            if !displayedAuthors.isEmpty {
-                Section("创作者") {
-                    ForEach(displayedAuthors) { author in
-                        NavigationLink {
-                            AuthorProfileView(author: author)
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: "person.crop.circle.fill")
-                                    .font(.title3)
-                                    .foregroundStyle(.secondary)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(author.name)
-                                    Text("\(author.mediaCount) 项作品")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                            }
-                        }
-                    }
+                if !loading && children.isEmpty && displayedAuthors.isEmpty && errorText.isEmpty {
+                    Text("无内容").foregroundStyle(.secondary).padding(.top, 20)
+                }
+                if !errorText.isEmpty {
+                    Text(errorText).font(.footnote).foregroundStyle(.red)
                 }
             }
-
-            if !loading && children.isEmpty && displayedAuthors.isEmpty && errorText.isEmpty {
-                Text("无内容").foregroundStyle(.secondary)
-            }
-            if !errorText.isEmpty {
-                Text(errorText).font(.footnote).foregroundStyle(.red)
-            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
         }
         .navigationTitle(pmlDisplayName(category?.name ?? "全部创作者"))
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索创作者")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Picker("排序", selection: $sortByMedia) {
-                        Text("作品数").tag(true)
-                        Text("名称").tag(false)
+                HStack(spacing: 12) {
+                    if !displayedAuthors.isEmpty {
+                        Button {
+                            cardLayout = cardLayout == "grid" ? "list" : "grid"
+                        } label: {
+                            Image(systemName: cardLayout == "grid" ? "list.bullet" : "square.grid.2x2")
+                        }
+                        .accessibilityLabel(cardLayout == "grid" ? "切换为单列" : "切换为双列")
                     }
-                } label: {
-                    Image(systemName: "arrow.up.arrow.down")
+                    Menu {
+                        Picker("排序", selection: $sortByMedia) {
+                            Text("作品数").tag(true)
+                            Text("名称").tag(false)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                    }
                 }
             }
         }
         .task { await load() }
+    }
+
+    private func cardLink(_ author: LibraryAuthor, bannerHeight: CGFloat) -> some View {
+        NavigationLink {
+            AuthorProfileView(author: author)
+        } label: {
+            AuthorShowcaseCard(
+                author: author,
+                bannerHeight: bannerHeight,
+                isTopCreator: topCreatorIds.contains(author.id)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private func load() async {
