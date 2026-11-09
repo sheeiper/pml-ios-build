@@ -646,7 +646,6 @@ struct DirectoryView: View {
 
     private func sortDomainEntries(_ items: inout [RemoteBrowserEntry]) {
         items.sort { left, right in
-            if left.isDirectory != right.isDirectory { return left.isDirectory }
             switch sort {
             case .newest:
                 if left.modifiedAt != right.modifiedAt {
@@ -659,6 +658,7 @@ struct DirectoryView: View {
             case .name:
                 break
             }
+            if left.isDirectory != right.isDirectory { return left.isDirectory }
             return left.name.localizedStandardCompare(right.name) == .orderedAscending
         }
     }
