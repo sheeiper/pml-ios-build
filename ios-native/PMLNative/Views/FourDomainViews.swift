@@ -503,7 +503,7 @@ private struct PendingProjectRow: View {
 struct PendingProjectDetailView: View {
     let project: PendingProject
     @EnvironmentObject private var model: AppModel
-    @State private var items: [PendingItem] = []
+    @State private var items: [PendingDomainItem] = []
     @State private var meta: DomainMeta?
     @State private var loading = false
     @State private var errorText = ""
@@ -538,7 +538,7 @@ struct PendingProjectDetailView: View {
                     ProgressView().frame(maxWidth: .infinity)
                 }
                 ForEach(items) { item in
-                    PendingItemRow(item: item, meta: meta) { categoryId, authorId in
+                    PendingDomainItemRow(item: item, meta: meta) { categoryId, authorId in
                         Task { await assign(item, categoryId: categoryId, authorId: authorId) }
                     } onPreview: {
                         Task { await openPreview(item) }
@@ -592,7 +592,7 @@ struct PendingProjectDetailView: View {
         loading = false
     }
 
-    private func assign(_ item: PendingItem, categoryId: String?, authorId: String?) async {
+    private func assign(_ item: PendingDomainItem, categoryId: String?, authorId: String?) async {
         guard let client = model.apiClient else { return }
         do {
             try await client.assignPending(assetId: item.assetId, categoryId: categoryId, authorId: authorId)
@@ -611,7 +611,7 @@ struct PendingProjectDetailView: View {
         var failed = 0
         for item in items where item.isReady {
             do {
-                let result = try await client.movePendingItem(assetId: item.assetId)
+                let result = try await client.movePendingDomainItem(assetId: item.assetId)
                 if result.success { moved += 1 }
                 else if result.status == "SKIPPED_EXIST" { conflicts += 1 }
                 else { failed += 1 }
@@ -624,7 +624,7 @@ struct PendingProjectDetailView: View {
         await load()
     }
 
-    private func openPreview(_ item: PendingItem) async {
+    private func openPreview(_ item: PendingDomainItem) async {
         guard let source = await model.playbackSource(assetId: item.assetId, remotePath: item.remotePath) else {
             errorText = "无法获取播放地址"
             return
@@ -639,8 +639,8 @@ struct PendingProjectDetailView: View {
     }
 }
 
-private struct PendingItemRow: View {
-    let item: PendingItem
+private struct PendingDomainItemRow: View {
+    let item: PendingDomainItem
     let meta: DomainMeta?
     let onAssign: (String?, String?) -> Void
     let onPreview: () -> Void
