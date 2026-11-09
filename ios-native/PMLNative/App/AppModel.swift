@@ -106,25 +106,22 @@ final class AppModel: ObservableObject {
     // MARK: - 播放地址解析
 
     /// 服务器模式：优先 AList `/d` 直连；失败回退服务器 `/media`。
-    private var directURLCache: [String: (URL, Date)] = [:]
-
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         if settings.mode == .server {
             let mode = settings.routeMode
             let direct = remotePath.flatMap { alistDirectURL(remotePath: $0) }
             let isMOV = remotePath?.lowercased().hasSuffix(".mov") == true
 
-            if mode == .relay {
+            // 自动模式：MOV 默认走服务器中转，稳定且首帧可控；直连需手动选择。
+            if mode == .relay || (mode == .auto && isMOV) {
                 if let relay = await serverMediaURL(assetId: assetId) {
                     return PlaybackSource(url: relay, fallbackURL: direct, label: "服务器中转")
                 }
             }
 
+            // 直连：把 AList /d 直接交给 AVPlayer，由播放器自己跟随 302。
+            // 不要先取最终 CDN URL 再复用：115 链接可能被首次请求消费/绑定。
             if let direct {
-                // MOV 只解析一次最终 CDN 地址，避免每个 Range 重复 302。
-                if isMOV, let stable = await stableDirectURL(direct) {
-                    return PlaybackSource(url: stable, fallbackURL: nil, label: "AList 直连")
-                }
                 return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
             }
 
@@ -139,28 +136,6 @@ final class AppModel: ObservableObject {
             return nil
         }
         return PlaybackSource(url: url, fallbackURL: nil, label: nil)
-    }
-
-    /// 跟随 AList /d 的 302，拿到最终 115 CDN 地址；缓存 10 分钟。
-    private func stableDirectURL(_ url: URL) async -> URL? {
-        let key = url.absoluteString
-        if let cached = directURLCache[key], Date().timeIntervalSince(cached.1) < 600 {
-            return cached.0
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
-        request.timeoutInterval = 6
-        do {
-            let (_, response) = try await APISession.shared.session.data(for: request)
-            guard let http = response as? HTTPURLResponse,
-                  http.statusCode == 200 || http.statusCode == 206,
-                  let final = http.url, final != url else { return nil }
-            directURLCache[key] = (final, Date())
-            return final
-        } catch {
-            return nil
-        }
     }
     /// AVPlayer 访问服务器 /media 时补 Basic 认证；直连 AList/CDN 不加，避免泄露。
     func playbackHeaders(for url: URL) -> [String: String] {
