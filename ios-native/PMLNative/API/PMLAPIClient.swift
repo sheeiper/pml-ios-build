@@ -109,7 +109,14 @@ struct PMLAPIClient {
         components.query = nil
         guard let url = components.url else { throw APIError.badURL }
 
-        var request = URLRequest(url: url, timeoutInterval: 30)
+        let timeout: TimeInterval = {
+            switch name {
+            case "scan_domain": return 1800
+            case "create_pending_project": return 600
+            default: return 30
+            }
+        }()
+        var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
