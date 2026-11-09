@@ -74,9 +74,18 @@ struct FourDomainHomeView: View {
         case "pending":
             PendingProjectsView()
         default:
-            DomainBrowserView(
+            let summary = summaries.first(where: { $0.domain == domain })
+            let rootPath = summary?.rootPath ?? ""
+            DirectoryView(
+                root: LibraryRoot(
+                    id: "domain-\(domain)",
+                    kind: domain == "comics" ? "comics" : "media",
+                    remotePath: rootPath,
+                    createdAt: 0
+                ),
+                path: rootPath,
                 domain: domain,
-                title: domainTitle(domain)
+                titleOverride: domainTitle(domain)
             )
         }
     }
