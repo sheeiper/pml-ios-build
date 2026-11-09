@@ -98,6 +98,23 @@ struct PendingDomainItem: Decodable, Identifiable, Hashable {
     var isReady: Bool { assignmentStatus == "ready" }
 }
 
+struct DomainChild: Decodable, Identifiable, Hashable {
+    let path: String
+    let name: String
+    let isDirectory: Bool
+    let assetId: String?
+    let mediaType: String?
+    let sizeBytes: Int64
+    let modifiedAt: String?
+    let thumbnailAssetId: String?
+    let childCount: Int64
+
+    var id: String { path }
+    var isVideo: Bool { mediaType == "video" }
+    var isImage: Bool { mediaType == "image" || mediaType == "comicPage" }
+    var isComic: Bool { mediaType == "comicArchive" || mediaType == "pdf" }
+}
+
 struct DomainMetaAuthor: Decodable, Identifiable, Hashable {
     let id: String
     let name: String
@@ -174,6 +191,13 @@ extension PMLAPIClient {
         if let mediaType, !mediaType.isEmpty { arguments["mediaType"] = mediaType }
         if let query, !query.isEmpty { arguments["query"] = query }
         return try await command("list_domain_assets", arguments: arguments)
+    }
+
+
+    func domainChildren(domain: String, path: String? = nil) async throws -> [DomainChild] {
+        var arguments: [String: Any] = ["domain": domain]
+        if let path, !path.isEmpty { arguments["path"] = path }
+        return try await command("list_domain_children", arguments: arguments)
     }
 
     func pendingProjects() async throws -> [PendingProject] {
