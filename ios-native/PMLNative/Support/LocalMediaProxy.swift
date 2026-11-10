@@ -172,6 +172,7 @@ private final class ProxyTransfer: NSObject, URLSessionDataDelegate {
     private var session: URLSession?
     private var task: URLSessionDataTask?
     private var usedFallback = false
+    private var retriedDirect = false
     private var sentHeaders = false
     private var completed = false
 
@@ -215,12 +216,22 @@ private final class ProxyTransfer: NSObject, URLSessionDataDelegate {
             fail()
             return
         }
-        if !usedFallback, [401, 403, 404, 500, 502, 503, 504].contains(http.statusCode), let fallback = stream.fallback {
-            usedFallback = true
-            completionHandler(.cancel)
-            session.invalidateAndCancel()
-            request(url: fallback, headers: stream.fallbackHeaders)
-            return
+        if !usedFallback, [401, 403, 404, 410, 500, 502, 503, 504].contains(http.statusCode) {
+            // 115 CDN 链接过期通常是跟随 /d 之后的 403/410。先向原始 /d 再要一次新签名，失败才回退中转。
+            if !retriedDirect, [403, 410].contains(http.statusCode) {
+                retriedDirect = true
+                completionHandler(.cancel)
+                session.invalidateAndCancel()
+                request(url: stream.direct, headers: [:])
+                return
+            }
+            if let fallback = stream.fallback {
+                usedFallback = true
+                completionHandler(.cancel)
+                session.invalidateAndCancel()
+                request(url: fallback, headers: stream.fallbackHeaders)
+                return
+            }
         }
         guard http.statusCode == 200 || http.statusCode == 206 else {
             completionHandler(.cancel)

@@ -264,7 +264,8 @@ struct DomainBrowserView: View {
                 title: preview.title,
                 assetId: preview.assetId,
                 fallbackURL: preview.fallbackURL,
-                sourceLabel: preview.sourceLabel
+                sourceLabel: preview.sourceLabel,
+                remotePath: preview.remotePath
             )
             .environmentObject(model)
         }
@@ -423,7 +424,8 @@ struct DomainBrowserView: View {
                     title: child.name,
                     assetId: assetId,
                     fallbackURL: source.fallbackURL,
-                    sourceLabel: source.label
+                    sourceLabel: source.label,
+                    remotePath: child.path
                 )
             } else if child.isImage {
                 imagePreview = DomainImagePreview(url: source.url, title: child.name)
@@ -545,6 +547,7 @@ private struct DomainPreview: Identifiable {
     let assetId: String?
     let fallbackURL: URL?
     let sourceLabel: String?
+    var remotePath: String? = nil
 }
 
 private struct DomainImagePreview: Identifiable {
@@ -606,7 +609,8 @@ struct DomainAssetListView: View {
                 title: preview.title,
                 assetId: preview.assetId,
                 fallbackURL: preview.fallbackURL,
-                sourceLabel: preview.sourceLabel
+                sourceLabel: preview.sourceLabel,
+                remotePath: preview.remotePath
             )
             .environmentObject(model)
         }
@@ -656,7 +660,8 @@ struct DomainAssetListView: View {
                     title: asset.fileName,
                     assetId: asset.id,
                     fallbackURL: source.fallbackURL,
-                    sourceLabel: source.label
+                    sourceLabel: source.label,
+                    remotePath: asset.remotePath
                 )
             } else if asset.isImage {
                 imagePreview = DomainImagePreview(url: source.url, title: asset.fileName)
@@ -911,7 +916,8 @@ struct PendingProjectDetailView: View {
                 title: item.title,
                 assetId: item.assetId,
                 fallbackURL: item.fallbackURL,
-                sourceLabel: item.sourceLabel
+                sourceLabel: item.sourceLabel,
+                remotePath: item.remotePath
             )
             .environmentObject(model)
         }
@@ -974,7 +980,8 @@ struct PendingProjectDetailView: View {
             title: item.fileName,
             assetId: item.assetId,
             fallbackURL: source.fallbackURL,
-            sourceLabel: source.label
+            sourceLabel: source.label,
+            remotePath: item.remotePath
         )
     }
 }

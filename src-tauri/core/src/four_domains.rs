@@ -1939,9 +1939,8 @@ fn modified_key(value: Option<&str>) -> i64 {
         .unwrap_or(i64::MIN)
 }
 
-// Match media_library::RemoteBrowserEntry's historical integer-second DTO.
-fn legacy_browse_progress(progress: Option<f64>) -> Option<i64> {
-    progress.map(|seconds| seconds as i64)
+fn browse_progress(progress: Option<f64>) -> Option<f64> {
+    progress.filter(|seconds| seconds.is_finite())
 }
 
 pub async fn compat_remote_children(
@@ -2057,8 +2056,7 @@ pub async fn compat_remote_children(
             "thumbnailUrl": thumbnail_source,
             "coverAssetId": cover,
             "durationSeconds": duration,
-            // Original browse DTO (including native Swift) uses integer seconds.
-            "progressSeconds": legacy_browse_progress(progress),
+            "progressSeconds": browse_progress(progress),
         }));
     }
     let from_cache = refresh_summary.is_none();
@@ -2119,7 +2117,7 @@ mod directory_snapshot_tests {
     }
 
     #[test]
-    fn playback_real_progress_preserves_domain_precision_and_legacy_browse_integer_dto() {
+    fn playback_real_progress_preserves_domain_and_browse_precision() {
         let connection = database();
         asset(&connection, "recent", "/root/a.jpg");
         connection.execute("INSERT INTO asset_state(asset_id,progress_seconds,updated_at) VALUES('legacy-/root/a.jpg',12.75,0)", []).unwrap();
@@ -2128,9 +2126,9 @@ mod directory_snapshot_tests {
         assert_eq!(items[0].progress_seconds, Some(12.75));
         let domain_json = serde_json::to_value(&items[0]).unwrap();
         assert_eq!(domain_json["progressSeconds"].as_f64(), Some(12.75));
-        let browse_json = serde_json::json!({"progressSeconds": legacy_browse_progress(items[0].progress_seconds)});
-        assert_eq!(browse_json["progressSeconds"].as_i64(), Some(12));
-        assert_eq!(legacy_browse_progress(None), None);
+        let browse_json = serde_json::json!({"progressSeconds": browse_progress(items[0].progress_seconds)});
+        assert_eq!(browse_json["progressSeconds"].as_f64(), Some(12.75));
+        assert_eq!(browse_progress(None), None);
         // SQLite REAL affinity also stores integral values as REAL.
         connection.execute("UPDATE asset_state SET progress_seconds=12.0", []).unwrap();
         assert_eq!(list_assets_from_connection(&connection, "recent", None, None, 100, 0).unwrap()[0].progress_seconds, Some(12.0));

@@ -32,7 +32,7 @@ struct LibraryAuthor: Decodable, Identifiable {
 
 struct PlaybackHistoryItem: Decodable, Identifiable {
     let asset: LibraryAsset
-    let positionSeconds: Int64
+    let positionSeconds: Double
     let updatedAt: Int64
 
     var id: String { asset.id }

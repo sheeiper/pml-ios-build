@@ -55,8 +55,6 @@ const MAX_THUMBNAIL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_THUMBNAIL_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const THUMBNAIL_CACHE_VERSION: &str = "v3";
 const ALIST_API_PAGE_SIZE: i64 = 500;
-const DIRECTORY_CACHE_TTL_SECONDS: u64 = 300;
-const MAX_DIRECTORY_CACHE_PAGES: usize = 128;
 const DEFAULT_ALIST_API_URL: &str = "http://xhofe_alist:5244";
 const DEFAULT_CD2_API_URL: &str = "http://127.0.0.1:19798";
 const MEDIA_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -104,7 +102,6 @@ pub(crate) struct ZipEntryMeta {
 pub struct MediaLibraryState {
     session: Mutex<Option<Session>>,
     pub(crate) proxy: Mutex<Option<MediaProxy>>,
-    directory_cache: Mutex<HashMap<String, CachedDirectoryPage>>,
     comic_archive_cache_lock: Mutex<()>,
     comic_archive_tasks:
         Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<PathBuf, String>>>>>,
@@ -122,7 +119,6 @@ impl MediaLibraryState {
         Self {
             session: Mutex::new(None),
             proxy: Mutex::new(None),
-            directory_cache: Mutex::new(HashMap::new()),
             comic_archive_cache_lock: Mutex::new(()),
             comic_archive_tasks: Mutex::new(HashMap::new()),
             comic_archive_index_cache: StdMutex::new(HashMap::new()),
@@ -216,7 +212,7 @@ pub struct RemoteBrowserEntry {
     thumbnail_url: Option<Url>,
     cover_asset_id: Option<String>,
     duration_seconds: Option<i64>,
-    progress_seconds: Option<i64>,
+    progress_seconds: Option<f64>,
 }
 
 const BROWSE_PAGE_SIZE: usize = 100;
@@ -264,12 +260,6 @@ struct DavEntry {
     thumbnail_url: Option<Url>,
 }
 
-#[derive(Clone)]
-struct CachedDirectoryPage {
-    cached_at: Instant,
-    entries: Vec<DavEntry>,
-    next_cursor: Option<String>,
-}
 
 #[derive(Clone)]
 struct IndexedAsset {
@@ -335,7 +325,7 @@ pub struct ShortVideoFeedPage {
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackHistoryItem {
     pub(crate) asset: LibraryAsset,
-    pub(crate) position_seconds: i64,
+    pub(crate) position_seconds: f64,
     pub(crate) updated_at: i64,
 }
 
@@ -738,7 +728,6 @@ pub async fn restore_alist_connection(
     match establish_session(&endpoint, &token, provider).await {
         Ok(session) => {
             *state.session.lock().await = Some(session);
-            state.directory_cache.lock().await.clear();
             clear_proxy_sources(&state).await;
             let msg = match provider {
                 ProviderKind::Alist => "已连接 AList API 媒体源",
@@ -822,9 +811,6 @@ enum BrowseSort { Name, Newest, Size }
 impl BrowseSort {
     fn parse(value: &str) -> Result<Self,String> { match value { "name"=>Ok(Self::Name),"newest"=>Ok(Self::Newest),"size"=>Ok(Self::Size),_=>Err("排序方式无效".into()) } }
     fn as_str(self) -> &'static str { match self { Self::Name=>"name",Self::Newest=>"newest",Self::Size=>"size" } }
-    fn order(self, directory: bool) -> &'static str {
-        match self { Self::Newest=>"modified_ts DESC,name_sort,remote_path",Self::Size if !directory=>"size_bytes DESC,name_sort,remote_path",_=>"name_sort,remote_path" }
-    }
 }
 
 // Compare digit runs by value without converting them to a bounded integer.
@@ -843,369 +829,6 @@ fn natural_name_key(name: &str) -> String {
         } else { key.push(ch); }
     }
     key
-}
-
-fn modified_timestamp(value: Option<&str>) -> i64 {
-    value.and_then(|v|chrono::DateTime::parse_from_rfc3339(v).or_else(|_|chrono::DateTime::parse_from_rfc2822(v)).ok())
-        .map(|v|v.timestamp_millis()).unwrap_or(i64::MIN)
-}
-
-fn migrate_directory_order(c: &Connection) -> Result<(),String> {
-    let migration=c.unchecked_transaction().map_err(database_error)?;
-    let c=&migration;
-    let mut migrated=false;
-    for (table, additions) in [
-        ("assets", vec![("name_sort","TEXT NOT NULL DEFAULT ''"),("modified_ts","INTEGER NOT NULL DEFAULT -9223372036854775808")]),
-        ("library_nodes",vec![("name_sort","TEXT NOT NULL DEFAULT ''"),("modified_at","TEXT"),("modified_ts","INTEGER NOT NULL DEFAULT -9223372036854775808")]),
-        ("directory_sync_state",vec![("revision","TEXT NOT NULL DEFAULT ''"),("cover_asset_id","TEXT")]),
-    ] {
-        let cols=c.prepare(&format!("PRAGMA table_info({table})")).map_err(database_error)?.query_map([],|r|r.get::<_,String>(1)).map_err(database_error)?.collect::<Result<HashSet<_>,_>>().map_err(database_error)?;
-        for (name,kind) in additions { if !cols.contains(name) { c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {kind}")).map_err(database_error)?;migrated=true; } }
-    }
-    if migrated {
-        for (table,name) in [("assets","file_name"),("library_nodes","name")] {
-            let rows=c.prepare(&format!("SELECT rowid,{name},modified_at FROM {table}")).map_err(database_error)?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?))).map_err(database_error)?.collect::<Result<Vec<_>,_>>().map_err(database_error)?;
-            for (id,name,date) in rows { c.execute(&format!("UPDATE {table} SET name_sort=?1,modified_ts=?2 WHERE rowid=?3"),params![natural_name_key(&name),modified_timestamp(date.as_deref()),id]).map_err(database_error)?; }
-        }
-    }
-    c.execute_batch("CREATE INDEX IF NOT EXISTS assets_browse_name ON assets(root_id,parent_path,missing,name_sort,remote_path);
-        CREATE INDEX IF NOT EXISTS assets_browse_date ON assets(root_id,parent_path,missing,modified_ts DESC,name_sort,remote_path);
-        CREATE INDEX IF NOT EXISTS assets_browse_size ON assets(root_id,parent_path,missing,size_bytes DESC,name_sort,remote_path);
-        CREATE INDEX IF NOT EXISTS nodes_browse_name ON library_nodes(root_id,parent_path,name_sort,remote_path);
-        CREATE INDEX IF NOT EXISTS nodes_browse_date ON library_nodes(root_id,parent_path,modified_ts DESC,name_sort,remote_path);").map_err(database_error)?;
-    let needs_sync_backfill: bool = migrated || c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM directory_sync_state WHERE revision = '' LIMIT 1)",
-        [],
-        |r| r.get(0),
-    ).unwrap_or(false);
-    let needs_cover_tree: bool = c.query_row(
-        "SELECT value FROM settings WHERE key = 'directory_cover_tree_v2'",
-        [],
-        |r| r.get::<_, String>(0),
-    ).optional().map_err(database_error)?.as_deref() != Some("1");
-    if needs_sync_backfill || needs_cover_tree {
-        // Ensure previously scanned directories keep a valid non-empty revision
-        // and cover_asset_id (including ancestor folders that only contain
-        // subfolders) so opening folders uses the local SQLite index instead
-        // of blocking on a live WebDAV PROPFIND request, while leaving
-        // unopened leaf folders with revision='' so they still fetch on open.
-        c.execute_batch("INSERT INTO directory_sync_state(root_id,remote_path,scanned_at,revision,cover_asset_id)
-            SELECT root_id,parent_path,MAX(scanned_at),lower(hex(randomblob(8))),NULL FROM library_nodes
-            WHERE remote_path!=parent_path
-            GROUP BY root_id,parent_path
-            ON CONFLICT(root_id,remote_path) DO UPDATE SET
-                revision=CASE WHEN directory_sync_state.revision='' THEN excluded.revision ELSE directory_sync_state.revision END;
-            INSERT INTO directory_sync_state(root_id,remote_path,scanned_at,revision,cover_asset_id)
-            SELECT root_id,remote_path,scanned_at,lower(hex(randomblob(8))),NULL FROM directory_snapshots
-            WHERE 1=1
-            ON CONFLICT(root_id,remote_path) DO UPDATE SET
-                revision=CASE WHEN directory_sync_state.revision='' THEN excluded.revision ELSE directory_sync_state.revision END;
-            INSERT INTO directory_sync_state(root_id,remote_path,scanned_at,revision,cover_asset_id)
-            SELECT root_id,parent_path,MAX(scanned_at),lower(hex(randomblob(8))),NULL FROM assets
-            WHERE missing=0
-            GROUP BY root_id,parent_path
-            ON CONFLICT(root_id,remote_path) DO UPDATE SET
-                revision=CASE WHEN directory_sync_state.revision='' THEN excluded.revision ELSE directory_sync_state.revision END;
-            INSERT OR IGNORE INTO directory_sync_state(root_id,remote_path,scanned_at,revision,cover_asset_id)
-            SELECT root_id,remote_path,scanned_at,'',NULL FROM library_nodes;
-            UPDATE directory_sync_state
-            SET revision=''
-            WHERE revision!=''
-              AND NOT EXISTS (SELECT 1 FROM directory_snapshots ds WHERE ds.root_id=directory_sync_state.root_id AND ds.remote_path=directory_sync_state.remote_path)
-              AND NOT EXISTS (SELECT 1 FROM library_nodes ln WHERE ln.root_id=directory_sync_state.root_id AND ln.parent_path=directory_sync_state.remote_path AND ln.remote_path!=directory_sync_state.remote_path)
-              AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.root_id=directory_sync_state.root_id AND a.parent_path=directory_sync_state.remote_path AND a.missing=0);").map_err(database_error)?;
-        propagate_directory_covers(&migration)?;
-        c.execute(
-            "INSERT INTO settings(key, value) VALUES('directory_cover_tree_v2', '1')
-             ON CONFLICT(key) DO UPDATE SET value = '1'",
-            [],
-        ).map_err(database_error)?;
-    }
-    migration.commit().map_err(database_error)?;
-    Ok(())
-}
-
-fn select_directory_cover(c: &Connection, root_id: &str, path: &str) -> Result<Option<String>, String> {
-    // 1. Direct child asset in this folder
-    let direct: Option<String> = c
-        .query_row(
-            "SELECT id FROM assets
-             WHERE root_id=?1 AND parent_path=?2 AND missing=0
-               AND (media_type IN ('image','comicPage','comicArchive')
-                 OR (media_type='video' AND lower(file_name) NOT GLOB '*.avi' AND lower(file_name) NOT GLOB '*.wmv' AND lower(file_name) NOT GLOB '*.rmvb' AND lower(file_name) NOT GLOB '*.rm' AND lower(file_name) NOT GLOB '*.flv' AND lower(file_name) NOT GLOB '*.vob' AND lower(file_name) NOT GLOB '*.m2ts' AND lower(file_name) NOT GLOB '*.mts' AND lower(file_name) NOT GLOB '*.asf'))
-             ORDER BY CASE WHEN lower(file_name) GLOB 'cover.*' OR lower(file_name) GLOB 'poster.*' OR lower(file_name) GLOB 'folder.*' THEN 0 WHEN media_type IN ('image','comicPage') THEN 1 ELSE 2 END,name_sort,remote_path LIMIT 1",
-            params![root_id, path],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(database_error)?;
-    if direct.is_some() {
-        return Ok(direct);
-    }
-    // 2. Inherit cover from first immediate child folder that already has a cover
-    let child_cover: Option<String> = c
-        .query_row(
-            "SELECT s.cover_asset_id
-             FROM library_nodes n
-             JOIN directory_sync_state s ON s.root_id = n.root_id AND s.remote_path = n.remote_path
-             WHERE n.root_id = ?1 AND n.parent_path = ?2 AND n.remote_path != ?2
-               AND s.cover_asset_id IS NOT NULL
-             ORDER BY n.name_sort, n.remote_path
-             LIMIT 1",
-            params![root_id, path],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(database_error)?;
-    if child_cover.is_some() {
-        return Ok(child_cover);
-    }
-    Ok(None)
-}
-
-fn propagate_directory_covers(c: &Connection) -> Result<(), String> {
-    c.execute_batch(
-        "INSERT OR IGNORE INTO directory_sync_state(root_id,remote_path,scanned_at,revision,cover_asset_id)
-         SELECT root_id,parent_path,MAX(scanned_at),'',NULL FROM library_nodes
-         GROUP BY root_id,parent_path;
-         INSERT OR IGNORE INTO directory_sync_state(root_id,remote_path,scanned_at,revision,cover_asset_id)
-         SELECT root_id,remote_path,scanned_at,'',NULL FROM library_nodes;
-         UPDATE directory_sync_state
-         SET cover_asset_id = NULL
-         WHERE cover_asset_id IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.id = directory_sync_state.cover_asset_id AND a.missing = 0);",
-    )
-    .map_err(database_error)?;
-
-    // 1. Fetch the single best cover asset per direct parent folder in one pass
-    let leaf_covers: Vec<(String, String, String)> = {
-        let mut stmt = c
-            .prepare(
-                "SELECT root_id, parent_path, id FROM (
-                     SELECT root_id, parent_path, id,
-                            ROW_NUMBER() OVER(
-                                PARTITION BY root_id, parent_path
-                                ORDER BY
-                                    CASE WHEN lower(file_name) GLOB 'cover.*' OR lower(file_name) GLOB 'poster.*' OR lower(file_name) GLOB 'folder.*' THEN 0
-                                         WHEN media_type IN ('image','comicPage') THEN 1
-                                         ELSE 2
-                                    END,
-                                    name_sort,
-                                    remote_path
-                            ) AS rank
-                     FROM assets
-                     WHERE missing = 0
-                       AND (media_type IN ('image','comicPage','comicArchive')
-                         OR (media_type = 'video' AND lower(file_name) NOT GLOB '*.avi' AND lower(file_name) NOT GLOB '*.wmv' AND lower(file_name) NOT GLOB '*.rmvb' AND lower(file_name) NOT GLOB '*.rm' AND lower(file_name) NOT GLOB '*.flv' AND lower(file_name) NOT GLOB '*.vob' AND lower(file_name) NOT GLOB '*.m2ts' AND lower(file_name) NOT GLOB '*.mts' AND lower(file_name) NOT GLOB '*.asf'))
-                 ) WHERE rank = 1
-                 ORDER BY root_id, parent_path",
-            )
-            .map_err(database_error)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(database_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(database_error)?
-    };
-
-    if leaf_covers.is_empty() {
-        return Ok(());
-    }
-
-    // 2. Build direct covers + ancestor covers in Rust memory (< 1ms)
-    let mut cover_map: HashMap<(String, String), String> =
-        HashMap::with_capacity(leaf_covers.len() * 2);
-    for (root_id, dir_path, cover_id) in &leaf_covers {
-        cover_map.insert((root_id.clone(), dir_path.clone()), cover_id.clone());
-    }
-    for (root_id, dir_path, cover_id) in &leaf_covers {
-        let mut current = dir_path.clone();
-        for _ in 0..16 {
-            let parent = parent_path(&current);
-            if parent == current {
-                break;
-            }
-            cover_map
-                .entry((root_id.clone(), parent.clone()))
-                .or_insert_with(|| cover_id.clone());
-            current = parent;
-        }
-    }
-
-    // 3. Batch-write covers into directory_sync_state
-    let mut upsert_stmt = c
-        .prepare(
-            "INSERT INTO directory_sync_state(root_id, remote_path, scanned_at, revision, cover_asset_id)
-             VALUES (?1, ?2, 0, '', ?3)
-             ON CONFLICT(root_id, remote_path) DO UPDATE SET
-               cover_asset_id = COALESCE(directory_sync_state.cover_asset_id, excluded.cover_asset_id)",
-        )
-        .map_err(database_error)?;
-    for ((root_id, dir_path), cover_id) in cover_map {
-        upsert_stmt
-            .execute(params![root_id, dir_path, cover_id])
-            .map_err(database_error)?;
-    }
-    Ok(())
-}
-
-fn browse_sorted_directory_page(c: &Connection, root: &str, path: &str, sort: BrowseSort, cursor: Option<&str>) -> Result<Option<RemoteBrowserPage>,String> {
-    let revision: Option<String> = c
-        .query_row(
-            "SELECT revision FROM directory_sync_state WHERE root_id=?1 AND remote_path=?2",
-            params![root, path],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(database_error)?;
-    let directories: i64 = c
-        .query_row(
-            "SELECT count(*) FROM library_nodes WHERE root_id=?1 AND parent_path=?2 AND remote_path!=?2",
-            params![root, path],
-            |r| r.get(0),
-        )
-        .map_err(database_error)?;
-    let files_count: i64 = c
-        .query_row(
-            "SELECT count(*) FROM assets WHERE root_id=?1 AND parent_path=?2 AND missing=0",
-            params![root, path],
-            |r| r.get(0),
-        )
-        .map_err(database_error)?;
-
-    // If there is no revision AND no records exist in SQLite, this directory has never been indexed/synced.
-    if revision.as_deref().unwrap_or("").is_empty() && directories == 0 && files_count == 0 {
-        return Ok(None);
-    }
-
-    let revision = match revision {
-        Some(rev) if !rev.is_empty() => rev,
-        _ => "local".to_string(),
-    };
-
-    let page = if let Some(cursor) = cursor {
-        let pieces: Vec<_> = cursor.split(':').collect();
-        if pieces.len() != 4 || pieces[0] != "v2" || pieces[1] != sort.as_str() || pieces[2] != revision {
-            return Err("目录或排序已变化，请刷新目录后继续".into());
-        }
-        pieces[3]
-            .parse::<usize>()
-            .ok()
-            .filter(|p| *p > 0 && *p < 1_000_000)
-            .ok_or("分页游标无效")?
-    } else {
-        1
-    };
-    let offset = (page - 1) * BROWSE_PAGE_SIZE;
-    let mut items = Vec::new();
-    if offset < directories as usize {
-        let sql = format!(
-            "SELECT n.remote_path,n.name,n.modified_at,s.cover_asset_id FROM
-            (SELECT * FROM library_nodes WHERE root_id=?1 AND parent_path=?2 AND remote_path!=?2 ORDER BY {} LIMIT ?3 OFFSET ?4) n
-            LEFT JOIN directory_sync_state s ON s.root_id=n.root_id AND s.remote_path=n.remote_path ORDER BY {}",
-            sort.order(true),
-            sort.order(true)
-                .replace("remote_path", "n.remote_path")
-                .replace("name_sort", "n.name_sort")
-                .replace("modified_ts", "n.modified_ts")
-        );
-        items = c
-            .prepare(&sql)
-            .map_err(database_error)?
-            .query_map(
-                params![root, path, (BROWSE_PAGE_SIZE + 1) as i64, offset as i64],
-                |r| {
-                    Ok(RemoteBrowserEntry {
-                        path: r.get(0)?,
-                        name: r.get(1)?,
-                        is_directory: true,
-                        size_bytes: 0,
-                        modified_at: r.get(2)?,
-                        etag: None,
-                        asset_id: None,
-                        media_type: None,
-                        thumbnail_source: None,
-                        thumbnail_url: None,
-                        cover_asset_id: r.get::<_, Option<String>>(3)?.filter(|s| !s.is_empty()),
-                        duration_seconds: None,
-                        progress_seconds: None,
-                    })
-                },
-            )
-            .map_err(database_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error)?;
-        for item in &mut items {
-            if item.is_directory && item.cover_asset_id.is_none() {
-                if let Ok(Some(cover_id)) = select_directory_cover(c, root, &item.path) {
-                    if !cover_id.is_empty() {
-                        item.cover_asset_id = Some(cover_id);
-                    }
-                }
-            }
-        }
-    }
-    if items.len() <= BROWSE_PAGE_SIZE {
-        let sql = format!(
-            "SELECT a.id,a.remote_path,a.file_name,a.media_type,a.size_bytes,a.etag,a.modified_at,a.duration_seconds,p.position_seconds
-            FROM assets a LEFT JOIN playback_progress p ON p.asset_id=a.id
-            WHERE a.root_id=?1 AND a.parent_path=?2 AND a.missing=0 ORDER BY {} LIMIT ?3 OFFSET ?4",
-            sort.order(false)
-        );
-        let remaining = BROWSE_PAGE_SIZE + 1 - items.len();
-        let files = c
-            .prepare(&sql)
-            .map_err(database_error)?
-            .query_map(
-                params![
-                    root,
-                    path,
-                    remaining as i64,
-                    offset.saturating_sub(directories as usize) as i64
-                ],
-                |r| {
-                    Ok(RemoteBrowserEntry {
-                        asset_id: Some(r.get(0)?),
-                        path: r.get(1)?,
-                        name: r.get(2)?,
-                        media_type: Some(r.get(3)?),
-                        size_bytes: r.get(4)?,
-                        etag: r.get(5)?,
-                        modified_at: r.get(6)?,
-                        is_directory: false,
-                        thumbnail_source: None,
-                        thumbnail_url: None,
-                        cover_asset_id: None,
-                        duration_seconds: r.get(7)?,
-                        progress_seconds: r.get(8)?,
-                    })
-                },
-            )
-            .map_err(database_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error)?;
-        items.extend(files);
-    }
-    let more = items.len() > BROWSE_PAGE_SIZE;
-    items.truncate(BROWSE_PAGE_SIZE);
-    Ok(Some(RemoteBrowserPage {
-        items,
-        next_cursor: more.then(|| format!("v2:{}:{}:{}", sort.as_str(), revision, page + 1)),
-        from_local_cache: Some(true),
-        sync_summary: None,
-    }))
-}
-
-#[cfg(test)]
-fn browse_local_directory_page(c:&Connection,root:&str,path:&str,page:usize)->Result<Option<RemoteBrowserPage>,String>{
-    let revision:Option<String>=c.query_row("SELECT revision FROM directory_sync_state WHERE root_id=?1 AND remote_path=?2",params![root,path],|r|r.get(0)).optional().map_err(database_error)?;
-    let cursor=revision.map(|r|format!("v2:name:{r}:{page}"));
-    browse_sorted_directory_page(c,root,path,BrowseSort::Name,cursor.as_deref())
 }
 
 /// Browse exactly one remote directory through AList's native API. SQLite is
@@ -1243,7 +866,7 @@ pub async fn list_remote_children(
             media_type:text("mediaType"),thumbnail_source:text("thumbnailSource"),thumbnail_url:None,
             cover_asset_id:text("coverAssetId"),
             duration_seconds:entry.get("durationSeconds").and_then(|v|v.as_i64()),
-            progress_seconds:entry.get("progressSeconds").and_then(|v|v.as_f64()).map(|n|n as i64),
+            progress_seconds:entry.get("progressSeconds").and_then(|v|v.as_f64()).filter(|n| n.is_finite()),
         })
     }).collect::<Result<Vec<_>,String>>()?;
     Ok(RemoteBrowserPage {
@@ -1260,101 +883,6 @@ pub struct DirectorySyncSummary {
     total: usize,
 }
 
-// All mutations use one transaction. Missing media retain their identifiers,
-// favorites and playback progress so a later reappearance restores them.
-fn sync_directory_entries(
-    connection: &mut Connection, root_id: &str, kind: LibraryRootKind,
-    path: &str, entries: Vec<DavEntry>,
-) -> Result<DirectorySyncSummary, String> {
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(database_error)?;
-    let result = sync_directory_entries_tx(&tx, root_id, kind, path, entries)?;
-    tx.commit().map_err(database_error)?;
-    Ok(result)
-}
-
-fn sync_directory_entries_tx(tx: &rusqlite::Transaction<'_>, root_id: &str, kind: LibraryRootKind, path: &str, entries: Vec<DavEntry>) -> Result<DirectorySyncSummary,String> {
-    let entries: Vec<_> = entries.into_iter().filter(|e| e.remote_path != path).collect();
-    if entries.iter().any(|e| parent_path(&e.remote_path) != path) {
-        return Err("媒体源返回了不属于当前目录的条目，本次未修改索引".into());
-    }
-    let old_dirs = tx.prepare("SELECT remote_path FROM library_nodes WHERE root_id=?1 AND parent_path=?2 AND remote_path!=?2")
-        .map_err(database_error)?.query_map(params![root_id,path], |r| r.get::<_,String>(0))
-        .map_err(database_error)?.collect::<Result<HashSet<_>,_>>().map_err(database_error)?;
-    let old_files = tx.prepare("SELECT remote_path,size_bytes,etag,modified_at,missing FROM assets WHERE root_id=?1 AND parent_path=?2")
-        .map_err(database_error)?.query_map(params![root_id,path], |r| Ok((r.get::<_,String>(0)?,(r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?))))
-        .map_err(database_error)?.collect::<Result<HashMap<_,_>,_>>().map_err(database_error)?;
-    let mut summary = DirectorySyncSummary { added:0, updated:0, removed:0, total:0 };
-    let mut live_dirs = HashSet::new();
-    let mut live_files = HashSet::new();
-    let timestamp = now();
-    for entry in &entries {
-        if entry.is_collection {
-            if !live_dirs.insert(entry.remote_path.clone()) { continue; }
-            if !old_dirs.contains(&entry.remote_path) { summary.added += 1; }
-            let name = file_name(&entry.remote_path);
-            let name_sort = natural_name_key(&name);
-            let mod_ts = modified_timestamp(entry.modified_at.as_deref());
-            tx.execute("INSERT INTO library_nodes(root_id,remote_path,parent_path,name,scanned_at,modified_at,modified_ts,name_sort) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-                ON CONFLICT(root_id,remote_path) DO UPDATE SET parent_path=excluded.parent_path,name=excluded.name,scanned_at=excluded.scanned_at,modified_at=excluded.modified_at,modified_ts=excluded.modified_ts,name_sort=excluded.name_sort",
-                params![root_id,entry.remote_path,path,name,timestamp,entry.modified_at,mod_ts,name_sort]).map_err(database_error)?;
-        } else if let Some(media_type) = media_type_for(kind, &entry.remote_path) {
-            if !live_files.insert(entry.remote_path.clone()) { continue; }
-            match old_files.get(&entry.remote_path) {
-                Some((_,_,_,missing)) if *missing != 0 => summary.added += 1,
-                Some((size,etag,modified,_)) if *size != entry.size_bytes || *etag != entry.etag || *modified != entry.modified_at => summary.updated += 1,
-                None => summary.added += 1,
-                _ => {}
-            }
-            let id = format!("asset-{:016x}",stable_hash(&format!("{root_id}|{}",entry.remote_path)));
-            let fname = file_name(&entry.remote_path);
-            let name_sort = natural_name_key(&fname);
-            let mod_ts = modified_timestamp(entry.modified_at.as_deref());
-            tx.execute("INSERT INTO assets(id,root_id,remote_path,file_name,parent_path,media_type,size_bytes,etag,modified_at,modified_ts,name_sort,missing,scanned_at)
-                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)
-                ON CONFLICT(root_id,remote_path) DO UPDATE SET file_name=excluded.file_name,parent_path=excluded.parent_path,media_type=excluded.media_type,
-                content_hash=CASE WHEN assets.size_bytes=excluded.size_bytes AND assets.etag IS excluded.etag AND assets.modified_at IS excluded.modified_at THEN assets.content_hash ELSE NULL END,
-                size_bytes=excluded.size_bytes,etag=excluded.etag,modified_at=excluded.modified_at,modified_ts=excluded.modified_ts,name_sort=excluded.name_sort,missing=0,scanned_at=excluded.scanned_at",
-                params![id,root_id,entry.remote_path,fname,path,media_type,entry.size_bytes,entry.etag,entry.modified_at,mod_ts,name_sort,timestamp]).map_err(database_error)?;
-        }
-    }
-    for (old,(_,_,_,missing)) in &old_files {
-        if !live_files.contains(old) {
-            if *missing == 0 { summary.removed += 1; }
-            tx.execute("UPDATE assets SET missing=1 WHERE root_id=?1 AND remote_path=?2",params![root_id,old]).map_err(database_error)?;
-        }
-    }
-    for old in old_dirs.difference(&live_dirs) {
-        summary.removed += 1;
-        let prefix_start = format!("{old}/");
-        let prefix_end = format!("{old}0");
-        tx.execute("UPDATE assets SET missing=1 WHERE root_id=?1 AND remote_path>=?2 AND remote_path<?3",params![root_id,prefix_start,prefix_end]).map_err(database_error)?;
-        for table in ["library_nodes","directory_snapshots","directory_sync_state"] {
-            tx.execute(&format!("DELETE FROM {table} WHERE root_id=?1 AND (remote_path=?2 OR (remote_path>=?3 AND remote_path<?4))"),params![root_id,old,prefix_start,prefix_end]).map_err(database_error)?;
-        }
-    }
-    tx.execute("INSERT INTO directory_sync_state(root_id,remote_path,scanned_at) VALUES(?1,?2,?3)
-        ON CONFLICT(root_id,remote_path) DO UPDATE SET scanned_at=excluded.scanned_at",params![root_id,path,now()]).map_err(database_error)?;
-    // Do not give the recursive scanner a fingerprint for an unscanned subtree.
-    tx.execute("DELETE FROM directory_snapshots WHERE root_id=?1 AND remote_path=?2",params![root_id,path]).map_err(database_error)?;
-    let cover: Option<String> = select_directory_cover(tx, root_id, path)?;
-    tx.execute("UPDATE directory_sync_state SET revision=?3,cover_asset_id=CASE WHEN cover_asset_id IS NOT NULL AND cover_asset_id LIKE 'dir_cover_%' THEN cover_asset_id ELSE ?4 END WHERE root_id=?1 AND remote_path=?2",params![root_id,path,random_token(),cover]).map_err(database_error)?;
-    if let Some(ref cover_id) = cover {
-        let mut current = path.to_owned();
-        for _ in 0..16 {
-            let parent = parent_path(&current);
-            if parent == current {
-                break;
-            }
-            let _ = tx.execute(
-                "UPDATE directory_sync_state SET cover_asset_id = COALESCE(NULLIF(cover_asset_id, ''), ?3) WHERE root_id = ?1 AND remote_path = ?2",
-                params![root_id, parent, cover_id],
-            );
-            current = parent;
-        }
-    }
-    summary.total = live_files.len() + live_dirs.len();
-    Ok(summary)
-}
 
 /// Search the complete remote subtree through AList instead of limiting the
 /// result to the pages currently rendered by the browser.
@@ -1661,140 +1189,6 @@ fn register_search_assets_v2(
     Ok(registered)
 }
 
-fn register_browsed_assets(
-    connection: &mut Connection,
-    root_id: &str,
-    path: &str,
-    playable: Vec<RemoteBrowserEntry>,
-    timestamp: i64,
-) -> Result<(), String> {
-    // An unchanged page uses only reads, even while the scanner holds the
-    // SQLite write lock. Recheck the fingerprint inside the upsert below.
-    let playable = {
-        let mut lookup = connection.prepare_cached("SELECT size_bytes, etag, media_type, missing FROM assets WHERE root_id = ?1 AND remote_path = ?2").map_err(database_error)?;
-        let mut changed = Vec::new();
-        for entry in playable {
-            let same = lookup
-                .query_row(params![root_id, entry.path], |row| {
-                    Ok(row.get::<_, i64>(0)? == entry.size_bytes
-                        && row.get::<_, Option<String>>(1)? == entry.etag
-                        && Some(row.get::<_, String>(2)?) == entry.media_type
-                        && row.get::<_, i64>(3)? == 0)
-                })
-                .optional()
-                .map_err(database_error)?
-                .unwrap_or(false);
-            if !same {
-                changed.push(entry);
-            }
-        }
-        changed
-    };
-    if playable.is_empty() {
-        return Ok(());
-    }
-    let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(database_error)?;
-    let mut statement = transaction.prepare_cached(
-            "INSERT INTO assets (id, root_id, remote_path, file_name, parent_path, media_type, size_bytes, etag, thumbnail_key, missing, scanned_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)
-             ON CONFLICT(root_id, remote_path) DO UPDATE SET
-               file_name = excluded.file_name, parent_path = excluded.parent_path,
-               media_type = excluded.media_type, size_bytes = excluded.size_bytes,
-               etag = excluded.etag, thumbnail_key = excluded.thumbnail_key,
-               missing = 0, scanned_at = excluded.scanned_at,
-               content_hash = CASE WHEN assets.size_bytes = excluded.size_bytes AND assets.etag IS excluded.etag THEN assets.content_hash ELSE NULL END
-             WHERE assets.missing != 0 OR assets.size_bytes != excluded.size_bytes
-                OR assets.etag IS NOT excluded.etag OR assets.media_type != excluded.media_type"
-        ).map_err(database_error)?;
-    for entry in playable {
-        let asset_id = entry.asset_id.as_deref().unwrap_or_default();
-        let media_type = entry.media_type.as_deref().unwrap_or_default();
-        statement
-            .execute(params![
-                asset_id,
-                root_id,
-                entry.path,
-                entry.name,
-                path,
-                media_type,
-                entry.size_bytes,
-                entry.etag,
-                thumbnail_key(&entry.name, media_type),
-                timestamp,
-            ])
-            .map_err(database_error)?;
-    }
-    drop(statement);
-    transaction.commit().map_err(database_error)?;
-    Ok(())
-}
-
-async fn browse_directory_page(
-    state: &MediaLibraryState,
-    session: &Session,
-    root_id: &str,
-    path: &str,
-    cursor: Option<String>,
-    refresh: bool,
-) -> Result<(Vec<DavEntry>, Option<String>), String> {
-    let page = match cursor {
-        Some(value) => value
-            .strip_prefix("api:")
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|value| *value > 0)
-            .ok_or("目录页码无效")?,
-        None => 1,
-    };
-    let cache_key = format!("{root_id}|{path}|{page}");
-    if !refresh {
-        let cache = state.directory_cache.lock().await;
-        if let Some(cached) = cache.get(&cache_key) {
-            if cached.cached_at.elapsed().as_secs() < DIRECTORY_CACHE_TTL_SECONDS {
-                return Ok((cached.entries.clone(), cached.next_cursor.clone()));
-            }
-        }
-    }
-    let (entries, more) = match session.provider {
-        ProviderKind::Alist => list_api_directory_range(session, path, Some(page), refresh).await?,
-        ProviderKind::CloudDrive2 => {
-            let all = list_webdav_directory(session, path).await?;
-            let offset = (page - 1) as usize * BROWSE_PAGE_SIZE;
-            if offset >= all.len() {
-                (Vec::new(), false)
-            } else {
-                let end = (offset + BROWSE_PAGE_SIZE).min(all.len());
-                let slice = all[offset..end].to_vec();
-                let more = end < all.len();
-                (slice, more)
-            }
-        }
-    };
-    let next_cursor = more.then(|| format!("api:{}", page + 1));
-    {
-        let mut cache = state.directory_cache.lock().await;
-        cache
-            .retain(|_, cached| cached.cached_at.elapsed().as_secs() < DIRECTORY_CACHE_TTL_SECONDS);
-        while cache.len() >= MAX_DIRECTORY_CACHE_PAGES {
-            let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, cached)| cached.cached_at)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            cache.remove(&oldest);
-        }
-        cache.insert(
-            cache_key,
-            CachedDirectoryPage {
-                cached_at: Instant::now(),
-                entries: entries.clone(),
-                next_cursor: next_cursor.clone(),
-            },
-        );
-    }
-    Ok((entries, next_cursor))
-}
 
 #[cfg_attr(feature = "tauri", tauri::command)]
 pub fn list_library_roots(app: AppHandle) -> Result<Vec<LibraryRoot>, String> {
@@ -2123,65 +1517,6 @@ pub fn list_library_assets(
     parent_path: Option<String>,
 ) -> Result<Vec<LibraryAsset>, String> {
     crate::v2_catalog::list_library_assets(app, filter, query, author_id, collection_id, category_id, limit, offset, parent_path)
-}
-
-struct VideoBoundsCache {
-    min_rowid: i64,
-    max_rowid: i64,
-    total: usize,
-    cached_at: Instant,
-}
-
-static VIDEO_BOUNDS_CACHE: OnceLock<StdMutex<Option<VideoBoundsCache>>> = OnceLock::new();
-
-fn get_video_bounds(connection: &Connection) -> Result<(i64, i64, usize), String> {
-    let mutex = VIDEO_BOUNDS_CACHE.get_or_init(|| StdMutex::new(None));
-    let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ref cached) = *guard {
-        if cached.cached_at.elapsed() < Duration::from_secs(300) && cached.total > 0 {
-            return Ok((cached.min_rowid, cached.max_rowid, cached.total));
-        }
-    }
-
-    let row: Option<(i64, i64, usize)> = connection
-        .query_row(
-            "SELECT MIN(rowid), MAX(rowid), COUNT(*) FROM assets
-             WHERE media_type = 'video' AND missing = 0
-               AND remote_path NOT LIKE '%inbox%'
-               AND remote_path NOT LIKE '%暂存%'
-               AND remote_path NOT LIKE '%未分类%'
-               AND remote_path NOT LIKE '%pending%'
-               AND (file_name LIKE '%.mp4' OR file_name LIKE '%.webm' OR file_name LIKE '%.mov' OR file_name LIKE '%.m4v')",
-            [],
-            |r| {
-                let min_r: Option<i64> = r.get(0)?;
-                let max_r: Option<i64> = r.get(1)?;
-                let cnt: usize = r.get(2)?;
-                if let (Some(min_v), Some(max_v)) = (min_r, max_r) {
-                    Ok(Some((min_v, max_v, cnt)))
-                } else {
-                    Ok(None)
-                }
-            },
-        )
-        .map_err(database_error)?;
-
-    let (min_rowid, max_rowid, total) = row.unwrap_or((0, 0, 0));
-    *guard = Some(VideoBoundsCache {
-        min_rowid,
-        max_rowid,
-        total,
-        cached_at: Instant::now(),
-    });
-
-    Ok((min_rowid, max_rowid, total))
-}
-
-pub fn invalidate_video_bounds_cache() {
-    let mutex = VIDEO_BOUNDS_CACHE.get_or_init(|| StdMutex::new(None));
-    if let Ok(mut guard) = mutex.lock() {
-        *guard = None;
-    }
 }
 
 /// Returns a true-random, non-repeating shuffle of eligible short videos.
@@ -4804,6 +4139,98 @@ fn comic_zipmeta_path(cache_dir: &std::path::Path, key: u64) -> PathBuf {
     cache_dir.join(format!("comic-{key:016x}.zipmeta.json"))
 }
 
+fn zip_meta_fingerprint(size: i64, etag: Option<&str>, modified: Option<&str>) -> String {
+    format!("{size}|{}|{}", etag.unwrap_or_default(), modified.unwrap_or_default())
+}
+
+fn load_persisted_zip_meta(
+    app: &AppHandle,
+    asset_id: &str,
+    size: i64,
+    etag: Option<&str>,
+    modified: Option<&str>,
+) -> Result<Option<Vec<ZipEntryMeta>>, String> {
+    let connection = open_media_database(app)?;
+    let raw: Option<String> = connection
+        .query_row(
+            "SELECT manifest_json FROM comic_archives WHERE asset_id=?1 AND page_count>0",
+            params![asset_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else { return Ok(None) };
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| format!("漫画清单损坏：{error}"))?;
+    let fingerprint = zip_meta_fingerprint(size, etag, modified);
+    if value.get("fingerprint").and_then(|item| item.as_str()) != Some(fingerprint.as_str()) {
+        return Ok(None);
+    }
+    let entries: Vec<ZipEntryMeta> = serde_json::from_value(value.get("pages").cloned().unwrap_or(serde_json::Value::Null))
+        .map_err(|error| format!("漫画页清单无法读取：{error}"))?;
+    Ok((!entries.is_empty()).then_some(entries))
+}
+
+fn persist_comic_manifest(
+    app: &AppHandle,
+    asset_id: &str,
+    size: i64,
+    etag: Option<&str>,
+    modified: Option<&str>,
+    entries: &[ZipEntryMeta],
+) -> Result<(), String> {
+    persist_comic_manifest_connection(&open_media_database(app)?, asset_id, size, etag, modified, entries)
+}
+
+fn persist_comic_manifest_connection(
+    connection: &Connection,
+    asset_id: &str,
+    size: i64,
+    etag: Option<&str>,
+    modified: Option<&str>,
+    entries: &[ZipEntryMeta],
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let tx = connection.unchecked_transaction().map_err(database_error)?;
+    let manifest = serde_json::json!({
+        "fingerprint": zip_meta_fingerprint(size, etag, modified),
+        "pages": entries,
+    });
+    tx.execute(
+        "INSERT INTO comic_archives(asset_id,page_count,manifest_json,updated_at) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(asset_id) DO UPDATE SET page_count=excluded.page_count,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at",
+        params![asset_id, entries.len() as i64, manifest.to_string(), now()],
+    ).map_err(database_error)?;
+    tx.execute("DELETE FROM comic_pages WHERE archive_asset_id=?1", params![asset_id]).map_err(database_error)?;
+    {
+        let mut statement = tx.prepare(
+            "INSERT INTO comic_pages(archive_asset_id,page_index,entry_name,data_offset,compressed_size,uncompressed_size)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+        ).map_err(database_error)?;
+        for (index, entry) in entries.iter().enumerate() {
+            statement.execute(params![
+                asset_id,
+                index as i64,
+                entry.name,
+                i64::try_from(entry.local_header_offset).ok(),
+                i64::try_from(entry.compressed_size).ok(),
+                i64::try_from(entry.uncompressed_size).ok(),
+            ]).map_err(database_error)?;
+        }
+    }
+    tx.commit().map_err(database_error)
+}
+
+fn remember_zip_meta(state: &MediaLibraryState, asset_id: &str, entries: Arc<Vec<ZipEntryMeta>>) {
+    if let Ok(mut cache) = state.comic_remote_zip_cache.lock() {
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(asset_id.to_owned(), entries);
+    }
+}
+
 async fn ensure_remote_zip_meta(
     app: &AppHandle,
     state: &State<'_, MediaLibraryState>,
@@ -4830,6 +4257,12 @@ async fn ensure_remote_zip_meta(
         return Err("不是 ZIP/CBZ 格式".into());
     }
 
+    if let Some(entries) = load_persisted_zip_meta(app, asset_id, expected_size, expected_etag.as_deref(), expected_modified.as_deref())? {
+        let arc_entries = Arc::new(entries);
+        remember_zip_meta(state, asset_id, Arc::clone(&arc_entries));
+        return Ok(arc_entries);
+    }
+
     let cache_base = if let Ok(value) = std::env::var("PML_CACHE_DIR") {
         PathBuf::from(value)
     } else {
@@ -4845,10 +4278,9 @@ async fn ensure_remote_zip_meta(
     if let Ok(bytes) = fs::read(&meta_file) {
         if let Ok(entries) = serde_json::from_slice::<Vec<ZipEntryMeta>>(&bytes) {
             if !entries.is_empty() {
+                let _ = persist_comic_manifest(app, asset_id, expected_size, expected_etag.as_deref(), expected_modified.as_deref(), &entries);
                 let arc_entries = Arc::new(entries);
-                if let Ok(mut cache) = state.comic_remote_zip_cache.lock() {
-                    cache.insert(asset_id.to_string(), Arc::clone(&arc_entries));
-                }
+                remember_zip_meta(state, asset_id, Arc::clone(&arc_entries));
                 return Ok(arc_entries);
             }
         }
@@ -4856,15 +4288,11 @@ async fn ensure_remote_zip_meta(
 
     let source = build_comic_proxy_source(state, asset_id, &remote_path).await?;
     let entries = fetch_remote_zip_central_directory(&source, expected_size).await?;
+    let _ = persist_comic_manifest(app, asset_id, expected_size, expected_etag.as_deref(), expected_modified.as_deref(), &entries);
     let arc_entries = Arc::new(entries);
 
     let _ = fs::write(&meta_file, serde_json::to_vec(&*arc_entries).unwrap_or_default());
-    if let Ok(mut cache) = state.comic_remote_zip_cache.lock() {
-        if cache.len() >= 256 {
-            cache.clear();
-        }
-        cache.insert(asset_id.to_string(), Arc::clone(&arc_entries));
-    }
+    remember_zip_meta(state, asset_id, Arc::clone(&arc_entries));
     Ok(arc_entries)
 }
 
@@ -10307,6 +9735,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn comic_manifest_round_trips_pages_and_rejects_a_changed_fingerprint() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE comic_archives(asset_id TEXT PRIMARY KEY,page_count INTEGER NOT NULL,manifest_json TEXT,updated_at INTEGER NOT NULL);
+            CREATE TABLE comic_pages(archive_asset_id TEXT NOT NULL,page_index INTEGER NOT NULL,entry_name TEXT NOT NULL,data_offset INTEGER,compressed_size INTEGER,uncompressed_size INTEGER,PRIMARY KEY(archive_asset_id,page_index));").unwrap();
+        let pages = vec![ZipEntryMeta { name: "001.jpg".into(), compression_method: 8, flags: 0, crc32: 1, compressed_size: 20, uncompressed_size: 40, local_header_offset: 64 }];
+        persist_comic_manifest_connection(&connection, "comic", 100, Some("etag"), Some("2026-11-10"), &pages).unwrap();
+        let stored: i64 = connection.query_row("SELECT page_count FROM comic_archives", [], |row| row.get(0)).unwrap();
+        assert_eq!(stored, 1);
+        let offset: i64 = connection.query_row("SELECT data_offset FROM comic_pages", [], |row| row.get(0)).unwrap();
+        assert_eq!(offset, 64);
+        let raw: String = connection.query_row("SELECT manifest_json FROM comic_archives", [], |row| row.get(0)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["fingerprint"], "100|etag|2026-11-10");
+        assert_ne!(value["fingerprint"], "100|other|2026-11-10");
+    }
+
+    #[test]
     fn directory_config_uses_only_canonical_roots_and_preserves_clear() {
         let c=Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE domain_roots(domain TEXT PRIMARY KEY,remote_path TEXT);
@@ -10380,120 +9825,6 @@ mod tests {
         assert_eq!(connection.query_row("SELECT cover_asset_id FROM directory_sync_state", [], |r| r.get::<_, String>(0)).unwrap(), "dir_cover_test");
     }
 
-    fn sync_test_database() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE assets(id TEXT PRIMARY KEY,root_id TEXT,remote_path TEXT,file_name TEXT,parent_path TEXT,media_type TEXT,size_bytes INTEGER,etag TEXT,modified_at TEXT,content_hash TEXT,missing INTEGER,scanned_at INTEGER,duration_seconds INTEGER,UNIQUE(root_id,remote_path));
-            CREATE TABLE library_nodes(root_id TEXT,remote_path TEXT,parent_path TEXT,name TEXT,scanned_at INTEGER,PRIMARY KEY(root_id,remote_path));
-            CREATE TABLE directory_snapshots(root_id TEXT,remote_path TEXT,fingerprint TEXT,scanned_at INTEGER,PRIMARY KEY(root_id,remote_path));
-            CREATE TABLE directory_sync_state(root_id TEXT,remote_path TEXT,scanned_at INTEGER,PRIMARY KEY(root_id,remote_path));
-            CREATE TABLE favorites(asset_id TEXT PRIMARY KEY);
-            CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT);
-            CREATE TABLE playback_progress(asset_id TEXT PRIMARY KEY,position_seconds INTEGER);").unwrap();
-        migrate_directory_order(&c).unwrap();
-        c
-    }
-    fn sync_entry(path: &str, directory: bool) -> DavEntry {
-        DavEntry { remote_path:path.into(),is_collection:directory,size_bytes:100,modified_at:Some("v1".into()),etag:None,thumbnail_url:None }
-    }
-    #[test]
-    fn directory_sort_is_global_and_pages_append_without_reordering() {
-        let mut c=sync_test_database();
-        let mut entries=Vec::new();
-        for directory in [true,false] {
-            for n in 1..=305 {
-                let path=if directory {format!("/media/folder-{n}")} else {format!("/media/image-{n}.jpg")};
-                let mut entry=sync_entry(&path,directory);
-                entry.modified_at=Some(chrono::DateTime::from_timestamp(1700000000+n*60,0).unwrap().to_rfc3339());
-                entry.size_bytes=n;
-                entries.push(entry);
-            }
-        }
-        entries.reverse();
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media",entries.clone()).unwrap();
-        for sort in [BrowseSort::Name,BrowseSort::Newest,BrowseSort::Size] {
-            let mut all=Vec::new();let mut cursor=None;
-            loop {
-                let page=browse_sorted_directory_page(&c,"root","/media",sort,cursor.as_deref()).unwrap().unwrap();
-                assert!(page.items.len()<=100);
-                all.extend(page.items);cursor=page.next_cursor;if cursor.is_none(){break;}
-            }
-            assert_eq!(all.len(),610);
-            assert_eq!(all.iter().map(|e|&e.path).collect::<HashSet<_>>().len(),610);
-            for (i,entry) in all.iter().enumerate() {
-                let directory=i<305;let index=i%305;
-                let n=if matches!(sort,BrowseSort::Newest) || (!directory && matches!(sort,BrowseSort::Size)) {305-index} else {index+1};
-                assert_eq!(entry.name,if directory{format!("folder-{n}")}else{format!("image-{n}.jpg")});
-                assert!(entry.modified_at.is_some());
-            }
-        }
-        let cursor=browse_sorted_directory_page(&c,"root","/media",BrowseSort::Name,None).unwrap().unwrap().next_cursor.unwrap();
-        assert!(browse_sorted_directory_page(&c,"root","/media",BrowseSort::Newest,Some(&cursor)).is_err());
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media",entries).unwrap();
-        assert!(browse_sorted_directory_page(&c,"root","/media",BrowseSort::Name,Some(&cursor)).is_err());
-        for sort in [BrowseSort::Name,BrowseSort::Newest,BrowseSort::Size] {
-            let sql=format!("EXPLAIN QUERY PLAN SELECT id FROM assets WHERE root_id=?1 AND parent_path=?2 AND missing=0 ORDER BY {} LIMIT 101 OFFSET 100",sort.order(false));
-            let plans=c.prepare(&sql).unwrap().query_map(params!["root","/media"],|r|r.get::<_,String>(3)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
-            assert!(!plans.iter().any(|p|p.contains("TEMP B-TREE")),"{plans:?}");
-        }
-    }
-
-    #[test]
-    fn unknown_dates_sort_last_and_cover_lookup_uses_saved_candidate() {
-        let mut c=sync_test_database();
-        let mut old=sync_entry("/media/old",true);old.modified_at=Some("Wed, 01 Jan 2020 00:00:00 GMT".into());
-        let mut new=sync_entry("/media/new",true);new.modified_at=Some("2026-10-22T10:00:00+08:00".into());
-        let mut unknown=sync_entry("/media/unknown",true);unknown.modified_at=None;
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media",vec![unknown,old,new]).unwrap();
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media/new",vec![sync_entry("/media/new/cover.avi",false),sync_entry("/media/new/image-2.jpg",false)]).unwrap();
-        let page=browse_sorted_directory_page(&c,"root","/media",BrowseSort::Newest,None).unwrap().unwrap();
-        assert_eq!(page.items.iter().map(|e|e.name.as_str()).collect::<Vec<_>>(),vec!["new","old","unknown"]);
-        let cover=page.items[0].cover_asset_id.as_ref().unwrap();
-        assert_eq!(c.query_row("SELECT file_name FROM assets WHERE id=?1",params![cover],|r|r.get::<_,String>(0)).unwrap(),"image-2.jpg");
-        // Running migration again must preserve complete snapshots and propagate subfolder covers.
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media/old",vec![sync_entry("/media/old/sub",true)]).unwrap();
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media/old/sub",vec![sync_entry("/media/old/sub/deep.jpg",false)]).unwrap();
-        c.execute("DELETE FROM settings WHERE key = 'directory_cover_tree_v2'", []).unwrap();
-        migrate_directory_order(&c).unwrap();
-        let page_after=browse_sorted_directory_page(&c,"root","/media",BrowseSort::Name,None).unwrap().unwrap();
-        let old_entry=page_after.items.iter().find(|e|e.name=="old").unwrap();
-        assert!(old_entry.cover_asset_id.is_some());
-    }
-    #[test]
-    fn sync_commits_all_pages_and_preserves_removed_history() {
-        let mut c=sync_test_database();
-        let entries:Vec<_>=(0..235).map(|i|sync_entry(&format!("/media/{i:03}.jpg"),false)).collect();
-        let result=sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media",entries.clone()).unwrap();
-        assert_eq!(result.total,235); assert_eq!(result.added,235);
-        let first=browse_local_directory_page(&c,"root","/media",1).unwrap().unwrap();
-        assert_eq!(first.items.len(),100); assert!(first.next_cursor.as_ref().unwrap().starts_with("v2:name:"));
-        assert_eq!(browse_local_directory_page(&c,"root","/media",3).unwrap().unwrap().items.len(),35);
-        let id=first.items[0].asset_id.clone().unwrap();
-        c.execute("INSERT INTO favorites VALUES(?1)",params![id]).unwrap();
-        c.execute("INSERT INTO playback_progress VALUES(?1,42)",params![id]).unwrap();
-        let mut changed=entries[1..].to_vec(); changed[0].modified_at=Some("v2".into());
-        let result=sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media",changed).unwrap();
-        assert_eq!(result.removed,1); assert_eq!(result.updated,1);
-        assert_eq!(c.query_row("SELECT missing FROM assets WHERE id=?1",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
-        assert_eq!(c.query_row("SELECT position_seconds FROM playback_progress WHERE asset_id=?1",params![id],|r|r.get::<_,i64>(0)).unwrap(),42);
-        assert_eq!(c.query_row("SELECT count(*) FROM favorites",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-        let restored=sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media",entries).unwrap();assert_eq!(restored.added,1);
-    }
-    #[test]
-    fn sync_removes_only_deleted_subtrees_and_rolls_back_on_failure() {
-        let mut c=sync_test_database();
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media",vec![sync_entry("/media/a_%",true),sync_entry("/media/abc",true)]).unwrap();
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media/a_%",vec![sync_entry("/media/a_%/a.jpg",false)]).unwrap();
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media/abc",vec![sync_entry("/media/abc/b.jpg",false)]).unwrap();
-        sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media",vec![sync_entry("/media/abc",true)]).unwrap();
-        assert!(browse_local_directory_page(&c,"root","/media/a_%",1).unwrap().is_none());
-        assert_eq!(c.query_row("SELECT count(*) FROM assets WHERE missing=0",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-        c.execute_batch("CREATE TRIGGER reject_insert BEFORE INSERT ON assets WHEN NEW.file_name='fail.jpg' BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
-        assert!(sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media/abc",vec![sync_entry("/media/abc/new.jpg",false),sync_entry("/media/abc/fail.jpg",false)]).is_err());
-        assert_eq!(c.query_row("SELECT count(*) FROM assets WHERE missing=0",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-        assert_eq!(browse_local_directory_page(&c,"root","/media/abc",1).unwrap().unwrap().items[0].name,"b.jpg");
-        let empty=sync_directory_entries(&mut c,"root",LibraryRootKind::Media,"/media/abc",vec![]).unwrap();assert_eq!(empty.total,0);
-        assert!(browse_local_directory_page(&c,"root","/media/abc",1).unwrap().unwrap().items.is_empty());
-    }
     #[test]
     fn malformed_or_denied_webdav_listing_is_not_an_empty_directory() {
         let endpoint=Url::parse("http://localhost/dav/").unwrap();
@@ -10502,109 +9833,6 @@ mod tests {
         assert!(parse_webdav_multistatus("<D:multistatus xmlns:D='DAV:'><D:response><D:href>/dav/a.jpg</D:href><D:status>HTTP/1.1 403 Forbidden</D:status></D:response></D:multistatus>",&endpoint,"/").is_err());
     }
 
-    fn browse_test_session(address: std::net::SocketAddr) -> Session {
-        Session {
-            provider: ProviderKind::Alist,
-            endpoint: Url::parse(&format!("http://{address}/")).unwrap(),
-            api_token: "test-token".into(),
-            client: Client::new(),
-        }
-    }
-
-    #[test]
-    fn browse_api_fetches_one_page_and_refreshes_only_on_request() {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let requests = Arc::new(StdMutex::new(Vec::<serde_json::Value>::new()));
-            let captured = requests.clone();
-            let router = axum::Router::new().fallback(axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-                captured.lock().unwrap().push(body.clone());
-                async move {
-                    let page = body["page"].as_i64().unwrap();
-                    let per_page = body["per_page"].as_i64().unwrap();
-                    let content = if page <= 2 { (0..per_page).map(|i| serde_json::json!({"name": format!("video-{}.mp4", (page - 1) * per_page + i), "size": 100, "is_dir": false})).collect::<Vec<_>>() } else { Vec::new() };
-                    axum::Json(serde_json::json!({"code":200,"data":{"content":content,"total":0}}))
-                }
-            }));
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let session = browse_test_session(listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                axum::serve(listener, router).await.unwrap();
-            });
-            let state = MediaLibraryState::new();
-            let (first, cursor) =
-                browse_directory_page(&state, &session, "root", "/media", None, false)
-                    .await
-                    .unwrap();
-            assert_eq!(first.len(), BROWSE_PAGE_SIZE);
-            assert_eq!(requests.lock().unwrap().len(), 1);
-            let (second, cursor) =
-                browse_directory_page(&state, &session, "root", "/media", cursor, false)
-                    .await
-                    .unwrap();
-            assert_eq!(second.len(), BROWSE_PAGE_SIZE);
-            assert!(!first
-                .iter()
-                .any(|a| second.iter().any(|b| a.remote_path == b.remote_path)));
-            let (last, cursor) =
-                browse_directory_page(&state, &session, "root", "/media", cursor, false)
-                    .await
-                    .unwrap();
-            assert!(last.is_empty() && cursor.is_none());
-            browse_directory_page(&state, &session, "root", "/media", None, true)
-                .await
-                .unwrap();
-            let observed = requests.lock().unwrap();
-            assert_eq!(observed.len(), 4);
-            for request in observed.iter().take(3) {
-                assert_eq!(request["refresh"], false);
-                assert_eq!(request["per_page"], BROWSE_PAGE_SIZE);
-            }
-            assert_eq!(observed[3]["refresh"], true);
-            server.abort();
-        });
-    }
-
-    #[test]
-    fn unchanged_browser_page_never_requires_a_database_write() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch("CREATE TABLE assets (id TEXT PRIMARY KEY, root_id TEXT, remote_path TEXT, file_name TEXT, parent_path TEXT, media_type TEXT, size_bytes INTEGER, etag TEXT, thumbnail_key TEXT, missing INTEGER, scanned_at INTEGER, content_hash TEXT, UNIQUE(root_id, remote_path));").unwrap();
-        let entry = RemoteBrowserEntry {
-            path: "/media/a.mp4".into(),
-            name: "a.mp4".into(),
-            is_directory: false,
-            size_bytes: 100,
-            modified_at: None,
-            etag: Some("v1".into()),
-            asset_id: Some("asset-a".into()),
-            media_type: Some("video".into()),
-            thumbnail_source: None,
-            thumbnail_url: None,
-            cover_asset_id: None,
-            duration_seconds: None,
-            progress_seconds: None,
-        };
-        register_browsed_assets(&mut connection, "root", "/media", vec![entry.clone()], 1).unwrap();
-        connection.execute_batch("PRAGMA query_only = ON;").unwrap();
-        register_browsed_assets(&mut connection, "root", "/media", vec![entry.clone()], 2).unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT scanned_at FROM assets", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        connection
-            .execute_batch("PRAGMA query_only = OFF; UPDATE assets SET content_hash = 'old';")
-            .unwrap();
-        let mut changed = entry;
-        changed.size_bytes = 200;
-        register_browsed_assets(&mut connection, "root", "/media", vec![changed], 3).unwrap();
-        let actual = connection
-            .query_row("SELECT size_bytes, content_hash FROM assets", [], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-            })
-            .unwrap();
-        assert_eq!(actual, (200, None));
-    }
     #[test]
     fn restores_a_duplicated_comic_archive_path() {
         assert_eq!(

@@ -238,7 +238,7 @@ pub fn list_playback_history(app: AppHandle, limit: Option<i64>) -> Result<Vec<P
     let mut statement = connection.prepare(
         "SELECT a.id,a.root_id,r.domain,a.remote_path,a.file_name,a.parent_path,
                 a.media_type,a.size_bytes,a.duration_seconds,a.content_hash,a.thumbnail_asset_id,
-                CAST(COALESCE(s.progress_seconds,0) AS INTEGER),s.last_played_at
+                COALESCE(s.progress_seconds,0),s.last_played_at
          FROM asset_state s JOIN assets a ON a.id=s.asset_id
          JOIN domain_roots r ON r.domain=a.domain AND r.root_id=a.root_id
          WHERE a.missing=0 AND a.media_type='video' AND s.last_played_at IS NOT NULL
@@ -247,7 +247,7 @@ pub fn list_playback_history(app: AppHandle, limit: Option<i64>) -> Result<Vec<P
     let rows = statement.query_map([limit.unwrap_or(100).clamp(1,500)], |row| {
         Ok(PlaybackHistoryItem {
             asset: asset_from_row(row)?,
-            position_seconds: row.get::<_, i64>(11)?.max(0),
+            position_seconds: row.get::<_, f64>(11)?.max(0.0),
             updated_at: row.get(12)?,
         })
     }).map_err(database_error)?;

@@ -65,6 +65,7 @@ struct ShortVideosView: View {
     @State private var preloadedID: String?
     @State private var preloadedItem: AVPlayerItem?
     @State private var activateGeneration = 0
+    @State private var retriedDirectID: String?
     @State private var lastSavedID: String?
     @State private var lastSavedAt: Double = 0
     @State private var restoringProgressID: String?
@@ -495,12 +496,34 @@ struct ShortVideosView: View {
         }
 
         guard generation == activateGeneration else { return }
+        observeDirectExpiry(asset: asset, generation: generation)
         player.isMuted = muted
         player.play()
         isPlaying = true
         coversPrefetch()
         Task { await restoreProgressAndMarkSeen(assetId: id, generation: generation) }
         Task { await preloadNext(after: id) }
+    }
+
+    @MainActor
+    private func observeDirectExpiry(asset: LibraryAsset, generation: Int) {
+        let id = asset.id
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard generation == activateGeneration, currentAsset?.id == id else { return }
+            guard player.currentItem?.status == .failed, retriedDirectID != id else { return }
+            retriedDirectID = id
+            guard let source = await model.playbackSource(assetId: id, remotePath: asset.remotePath),
+                  source.label?.contains("直连") == true else { return }
+            guard generation == activateGeneration, currentAsset?.id == id else { return }
+            let resume = progress
+            player.replaceCurrentItem(with: makeItem(source.url))
+            player.isMuted = muted
+            player.play()
+            if resume > 1 {
+                player.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
+            }
+        }
     }
 
     private func preloadNext(after id: String) async {

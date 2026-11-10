@@ -43,7 +43,7 @@ struct FavoritesView: View {
                 url: item.url,
                 title: item.title,
                 assetId: item.assetId,
-                startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel
+                startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel, remotePath: item.remotePath
             )
             .environmentObject(model)
         }

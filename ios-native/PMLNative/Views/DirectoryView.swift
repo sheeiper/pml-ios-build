@@ -189,7 +189,8 @@ struct DirectoryView: View {
                 playlist: videoPlaylist,
                 playlistIndex: videoPlaylistIndex,
                 fallbackURL: item.fallbackURL,
-                sourceLabel: item.sourceLabel
+                sourceLabel: item.sourceLabel,
+                remotePath: item.remotePath
             )
             .environmentObject(model)
         }

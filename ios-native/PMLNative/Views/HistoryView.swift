@@ -50,7 +50,7 @@ struct HistoryView: View {
                     url: item.url,
                     title: item.title,
                     assetId: item.assetId,
-                    startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel
+                    startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel, remotePath: item.remotePath
                 )
                 .environmentObject(model)
             } else {
@@ -79,7 +79,7 @@ struct HistoryView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.asset.fileName).lineLimit(1)
                 HStack(spacing: 8) {
-                    Text(pmlFormatTime(item.positionSeconds))
+                    Text(pmlFormatTime(Int64(item.positionSeconds)))
                     if let author = item.asset.authorName, !author.isEmpty {
                         Text(author)
                     }
@@ -110,7 +110,7 @@ struct HistoryView: View {
         preview = PreviewItem(
             url: source.url,
             isVideo: item.asset.mediaType == "video",
-            startAt: Double(item.positionSeconds),
+            startAt: item.positionSeconds,
             assetId: item.asset.id,
             title: item.asset.fileName,
             fallbackURL: source.fallbackURL,

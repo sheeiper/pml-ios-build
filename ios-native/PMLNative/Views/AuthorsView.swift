@@ -546,7 +546,8 @@ struct AuthorProfileView: View {
                     assetId: item.assetId,
                     startAt: item.startAt,
                     fallbackURL: item.fallbackURL,
-                    sourceLabel: item.sourceLabel
+                    sourceLabel: item.sourceLabel,
+                    remotePath: item.remotePath
                 )
                 .environmentObject(model)
             } else {

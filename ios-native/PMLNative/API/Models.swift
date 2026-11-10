@@ -46,7 +46,7 @@ struct RemoteBrowserEntry: Decodable, Identifiable, Hashable {
     let thumbnailSource: String?
     let coverAssetId: String?
     var durationSeconds: Int64? = nil
-    var progressSeconds: Int64? = nil
+    var progressSeconds: Double? = nil
 
     var id: String { path }
 

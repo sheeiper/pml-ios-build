@@ -28,7 +28,9 @@ struct GestureVideoPlayerSheet: View {
     @State private var accelLabel: String?
     @State private var currentFallbackURL: URL?
     @State private var currentSourceLabel: String?
+    @State private var currentRemotePath: String?
     @State private var usedFallback = false
+    @State private var retriedDirect = false
 
     @State private var isPlaying = false
     @State private var currentTime: Double = 0
@@ -94,7 +96,8 @@ struct GestureVideoPlayerSheet: View {
         playlist: [VideoPlaylistItem] = [],
         playlistIndex: Int? = nil,
         fallbackURL: URL? = nil,
-        sourceLabel: String? = nil
+        sourceLabel: String? = nil,
+        remotePath: String? = nil
     ) {
         self.startAt = startAt
         _playlist = State(initialValue: playlist)
@@ -104,6 +107,7 @@ struct GestureVideoPlayerSheet: View {
         _currentIndex = State(initialValue: playlistIndex)
         _currentFallbackURL = State(initialValue: fallbackURL)
         _currentSourceLabel = State(initialValue: sourceLabel)
+        _currentRemotePath = State(initialValue: remotePath)
         _accelLabel = State(initialValue: sourceLabel)
     }
 
@@ -612,6 +616,29 @@ struct GestureVideoPlayerSheet: View {
         }
     }
 
+    /// 直连 CDN 过期时重新向 AList `/d` 要签名，并从当前时间续播。只试一次。
+    @MainActor
+    private func retryExpiredDirect(at target: Double, resume: Bool) async -> Bool {
+        guard !retriedDirect else { return false }
+        let label = currentSourceLabel ?? ""
+        guard label.contains("直连") else { return false }
+        let path = currentRemotePath ?? playlist.first { $0.assetId == currentAssetId }?.remotePath
+        guard let assetId = currentAssetId, let path, !path.isEmpty else { return false }
+        retriedDirect = true
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: path),
+              source.label?.contains("直连") == true else { return false }
+        currentURL = source.url
+        currentFallbackURL = source.fallbackURL
+        currentSourceLabel = source.label
+        currentRemotePath = path
+        accelLabel = "重新直连"
+        poster = nil
+        player.replaceCurrentItem(with: makePlayerItem(source.url))
+        guard await waitUntilReady() else { return false }
+        requestSeek(to: target, resume: resume, debounce: false)
+        return true
+    }
+
     @MainActor
     private func recoverPlayback(at target: Double) async {
         guard !isRecovering else { return }
@@ -620,9 +647,13 @@ struct GestureVideoPlayerSheet: View {
         seekRequestID += 1
         seekTask?.cancel()
         var url = currentURL
-        if player.currentItem?.status == .failed, let fallback = currentFallbackURL {
-            url = fallback
-            accelLabel = "服务器中转"
+        if player.currentItem?.status == .failed {
+            if await retryExpiredDirect(at: target, resume: true) { return }
+            if let fallback = currentFallbackURL {
+                url = fallback
+                accelLabel = "服务器中转"
+                usedFallback = true
+            }
         }
         player.replaceCurrentItem(with: makePlayerItem(url))
         if await waitUntilReady(timeout: 8) {
@@ -791,8 +822,10 @@ struct GestureVideoPlayerSheet: View {
         currentURL = source.url
         currentFallbackURL = source.fallbackURL
         currentSourceLabel = source.label
+        currentRemotePath = item.remotePath ?? currentRemotePath
         accelLabel = source.label
         usedFallback = false
+        retriedDirect = false
         showPlaylist = false
         loadCurrent(trackResume: false)
     }
@@ -1035,10 +1068,11 @@ struct GestureVideoPlayerSheet: View {
                 duration = seconds.isFinite ? seconds : 0
             }
             if player.currentItem?.status == .failed, !usedFallback {
-                usedFallback = true
                 let target = currentTime
                 let wasPlaying = isPlaying
                 Task { @MainActor in
+                    if await retryExpiredDirect(at: target, resume: wasPlaying) { return }
+                    usedFallback = true
                     var fallback = currentFallbackURL
                     if fallback == nil, let assetId = currentAssetId {
                         fallback = await model.fallbackMediaURL(assetId: assetId)
