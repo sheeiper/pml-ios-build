@@ -521,7 +521,7 @@ struct ShortVideosView: View {
             player.isMuted = muted
             player.play()
             if resume > 1 {
-                player.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
+                await player.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
             }
         }
     }
