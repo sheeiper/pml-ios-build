@@ -1,8 +1,8 @@
 import Foundation
 import Network
 
-/// 最小 App 内视频代理：AVPlayer 只访问 127.0.0.1，
-/// 代理负责跟随 AList /d 的 302、转发 Range，并在失败时回退服务器中转。
+/// 最小 App 内视频代理：AVPlayer 只访问 127.0.0.1。
+/// 代理跟随 AList `/d` 的 302 并转发 Range。链接过期只重试原始 `/d`，不回退服务器。
 final class LocalMediaProxy: NSObject {
     static let shared = LocalMediaProxy()
 
@@ -22,11 +22,11 @@ final class LocalMediaProxy: NSObject {
 
     private override init() { super.init() }
 
-    func register(directURL: URL, fallbackURL: URL?, fallbackHeaders: [String: String]) async -> URL? {
+    func register(directURL: URL) async -> URL? {
         guard let port = await ensureStarted() else { return nil }
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
         lock.lock()
-        streams[token] = Stream(direct: directURL, fallback: fallbackURL, fallbackHeaders: fallbackHeaders)
+        streams[token] = Stream(direct: directURL, fallback: nil, fallbackHeaders: [:])
         lock.unlock()
         let ext = directURL.pathExtension.isEmpty ? "mp4" : directURL.pathExtension
         return URL(string: "http://127.0.0.1:\(port)/p/\(token).\(ext)")
@@ -216,22 +216,12 @@ private final class ProxyTransfer: NSObject, URLSessionDataDelegate {
             fail()
             return
         }
-        if !usedFallback, [401, 403, 404, 410, 500, 502, 503, 504].contains(http.statusCode) {
-            // 115 CDN 链接过期通常是跟随 /d 之后的 403/410。先向原始 /d 再要一次新签名，失败才回退中转。
-            if !retriedDirect, [403, 410].contains(http.statusCode) {
-                retriedDirect = true
-                completionHandler(.cancel)
-                session.invalidateAndCancel()
-                request(url: stream.direct, headers: [:])
-                return
-            }
-            if let fallback = stream.fallback {
-                usedFallback = true
-                completionHandler(.cancel)
-                session.invalidateAndCancel()
-                request(url: fallback, headers: stream.fallbackHeaders)
-                return
-            }
+        if !retriedDirect, [403, 410].contains(http.statusCode) {
+            retriedDirect = true
+            completionHandler(.cancel)
+            session.invalidateAndCancel()
+            request(url: stream.direct, headers: [:])
+            return
         }
         guard http.statusCode == 200 || http.statusCode == 206 else {
             completionHandler(.cancel)

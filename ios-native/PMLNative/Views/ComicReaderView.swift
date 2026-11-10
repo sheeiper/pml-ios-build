@@ -71,9 +71,11 @@ struct ComicReaderView: View {
             .task { await load() }
             .task(id: currentPage) {
                 guard !pages.isEmpty else { return }
-                let next = currentPage + 1
-                if pages.contains(where: { $0.index == next }) {
-                    ComicDirectStore.shared.prefetch(assetId: target.id, index: next, model: model)
+                for offset in 0...3 {
+                    let next = currentPage + offset
+                    if pages.contains(where: { $0.index == next }) {
+                        ComicDirectStore.shared.prefetch(assetId: target.id, index: next, model: model)
+                    }
                 }
             }
             .onChange(of: mode) { _, _ in
@@ -174,10 +176,15 @@ struct ComicReaderView: View {
         loading = true
         errorText = ""
         do {
-            let info = try await client.inspectComicArchive(assetId: target.id)
-            pages = info.pages
+            let manifest = try await client.comicArchiveManifest(assetId: target.id)
+            ComicDirectStore.shared.remember(assetId: target.id, manifest)
+            pages = manifest.pages.map { ComicArchivePageInfo(index: $0.index, name: $0.name) }
             if pages.isEmpty {
                 errorText = "压缩包里没有可显示的图片页"
+            } else {
+                for page in pages.prefix(4) {
+                    ComicDirectStore.shared.prefetch(assetId: target.id, index: page.index, model: model)
+                }
             }
         } catch {
             errorText = error.localizedDescription

@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// ZIP 漫画单页：优先按页直连 + 本地解压；失败时自动回退服务器漫画页路由。
+/// ZIP 漫画单页：只按 AList `/d` Range 直连并本地解压，不回退服务器。
 struct ComicDirectPageView: View {
     let assetId: String
     let page: ComicArchivePageInfo
@@ -19,12 +19,8 @@ struct ComicDirectPageView: View {
                     .scaledToFit()
                     .frame(maxWidth: .infinity)
             } else if failed {
-                CachedImageView(
-                    url: fallbackURL,
-                    contentMode: .fit,
-                    minHeight: 360,
-                    maxPixel: 1600
-                )
+                ContentUnavailableView("这一页无法直连", systemImage: "wifi.exclamationmark", description: Text("不会改走服务器。可返回后重试。"))
+                    .frame(maxWidth: .infinity, minHeight: 360)
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity, minHeight: 360)
@@ -33,10 +29,6 @@ struct ComicDirectPageView: View {
         .task(id: page.index) {
             await load()
         }
-    }
-
-    private var fallbackURL: URL? {
-        model.apiClient?.comicPageURL(assetId: assetId, pageIndex: page.index)
     }
 
     private func load() async {

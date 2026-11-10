@@ -36,22 +36,6 @@ struct RuntimeModeView: View {
                 TextField("账号", text: $draft.serverUser)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-            Section {
-                Picker("播放方式", selection: Binding(
-                    get: { draft.playbackMode ?? .auto },
-                    set: { draft.playbackMode = $0 }
-                )) {
-                    ForEach(PlaybackRouteMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-            } header: {
-                Text("播放方式")
-            } footer: {
-                Text("自动：MOV 走服务器中转，其他格式优先直连；直连：强制 AList → 115 CDN；中转：全部走服务器 /media。")
-            }
-
                 SecureField("密码", text: $draft.serverPassword)
                 Button(busy ? "检测中…" : "测试服务器连接") {
                     Task { await testServer() }
@@ -60,7 +44,7 @@ struct RuntimeModeView: View {
             } header: {
                 Text("服务器")
             } footer: {
-                Text("服务器负责 CD2 索引与数据库；服务器模式下 App 不需要配置 CD2。")
+                Text("服务器只保存索引、进度和后台扫描。视频、图片、漫画字节不经过服务器。")
             }
 
             Section {
@@ -81,7 +65,7 @@ struct RuntimeModeView: View {
             } header: {
                 Text("AList 直连")
             } footer: {
-                Text("播放时把 CD2 路径按前缀映射到 AList，再走 /d 直链；AList 不可用时回退服务器中转。")
+                Text("视频、图片和漫画只走 AList /d 直连，不经过服务器中转。前缀对不上时会提示，不会改走 /media。")
             }
 
             Section {

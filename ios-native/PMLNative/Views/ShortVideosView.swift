@@ -84,14 +84,14 @@ struct ShortVideosView: View {
     @ObservedObject private var covers = ThumbnailService.shared
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack {
+        ZStack {
                 Color.black.ignoresSafeArea()
 
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
                         ForEach(items) { item in
-                            slide(item: item, size: geo.size)
+                            slide(item: item)
+                                .containerRelativeFrame([.horizontal, .vertical])
                         }
                         if loadingMore {
                             ProgressView().tint(.white).padding(24)
@@ -116,7 +116,10 @@ struct ShortVideosView: View {
                 await loadFeed(reset: true)
             }
             .onChange(of: currentID) { _, newValue in
-                Task { await activate(newValue) }
+                Task {
+                    await activate(newValue)
+                    await loadMoreIfNeeded(current: newValue)
+                }
             }
             .onChange(of: scope) { _, _ in Task { await resetAndReload() } }
             .onChange(of: durationFilter) { _, _ in Task { await resetAndReload() } }
@@ -154,12 +157,11 @@ struct ShortVideosView: View {
                     ContentUnavailableView("还没有短视频", systemImage: "play.rectangle", description: Text("扫描资料库后，mp4 / mov / m4v / webm 会进入短视频。"))
                 }
             }
-        }
         .background(Color.black)
         .preferredColorScheme(.dark)
     }
 
-    private func slide(item: LibraryAsset, size: CGSize) -> some View {
+    private func slide(item: LibraryAsset) -> some View {
         ShortVideoSlide(
             item: item,
             player: player,
@@ -180,20 +182,8 @@ struct ShortVideosView: View {
                     player.rate = 1
                     hudIcon = nil
                 }
-            },
-            onSeek: { delta in
-                guard item.id == currentID, duration > 0 else { return }
-                let target = min(max(0, progress + delta), duration)
-                player.seek(
-                    to: CMTime(seconds: target, preferredTimescale: 600),
-                    toleranceBefore: .init(seconds: 0.4, preferredTimescale: 600),
-                    toleranceAfter: .init(seconds: 0.4, preferredTimescale: 600)
-                )
-                progress = target
-                showHUD(delta > 0 ? "goforward.5" : "gobackward.5")
             }
         )
-        .frame(width: size.width, height: size.height)
         .id(item.id)
         .clipped()
     }
@@ -430,9 +420,15 @@ struct ShortVideosView: View {
     }
 
     private func loadFeed(reset: Bool) async {
-        guard let client = model.apiClient, !loading else { return }
-        loading = true
-        if reset { errorText = "" }
+        guard let client = model.apiClient else { return }
+        if reset {
+            guard !loading else { return }
+            loading = true
+            errorText = ""
+        } else {
+            guard !loadingMore, nextCursor != nil else { return }
+            loadingMore = true
+        }
         do {
             if reset { try await hydrateState(client: client) }
             var collected = reset ? [] : items
@@ -465,6 +461,13 @@ struct ShortVideosView: View {
             }
         }
         loading = false
+    }
+
+    @MainActor
+    private func loadMoreIfNeeded(current id: String?) async {
+        guard let id, let index = items.firstIndex(where: { $0.id == id }) else { return }
+        guard nextCursor != nil, index >= items.count - 2, !loading, !loadingMore else { return }
+        await loadFeed(reset: false)
     }
 
     @MainActor
@@ -781,28 +784,22 @@ private struct ShortVideoSlide: View {
     let onSingleTap: () -> Void
     let onDoubleTap: () -> Void
     let onLongPress: (Bool) -> Void
-    let onSeek: (Double) -> Void
-
-    @State private var dragStart: Double?
 
     var body: some View {
         ZStack {
             Color.black
             if isCurrent {
                 PlayerLayerContainer(player: player, gravity: .resizeAspectFill)
-                    .ignoresSafeArea()
                 if isBuffering || !isPlaying, let poster {
                     Image(uiImage: poster)
                         .resizable()
                         .scaledToFill()
-                        .ignoresSafeArea()
                         .allowsHitTesting(false)
                 }
             } else if let poster {
                 Image(uiImage: poster)
                     .resizable()
                     .scaledToFill()
-                    .ignoresSafeArea()
                     .allowsHitTesting(false)
             }
         }
@@ -814,17 +811,5 @@ private struct ShortVideoSlide: View {
         .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
             onLongPress(pressing)
         }, perform: {})
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 12)
-                .onChanged { value in
-                    guard isCurrent, abs(value.translation.width) > abs(value.translation.height) * 1.4 else { return }
-                    if dragStart == nil { dragStart = 0 }
-                }
-                .onEnded { value in
-                    defer { dragStart = nil }
-                    guard isCurrent, abs(value.translation.width) > abs(value.translation.height) * 1.4 else { return }
-                    onSeek(Double(value.translation.width / 8))
-                }
-        )
     }
 }

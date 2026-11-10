@@ -59,7 +59,10 @@ struct ImageViewer: View {
                     }
                 }
             }
-            .task { await loadFavorites() }
+            .task {
+                await loadFavorites()
+                await prefetch(around: index)
+            }
             .onChange(of: currentID) { _, newValue in
                 guard let newValue, let idx = context.entries.firstIndex(where: { $0.id == newValue }) else { return }
                 if index != idx { index = idx }
@@ -76,7 +79,7 @@ struct ImageViewer: View {
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: 0) {
                         ForEach(context.entries) { entry in
-                            ZoomableImagePage(url: urls[entry.id])
+                            ZoomableImagePage(url: urls[entry.id], posterAssetId: entry.assetId)
                                 .frame(width: geo.size.width, height: geo.size.height)
                                 .id(entry.id)
                                 .task { await load(entry) }
@@ -132,10 +135,14 @@ struct ImageViewer: View {
 
     @MainActor
     private func load(_ entry: RemoteBrowserEntry) async {
-        guard urls[entry.id] == nil, let assetId = entry.assetId else { return }
-        if let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) {
-            urls[entry.id] = source.url
+        guard urls[entry.id] == nil else { return }
+        if let direct = model.alistDirectURL(remotePath: entry.path) {
+            urls[entry.id] = direct
+            return
         }
+        guard let assetId = entry.assetId,
+              let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else { return }
+        urls[entry.id] = source.url
     }
 
     @MainActor
@@ -171,6 +178,7 @@ struct ImageViewer: View {
 /// 单页图片：纯 SwiftUI 实现，捏合缩放 / 拖动平移 / 双击缩放，布局不依赖 UIKit frame。
 private struct ZoomableImagePage: View {
     let url: URL?
+    var posterAssetId: String? = nil
 
     @State private var image: UIImage?
 
@@ -179,6 +187,11 @@ private struct ZoomableImagePage: View {
             Color.black
             if let image {
                 ZoomScrollRepresentable(image: image)
+            } else if let posterAssetId, let poster = ThumbnailService.shared.images[posterAssetId] {
+                Image(uiImage: poster)
+                    .resizable()
+                    .scaledToFit()
+                ProgressView().tint(.white)
             } else {
                 ProgressView().tint(.white)
             }

@@ -21,6 +21,11 @@ final class ComicDirectStore {
         images.countLimit = 80
     }
 
+    func remember(assetId: String, _ manifest: ComicArchiveManifest) {
+        manifests[assetId] = manifest
+        unavailable.remove(assetId)
+    }
+
     func cachedImage(assetId: String, index: Int) -> UIImage? {
         images.object(forKey: key(assetId, index))
     }
@@ -87,7 +92,7 @@ final class ComicDirectStore {
         request.setValue("bytes=\(start)-\(start + UInt64(length) - 1)", forHTTPHeaderField: "Range")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ComicDirectError.badResponse }
-        guard http.statusCode == 206 else { throw ComicDirectError.badResponse }
+        guard http.statusCode == 206 || http.statusCode == 200 else { throw ComicDirectError.badResponse }
         guard data.count >= length else { throw ComicDirectError.shortData }
         return Data(data.prefix(length))
     }

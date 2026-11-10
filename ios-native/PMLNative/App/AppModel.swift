@@ -105,40 +105,19 @@ final class AppModel: ObservableObject {
 
     // MARK: - 播放地址解析
 
-    /// 服务器模式：优先 AList `/d` 直连；失败回退服务器 `/media`。
+    /// 服务器模式只走 AList `/d`。视频经本地代理转发 Range；图片直接用 `/d`。不回退服务器中转。
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         if settings.mode == .server {
-            let mode = settings.routeMode
-            let direct = remotePath.flatMap { alistDirectURL(remotePath: $0) }
-            let isMOV = remotePath?.lowercased().hasSuffix(".mov") == true
-
-            // 自动模式：MOV 默认走服务器中转，稳定且首帧可控；直连需手动选择。
-            if mode == .relay || (mode == .auto && isMOV) {
-                if let relay = await serverMediaURL(assetId: assetId) {
-                    return PlaybackSource(url: relay, fallbackURL: direct, label: "服务器中转")
+            guard let remotePath, let direct = alistDirectURL(remotePath: remotePath) else {
+                return nil
+            }
+            if Self.isVideoPath(remotePath) {
+                guard let proxied = await LocalMediaProxy.shared.register(directURL: direct) else {
+                    return nil
                 }
+                return PlaybackSource(url: proxied, fallbackURL: nil, label: "AList 直连")
             }
-
-            // 直连：AList /d 交给 App 内本地代理，由代理跟随 302 并转发 Range。
-            if let direct {
-                if mode == .direct {
-                    let fallback = await serverMediaURL(assetId: assetId)
-                    let headers = fallback.map { playbackHeaders(for: $0) } ?? [:]
-                    if let proxied = await LocalMediaProxy.shared.register(
-                        directURL: direct,
-                        fallbackURL: fallback,
-                        fallbackHeaders: headers
-                    ) {
-                        return PlaybackSource(url: proxied, fallbackURL: nil, label: "本地代理直连")
-                    }
-                }
-                return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
-            }
-
-            if let relay = await serverMediaURL(assetId: assetId) {
-                return PlaybackSource(url: relay, fallbackURL: nil, label: "服务器中转")
-            }
-            return nil
+            return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
         }
 
         guard let client = localClient, let assetId,
@@ -146,6 +125,11 @@ final class AppModel: ObservableObject {
             return nil
         }
         return PlaybackSource(url: url, fallbackURL: nil, label: nil)
+    }
+
+    private static func isVideoPath(_ path: String) -> Bool {
+        let ext = (path as NSString).pathExtension.lowercased()
+        return ["mp4", "mov", "m4v", "webm", "mkv", "avi", "ts", "m2ts"].contains(ext)
     }
     /// AVPlayer 访问服务器 /media 时补 Basic 认证；直连 AList/CDN 不加，避免泄露。
     func playbackHeaders(for url: URL) -> [String: String] {
@@ -161,14 +145,10 @@ final class AppModel: ObservableObject {
         let token = Data(raw.utf8).base64EncodedString()
         return ["Authorization": "Basic \(token)"]
     }
-    /// 播放失败时再取服务器中转地址（不阻塞首帧）。
+    /// 媒体字节不再走服务器。保留空实现，避免旧调用点改回中转。
     func fallbackMediaURL(assetId: String?) async -> URL? {
-        guard let assetId, let client = apiClient else { return nil }
-        return try? await client.mediaSourceURL(assetId: assetId)
-    }
-
-    private func serverMediaURL(assetId: String?) async -> URL? {
-        await fallbackMediaURL(assetId: assetId)
+        _ = assetId
+        return nil
     }
 
     /// 把 CD2 路径按前缀映射到 AList，并拼出 `/d` 直链。

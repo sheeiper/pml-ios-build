@@ -448,6 +448,11 @@ struct DirectoryView: View {
                 .font(.caption2)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            Text(metaLine(entry))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -730,17 +735,38 @@ struct DirectoryView: View {
     }
 
     private func subtitle(_ entry: RemoteBrowserEntry) -> String {
-        if entry.isDirectory { return "文件夹" }
-        let typeLabel: String
-        switch entry.mediaType {
-        case "video": typeLabel = "视频"
-        case "image": typeLabel = "图片"
-        case "comicPage": typeLabel = "漫画页"
-        case "comicArchive": typeLabel = "漫画压缩包"
-        case "pdf": typeLabel = "PDF"
-        default: typeLabel = "文件"
-        }
-        let size = entry.isDirectory ? "" : pmlFormatBytes(entry.sizeBytes)
-        return size.isEmpty ? typeLabel : "\(typeLabel) · \(size)"
+        metaLine(entry)
     }
+
+    private func metaLine(_ entry: RemoteBrowserEntry) -> String {
+        let time = formattedModified(entry.modifiedAt)
+        if entry.isDirectory {
+            return time ?? "文件夹"
+        }
+        let size = pmlFormatBytes(entry.sizeBytes)
+        if let time { return "\(size) · \(time)" }
+        return size
+    }
+
+    private func formattedModified(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        let rfc = DateFormatter()
+        rfc.locale = Locale(identifier: "en_US_POSIX")
+        rfc.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = iso.date(from: raw) ?? plain.date(from: raw) ?? rfc.date(from: raw) else {
+            return nil
+        }
+        return DirectoryView.modifiedDisplay.string(from: date)
+    }
+
+    private static let modifiedDisplay: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
 }
