@@ -280,15 +280,20 @@ struct DomainBrowserView: View {
     }
 
     private var sortedChildren: [DomainChild] {
-        let folders = children.filter(\.isDirectory).sorted {
-            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        let folders = children.filter(\.isDirectory).sorted { left, right in
+            if sortRaw == "newest" {
+                let l = DomainBrowserView.modifiedDate(left.modifiedAt)
+                let r = DomainBrowserView.modifiedDate(right.modifiedAt)
+                if l != r { return l > r }
+            }
+            return left.name.localizedStandardCompare(right.name) == .orderedAscending
         }
         let files = children.filter { !$0.isDirectory }.sorted { left, right in
             switch sortRaw {
             case "newest":
-                if left.modifiedAt != right.modifiedAt {
-                    return (left.modifiedAt ?? "") > (right.modifiedAt ?? "")
-                }
+                let l = DomainBrowserView.modifiedDate(left.modifiedAt)
+                let r = DomainBrowserView.modifiedDate(right.modifiedAt)
+                if l != r { return l > r }
             case "size":
                 if left.sizeBytes != right.sizeBytes {
                     return left.sizeBytes > right.sizeBytes
@@ -299,6 +304,19 @@ struct DomainBrowserView: View {
             return left.name.localizedStandardCompare(right.name) == .orderedAscending
         }
         return folders + files
+    }
+
+    private static func modifiedDate(_ raw: String?) -> Date {
+        guard let raw, !raw.isEmpty else { return .distantPast }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso.date(from: raw) { return date }
+        iso.formatOptions = [.withInternetDateTime]
+        if let date = iso.date(from: raw) { return date }
+        let rfc = DateFormatter()
+        rfc.locale = Locale(identifier: "en_US_POSIX")
+        rfc.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return rfc.date(from: raw) ?? .distantPast
     }
 
     private var listView: some View {
@@ -332,6 +350,7 @@ struct DomainBrowserView: View {
                 ContentUnavailableView("空目录", systemImage: "folder")
             }
         }
+        .id(sortRaw)
     }
 
     private var gridView: some View {
@@ -368,6 +387,7 @@ struct DomainBrowserView: View {
                 }
             }
             .padding(16)
+            .id(sortRaw)
 
             if children.isEmpty && !loading && errorText.isEmpty {
                 ContentUnavailableView("空目录", systemImage: "folder")

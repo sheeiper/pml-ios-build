@@ -73,8 +73,8 @@ struct DirectoryView: View {
             case .name:
                 break
             case .newest:
-                let l = left.modifiedAt ?? ""
-                let r = right.modifiedAt ?? ""
+                let l = modifiedDate(left.modifiedAt)
+                let r = modifiedDate(right.modifiedAt)
                 if l != r { return l > r }
             case .size:
                 if left.sizeBytes != right.sizeBytes { return left.sizeBytes > right.sizeBytes }
@@ -103,10 +103,12 @@ struct DirectoryView: View {
                 LazyVStack(spacing: 0) {
                     contentRows
                 }
+                .id(sort)
             } else {
                 LazyVGrid(columns: gridColumns, spacing: 6) {
                     contentCells
                 }
+                .id(sort)
                 .padding(.horizontal, 6)
                 .padding(.top, 6)
             }
@@ -749,24 +751,41 @@ struct DirectoryView: View {
     }
 
     private func formattedModified(_ raw: String?) -> String? {
-        guard let raw, !raw.isEmpty else { return nil }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        let rfc = DateFormatter()
-        rfc.locale = Locale(identifier: "en_US_POSIX")
-        rfc.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        guard let date = iso.date(from: raw) ?? plain.date(from: raw) ?? rfc.date(from: raw) else {
-            return nil
-        }
+        guard let date = modifiedDate(raw) else { return nil }
         return DirectoryView.modifiedDisplay.string(from: date)
+    }
+
+    private func modifiedDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        if let date = DirectoryView.isoFractional.date(from: raw) ?? DirectoryView.isoPlain.date(from: raw) {
+            return date
+        }
+        return DirectoryView.rfc2822.date(from: raw)
     }
 
     private static let modifiedDisplay: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
+    private static let isoFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let isoPlain: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static let rfc2822: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
         return formatter
     }()
 }
