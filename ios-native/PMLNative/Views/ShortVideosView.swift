@@ -80,6 +80,8 @@ struct ShortVideosView: View {
     @State private var isSeeking = false
     @State private var seekResume = false
     @State private var isLongPressing = false
+    @State private var hasFrame = false
+    @State private var scrubTarget: Double?
 
     @ObservedObject private var covers = ThumbnailService.shared
 
@@ -108,6 +110,7 @@ struct ShortVideosView: View {
             .overlay(alignment: .trailing) { rightRail.padding(.bottom, 104) }
             .overlay(alignment: .bottom) { bottomInfo }
             .overlay(alignment: .center) { centerOverlay }
+            .overlay { scrubOverlay }
             .toolbar(.hidden, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .tabBar)
             .task {
@@ -168,7 +171,13 @@ struct ShortVideosView: View {
             isCurrent: item.id == currentID,
             isPlaying: isPlaying && item.id == currentID,
             poster: covers.images[item.thumbnailAssetId ?? item.id],
+            showPoster: item.id != currentID || !hasFrame,
             isBuffering: isBuffering && item.id == currentID,
+            scrubDuration: duration,
+            scrubTime: progress,
+            onScrubBegin: { beginScrub() },
+            onScrubPreview: { scrubTarget = $0 },
+            onScrubEnd: { finishScrub($0) },
             onSingleTap: { togglePlayback() },
             onDoubleTap: { pauseOrResume() },
             onLongPress: { pressing in
@@ -370,6 +379,52 @@ struct ShortVideosView: View {
         .frame(height: 16)
     }
 
+    private var scrubOverlay: some View {
+        Group {
+            if let scrubTarget {
+                VStack(spacing: 6) {
+                    Text(pmlFormatTime(Int64(scrubTarget)))
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                    Text("/ \(pmlFormatTime(Int64(duration)))")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 22)
+                .padding(.vertical, 14)
+                .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private func beginScrub() {
+        guard !isSeeking else { return }
+        isSeeking = true
+        seekResume = isPlaying
+        player.pause()
+    }
+
+    private func finishScrub(_ target: Double?) {
+        defer {
+            isSeeking = false
+            scrubTarget = nil
+        }
+        guard let target else {
+            if seekResume { player.play(); isPlaying = true }
+            return
+        }
+        progress = target
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .init(seconds: 0.35, preferredTimescale: 600), toleranceAfter: .init(seconds: 0.35, preferredTimescale: 600))
+        if seekResume {
+            player.play()
+            isPlaying = true
+        }
+        saveProgress(force: true)
+    }
+
     private var centerOverlay: some View {
         ZStack {
             if isBuffering {
@@ -479,6 +534,8 @@ struct ShortVideosView: View {
         saveProgress(force: true)
         activateGeneration += 1
         let generation = activateGeneration
+        hasFrame = false
+        scrubTarget = nil
         currentAsset = asset
         restoringProgressID = id
         lastSavedID = nil
@@ -746,7 +803,8 @@ struct ShortVideosView: View {
             queue: .main
         ) { time in
             let seconds = time.seconds
-            if seconds.isFinite { progress = seconds }
+            if seconds.isFinite, !isSeeking { progress = seconds }
+            if seconds > 0.12 { hasFrame = true }
             if let total = player.currentItem?.duration.seconds, total.isFinite { duration = total }
             isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
             if Int(seconds) % 2 == 0 { saveProgress() }
@@ -780,7 +838,13 @@ private struct ShortVideoSlide: View {
     let isCurrent: Bool
     let isPlaying: Bool
     let poster: UIImage?
+    var showPoster = true
     let isBuffering: Bool
+    var scrubDuration: Double = 0
+    var scrubTime: Double = 0
+    var onScrubBegin: () -> Void = {}
+    var onScrubPreview: (Double) -> Void = { _ in }
+    var onScrubEnd: (Double?) -> Void = { _ in }
     let onSingleTap: () -> Void
     let onDoubleTap: () -> Void
     let onLongPress: (Bool) -> Void
@@ -790,17 +854,24 @@ private struct ShortVideoSlide: View {
             Color.black
             if isCurrent {
                 PlayerLayerContainer(player: player, gravity: .resizeAspectFill)
-                if isBuffering || !isPlaying, let poster {
-                    Image(uiImage: poster)
-                        .resizable()
-                        .scaledToFill()
-                        .allowsHitTesting(false)
-                }
-            } else if let poster {
+            }
+            if let poster, showPoster || !isCurrent {
                 Image(uiImage: poster)
                     .resizable()
                     .scaledToFill()
+                    .opacity(isCurrent && !showPoster ? 0 : 1)
+                    .animation(.easeOut(duration: 0.35), value: showPoster)
                     .allowsHitTesting(false)
+            }
+            if isCurrent {
+                HorizontalScrubPad(
+                    enabled: scrubDuration > 1,
+                    duration: scrubDuration,
+                    currentTime: scrubTime,
+                    onBegin: onScrubBegin,
+                    onPreview: onScrubPreview,
+                    onEnd: onScrubEnd
+                )
             }
         }
         .contentShape(Rectangle())
@@ -811,5 +882,71 @@ private struct ShortVideoSlide: View {
         .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
             onLongPress(pressing)
         }, perform: {})
+    }
+}
+
+/// 只在明确横滑时接管。竖滑让手势失败，列表分页仍能滚动。
+private struct HorizontalScrubPad: UIViewRepresentable {
+    var enabled: Bool
+    var duration: Double
+    var currentTime: Double
+    var onBegin: () -> Void
+    var onPreview: (Double) -> Void
+    var onEnd: (Double?) -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.pan(_:)))
+        pan.delegate = context.coordinator
+        pan.maximumNumberOfTouches = 1
+        view.addGestureRecognizer(pan)
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.enabled = enabled
+        context.coordinator.duration = duration
+        context.coordinator.currentTime = currentTime
+        context.coordinator.onBegin = onBegin
+        context.coordinator.onPreview = onPreview
+        context.coordinator.onEnd = onEnd
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var enabled = false
+        var duration = 0.0
+        var currentTime = 0.0
+        var onBegin: () -> Void = {}
+        var onPreview: (Double) -> Void = { _ in }
+        var onEnd: (Double?) -> Void = { _ in }
+        private var origin = 0.0
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard enabled, let pan = gestureRecognizer as? UIPanGestureRecognizer else { return false }
+            let velocity = pan.velocity(in: pan.view)
+            return abs(velocity.x) > abs(velocity.y) * 1.35 && abs(velocity.x) > 80
+        }
+
+        @objc func pan(_ pan: UIPanGestureRecognizer) {
+            guard let view = pan.view else { return }
+            let width = max(view.bounds.width, 1)
+            let span = max(duration, 0.1)
+            let target = min(max(0, origin + Double(pan.translation(in: view).x / width) * span), span)
+            switch pan.state {
+            case .began:
+                origin = currentTime
+                onBegin()
+                onPreview(min(max(0, origin), span))
+            case .changed:
+                onPreview(target)
+            case .ended:
+                onEnd(target)
+            default:
+                onEnd(nil)
+            }
+        }
     }
 }
