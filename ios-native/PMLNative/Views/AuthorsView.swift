@@ -730,7 +730,7 @@ struct AuthorProfileView: View {
     }
 
     @ViewBuilder
-    private func folderContent(root: String) -> some View {
+    private func folderContent(root: LibraryRoot) -> some View {
         if folderEntries.isEmpty {
             Text("无文件").foregroundStyle(.secondary)
         } else if layout == .list {
