@@ -73,8 +73,8 @@ struct DirectoryView: View {
             case .name:
                 break
             case .newest:
-                let l = modifiedDate(left.modifiedAt)
-                let r = modifiedDate(right.modifiedAt)
+                let l = modifiedDate(left.modifiedAt) ?? .distantPast
+                let r = modifiedDate(right.modifiedAt) ?? .distantPast
                 if l != r { return l > r }
             case .size:
                 if left.sizeBytes != right.sizeBytes { return left.sizeBytes > right.sizeBytes }
