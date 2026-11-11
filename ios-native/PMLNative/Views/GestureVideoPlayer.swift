@@ -38,7 +38,7 @@ struct GestureVideoPlayerSheet: View {
     @State private var rate: Float = 1
     @State private var muted = false
     @State private var volume: Float = 1
-    @State private var controlsVisible = true
+    @State private var controlsVisible = false
     @State private var hasFirstFrame = false
     @State private var controlsTask: Task<Void, Never>?
 
@@ -221,7 +221,15 @@ struct GestureVideoPlayerSheet: View {
                         }
                         Menu {
                             Button { showPlaylist = true } label: {
-                                Label("播放列表", systemImage: "list.bullet")
+                                Label("选集", systemImage: "list.bullet")
+                            }
+                            Menu("倍速") {
+                                ForEach([0.5, 1.0, 1.25, 1.5, 2.0], id: \.self) { value in
+                                    Button(String(format: "%.2gx", value)) { setRate(Float(value)) }
+                                }
+                            }
+                            Button { toggleOrientation() } label: {
+                                Label("横竖屏", systemImage: "rectangle.landscape.rotate")
                             }
                             Menu {
                                 Button("关闭字幕") {
@@ -265,7 +273,8 @@ struct GestureVideoPlayerSheet: View {
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, 18)
-                    .padding(.top, 12)
+                    .padding(.top, 8)
+                    .safeAreaPadding(.top, 4)
                 }
             }
             .overlay(alignment: .leading) {
@@ -403,35 +412,15 @@ struct GestureVideoPlayerSheet: View {
                         .disabled(!canGoNext)
                     }
                     Spacer()
-                    Menu {
-                        ForEach([0.5, 1.0, 1.25, 1.5, 2.0], id: \.self) { value in
-                            Button(String(format: "%.2gx", value)) { setRate(Float(value)) }
-                        }
-                    } label: {
-                        Text(String(format: "%.2gx", rate))
-                            .font(.caption.weight(.semibold))
-                    }
-                    Button {
-                        toggleAspect()
-                    } label: {
-                        Text(videoGravity == .resizeAspect ? "适配" : "填充")
-                            .font(.caption.weight(.semibold))
-                    }
-                    Button {
-                        showPlaylist = true
-                    } label: {
-                        Image(systemName: "list.bullet")
-                    }
-                    Button {
-                        toggleOrientation()
-                    } label: {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                    }
+                    Text(String(format: "%.2gx", rate))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.8))
                 }
                 .foregroundStyle(.white)
             }
             .padding(.horizontal, 20)
-            .padding(.bottom, 8)
+            .padding(.bottom, 12)
+            .safeAreaPadding(.bottom, 4)
             .padding(.top, 10)
             .background(
                 LinearGradient(colors: [.clear, .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)

@@ -59,14 +59,8 @@ struct ComicFolderReaderView: View {
             }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .tabBar)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    if !pages.isEmpty {
-                        Text(pageLabel)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                }
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 14) {
                         Menu {
@@ -76,10 +70,20 @@ struct ComicFolderReaderView: View {
                                 }
                             }
                         } label: {
-                            Image(systemName: mode.symbol)
+                            Image(systemName: "ellipsis")
                         }
                         Button("完成") { dismiss() }
                     }
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !pages.isEmpty, mode != .webtoon {
+                    Text(pageLabel)
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .padding(.bottom, 6)
                 }
             }
             .task { await load() }

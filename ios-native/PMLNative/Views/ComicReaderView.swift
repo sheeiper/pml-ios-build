@@ -39,14 +39,8 @@ struct ComicReaderView: View {
             }
             .navigationTitle(target.title)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .tabBar)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    if !pages.isEmpty {
-                        Text(pageLabel)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                }
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 14) {
                         Menu {
@@ -55,17 +49,23 @@ struct ComicReaderView: View {
                                     Label(item.rawValue, systemImage: item.symbol).tag(item)
                                 }
                             }
+                            Button("设为封面") { Task { await setAsCover() } }
+                                .disabled(pages.isEmpty)
                         } label: {
-                            Image(systemName: mode.symbol)
+                            Image(systemName: "ellipsis")
                         }
-                        Button {
-                            Task { await setAsCover() }
-                        } label: {
-                            Image(systemName: "photo.badge.checkmark")
-                        }
-                        .disabled(pages.isEmpty)
                         Button("完成") { dismiss() }
                     }
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !pages.isEmpty, mode != .webtoon {
+                    Text(pageLabel)
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .padding(.bottom, 6)
                 }
             }
             .task { await load() }

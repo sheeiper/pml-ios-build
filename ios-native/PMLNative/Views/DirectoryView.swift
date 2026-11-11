@@ -99,6 +99,7 @@ struct DirectoryView: View {
 
     var body: some View {
         ScrollView {
+            folderHeader
             if layout == .list {
                 LazyVStack(spacing: 0) {
                     contentRows
@@ -115,6 +116,7 @@ struct DirectoryView: View {
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .tabBar)
         .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索当前目录")
         .refreshable { await reload(force: true) }
         .task { await bootstrap() }
@@ -213,6 +215,85 @@ struct DirectoryView: View {
             RemoteSearchView(root: root, parentPath: path)
                 .environmentObject(model)
         }
+    }
+
+    private var folderHeader: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 14) {
+                folderCover
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(2)
+                    Text(folderMeta)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button {
+                        Task { await playFolder() }
+                    } label: {
+                        Label(resumeVideo == nil ? "播放" : "继续播放", systemImage: "play.fill")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(playableVideos.isEmpty)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+    }
+
+    private var folderCover: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.quaternary.opacity(0.35))
+            if let id = folderCoverId, let image = thumbs.images[id] {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: root.kind == "comics" ? "book.closed.fill" : "folder.fill")
+                    .font(.title2)
+                    .foregroundStyle(.tint)
+            }
+        }
+        .frame(width: 92, height: 128)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .task(id: folderCoverId) {
+            guard let id = folderCoverId else { return }
+            await thumbs.image(assetId: id, client: model.apiClient)
+        }
+    }
+
+    private var playableVideos: [RemoteBrowserEntry] {
+        visibleEntries.filter { $0.isVideo && $0.assetId != nil }
+    }
+
+    private var resumeVideo: RemoteBrowserEntry? {
+        playableVideos.filter { ($0.progressSeconds ?? 0) > 2 }
+            .max { ($0.progressSeconds ?? 0) < ($1.progressSeconds ?? 0) }
+    }
+
+    private var folderCoverId: String? {
+        visibleEntries.compactMap(\.coverAssetId).first
+            ?? visibleEntries.first(where: { !$0.isDirectory })?.assetId
+    }
+
+    private var folderMeta: String {
+        let folders = visibleEntries.filter(\.isDirectory).count
+        let files = visibleEntries.filter { !$0.isDirectory }.count
+        let time = visibleEntries.compactMap { modifiedDate($0.modifiedAt) }.max()
+        var parts = ["\(files) 个文件"]
+        if folders > 0 { parts.append("\(folders) 个文件夹") }
+        if let time { parts.append(DirectoryView.modifiedDisplay.string(from: time)) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func playFolder() async {
+        guard let entry = resumeVideo ?? playableVideos.first else { return }
+        await open(entry)
     }
 
     private var title: String {
