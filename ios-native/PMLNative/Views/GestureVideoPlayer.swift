@@ -94,7 +94,8 @@ struct GestureVideoPlayerSheet: View {
         playlist: [VideoPlaylistItem] = [],
         playlistIndex: Int? = nil,
         fallbackURL: URL? = nil,
-        sourceLabel: String? = nil
+        sourceLabel: String? = nil,
+        remotePath: String? = nil
     ) {
         self.startAt = startAt
         _playlist = State(initialValue: playlist)

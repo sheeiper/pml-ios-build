@@ -430,49 +430,7 @@ struct AuthorProfileView: View {
                     }
                     .padding(.vertical, 8)
                 } else if let folderRoot {
-                    if folderEntries.isEmpty {
-                        Text("无文件").foregroundStyle(.secondary)
-                    } else if layout == .list {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(folderEntries) { entry in
-                                if entry.isDirectory {
-                                    NavigationLink {
-                                        DirectoryView(root: folderRoot, path: entry.path)
-                                    } label: {
-                                        authorEntryRow(entry)
-                                    }
-                                    .buttonStyle(.plain)
-                                } else {
-                                    Button {
-                                        Task { await open(entry) }
-                                    } label: {
-                                        authorEntryRow(entry)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                    } else {
-                        LazyVGrid(columns: authorColumns, spacing: 6) {
-                            ForEach(folderEntries) { entry in
-                                if entry.isDirectory {
-                                    NavigationLink {
-                                        DirectoryView(root: folderRoot, path: entry.path)
-                                    } label: {
-                                        authorEntryCell(entry)
-                                    }
-                                    .buttonStyle(.plain)
-                                } else {
-                                    Button {
-                                        Task { await open(entry) }
-                                    } label: {
-                                        authorEntryCell(entry)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                    }
+                    folderContent(root: folderRoot)
                 }
             }
             .padding(16)
@@ -769,6 +727,53 @@ struct AuthorProfileView: View {
 
     private var authorColumns: [GridItem] {
         Array(repeating: GridItem(.flexible(), spacing: 6), count: layout == .grid ? 3 : 2)
+    }
+
+    @ViewBuilder
+    private func folderContent(root: String) -> some View {
+        if folderEntries.isEmpty {
+            Text("无文件").foregroundStyle(.secondary)
+        } else if layout == .list {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(folderEntries) { entry in
+                    if entry.isDirectory {
+                        NavigationLink {
+                            DirectoryView(root: root, path: entry.path)
+                        } label: {
+                            authorEntryRow(entry)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Button {
+                            Task { await open(entry) }
+                        } label: {
+                            authorEntryRow(entry)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        } else {
+            LazyVGrid(columns: authorColumns, spacing: 6) {
+                ForEach(folderEntries) { entry in
+                    if entry.isDirectory {
+                        NavigationLink {
+                            DirectoryView(root: root, path: entry.path)
+                        } label: {
+                            authorEntryCell(entry)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Button {
+                            Task { await open(entry) }
+                        } label: {
+                            authorEntryCell(entry)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
     }
 
     private func authorEntryCell(_ entry: RemoteBrowserEntry) -> some View {

@@ -21,13 +21,18 @@ struct TelegramFeedView: View {
     
     // 播放器状态
     @State private var activeVideoTarget: VideoTarget?
-    @State private var activeImageURL: URL?
+    @State private var activeImageTarget: ImageTarget?
     @State private var copyToast: String?
     
     struct VideoTarget: Identifiable {
         let id = UUID()
         let url: URL
         let title: String
+    }
+
+    struct ImageTarget: Identifiable {
+        let id = UUID()
+        let url: URL
     }
 
     var body: some View {
@@ -72,9 +77,9 @@ struct TelegramFeedView: View {
                 sourceLabel: "Telegram 原画"
             )
         }
-        .sheet(item: $activeImageURL) { url in
+        .sheet(item: $activeImageTarget) { target in
             NavigationStack {
-                AsyncImage(url: url) { phase in
+                AsyncImage(url: target.url) { phase in
                     switch phase {
                     case .success(let image):
                         image
@@ -94,7 +99,7 @@ struct TelegramFeedView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
-                        Button("关闭") { activeImageURL = nil }
+                        Button("关闭") { activeImageTarget = nil }
                     }
                 }
             }
@@ -355,7 +360,7 @@ struct TelegramFeedView: View {
                   let thumbURL = model.apiClient?.telegramUserThumbURL(chatId: chatId, messageId: msgId) else {
                 return
             }
-            activeImageURL = thumbURL
+            activeImageTarget = ImageTarget(url: thumbURL)
         } label: {
             if let chatId = selectedDialog?.id,
                let thumbURL = model.apiClient?.telegramUserThumbURL(chatId: chatId, messageId: msgId) {
