@@ -7,7 +7,7 @@ static COMIC_PAGE_CACHE: LazyLock<Mutex<HashMap<String, (String, Vec<u8>)>>> =
 
 use axum::{
     body::Body,
-    extract::{Path, State as AxumState},
+    extract::{Path, Query, State as AxumState},
     http::{
         header::{
             ACCEPT_RANGES, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE,
@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "tauri")]
 use tauri::Manager;
 use crate::four_domains;
+use crate::telegram_public;
 use crate::AppHandle;
 use tower_http::services::ServeDir;
 
@@ -346,6 +347,9 @@ fn build_router(state: ServerState, static_dir: String) -> Router {
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
+        .route("/api/telegram-proxy-media", get(proxy_telegram_media).head(proxy_telegram_media))
+        .route("/api/telegram-user-stream/{chat_id}/{message_id}", get(proxy_telegram_user_stream).head(proxy_telegram_user_stream))
+        .route("/api/telegram-user-thumb/{chat_id}/{message_id}", get(proxy_telegram_user_thumb).head(proxy_telegram_user_thumb))
         .route("/api/{command}", post(dispatch_command))
         .route("/media/{token}", get(proxy_media).head(proxy_media))
         .route(
@@ -367,8 +371,10 @@ fn build_router(state: ServerState, static_dir: String) -> Router {
 async fn cache_headers(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path().to_owned();
     let mut response = next.run(request).await;
-    let cache_policy = if path.starts_with("/media/") || path.starts_with("/compatible/") || path.starts_with("/thumbnail/") {
+    let cache_policy = if path.starts_with("/media/") || path.starts_with("/compatible/") || path.starts_with("/thumbnail/") || path.starts_with("/api/telegram-proxy-media") || path.starts_with("/api/telegram-user-stream/") {
         "private, max-age=300"
+    } else if path.starts_with("/api/telegram-user-thumb/") {
+        "public, max-age=86400"
     } else if path == "/" || path.ends_with(".html") || path == "/manifest.webmanifest" {
         "no-cache, no-store, must-revalidate"
     } else if path.starts_with("/assets/") {
@@ -390,7 +396,12 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_owned();
-    if path == "/api/health" || path.starts_with("/api/auth/") {
+    if path == "/api/health"
+        || path.starts_with("/api/auth/")
+        || path == "/api/telegram-proxy-media"
+        || path.starts_with("/api/telegram-user-stream/")
+        || path.starts_with("/api/telegram-user-thumb/")
+    {
         return next.run(request).await;
     }
     if !path.starts_with("/api/")
@@ -1433,6 +1444,90 @@ async fn dispatch_command(
                 .await,
             )
         }
+        "telegram_list_channels" => {
+            let app = app.clone();
+            blocking_result_response(move || telegram_public::list_channels(&app)).await
+        }
+        "telegram_add_channel" => {
+            let username = payload
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            result_response(telegram_public::add_channel(app.clone(), username).await)
+        }
+        "telegram_remove_channel" => {
+            let username = payload
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let app = app.clone();
+            blocking_result_response(move || telegram_public::remove_channel(&app, &username)).await
+        }
+        "telegram_list_posts" => {
+            let username = payload
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let before = payload.get("before").and_then(Value::as_i64);
+            let refresh = payload.get("refresh").and_then(Value::as_bool);
+            result_response(telegram_public::list_posts(app.clone(), username, before, refresh).await)
+        }
+        "telegram_resolve_media" => {
+            let username = payload
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let post_id = match payload.get("postId").and_then(Value::as_i64) {
+                Some(value) if value > 0 => value,
+                _ => return error_response("缺少 postId 参数"),
+            };
+            result_response(telegram_public::resolve_media(app.clone(), username, post_id).await)
+        }
+        "telegram_user_status" => {
+            forward_to_tg_streamer(reqwest::Method::GET, "/auth/status", None).await
+        }
+        "telegram_user_qr_start" => {
+            forward_to_tg_streamer(reqwest::Method::POST, "/auth/qr/start", Some(payload)).await
+        }
+        "telegram_user_qr_check" => {
+            forward_to_tg_streamer(reqwest::Method::GET, "/auth/qr/check", None).await
+        }
+        "telegram_user_qr_password" => {
+            forward_to_tg_streamer(reqwest::Method::POST, "/auth/qr/password", Some(payload)).await
+        }
+        "telegram_user_send_code" => {
+            forward_to_tg_streamer(reqwest::Method::POST, "/auth/send-code", Some(payload)).await
+        }
+        "telegram_user_sign_in" => {
+            forward_to_tg_streamer(reqwest::Method::POST, "/auth/sign-in", Some(payload)).await
+        }
+        "telegram_user_logout" => {
+            forward_to_tg_streamer(reqwest::Method::POST, "/auth/logout", None).await
+        }
+        "telegram_user_list_dialogs" => {
+            forward_to_tg_streamer(reqwest::Method::GET, "/user/dialogs", None).await
+        }
+        "telegram_user_subscriptions" => {
+            forward_to_tg_streamer(reqwest::Method::GET, "/user/subscriptions", None).await
+        }
+        "telegram_user_toggle_subscription" => {
+            forward_to_tg_streamer(reqwest::Method::POST, "/user/subscriptions/toggle", Some(payload)).await
+        }
+        "telegram_user_list_messages" => {
+            let chat_id = payload.get("chat_id").and_then(Value::as_i64).or_else(|| {
+                payload.get("chat_id").and_then(Value::as_str).and_then(|s| s.parse().ok())
+            }).unwrap_or(0);
+            let offset_id = payload.get("offset_id").and_then(Value::as_i64).unwrap_or(0);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(30);
+            let filter_ads = payload.get("filter_ads").and_then(Value::as_bool).unwrap_or(true);
+            let filter_duplicates = payload.get("filter_duplicates").and_then(Value::as_bool).unwrap_or(true);
+            let path = format!("/user/messages?chat_id={chat_id}&offset_id={offset_id}&limit={limit}&filter_ads={filter_ads}&filter_duplicates={filter_duplicates}");
+            forward_to_tg_streamer(reqwest::Method::GET, &path, None).await
+        }
         _ => error_response(format!("不支持的 API：{command}")),
     }
 }
@@ -1608,4 +1703,179 @@ async fn cached_comic_page(
         }
         Err(error) => (StatusCode::NOT_FOUND, [(CACHE_CONTROL, HeaderValue::from_static("no-store"))], error).into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramProxyQuery {
+    url: String,
+}
+
+async fn proxy_telegram_media(
+    AxumState(_context): AxumState<ServerState>,
+    Query(query): Query<TelegramProxyQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let raw_url = query.url.trim();
+    if !raw_url.starts_with("https://") && !raw_url.starts_with("http://") {
+        return (StatusCode::BAD_REQUEST, "Invalid URL").into_response();
+    }
+    let Ok(parsed) = url::Url::parse(raw_url) else {
+        return (StatusCode::BAD_REQUEST, "Malformed URL").into_response();
+    };
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    if !host.contains("telesco.pe")
+        && !host.contains("telegram")
+        && !host.contains("t.me")
+        && !host.ends_with(".cdn-telegram.org")
+    {
+        return (StatusCode::FORBIDDEN, "Domain not allowed").into_response();
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::limited(4))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let mut req = client.get(raw_url)
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+        .header(reqwest::header::REFERER, "https://t.me/");
+
+    if let Some(range) = headers.get(RANGE) {
+        req = req.header(reqwest::header::RANGE, range);
+    }
+
+    let upstream = match req.send().await {
+        Ok(resp) => resp,
+        Err(err) => return (StatusCode::BAD_GATEWAY, format!("Upstream request failed: {err}")).into_response(),
+    };
+
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+
+    for (k, v) in upstream.headers() {
+        if matches!(
+            k.as_str(),
+            "content-type" | "content-length" | "content-range" | "accept-ranges" | "cache-control" | "etag" | "last-modified"
+        ) {
+            builder = builder.header(k, v);
+        }
+    }
+    builder = builder.header("access-control-allow-origin", "*");
+    builder = builder.header("access-control-allow-headers", "*");
+
+    let body = Body::from_stream(upstream.bytes_stream());
+    builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn forward_to_tg_streamer(
+    method: reqwest::Method,
+    path: &str,
+    json_body: Option<Value>,
+) -> Response {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:18082{}", path);
+    let mut req = client.request(method, &url);
+    if let Some(body) = json_body {
+        req = req.json(&body);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            let val = resp.json::<Value>().await.unwrap_or_else(|_| json!({"error": "Invalid response"}));
+            (status, Json(val)).into_response()
+        }
+        Err(err) => {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"ok": false, "error": format!("Telegram Streamer 离线或未启动: {err}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn proxy_telegram_user_stream(
+    AxumState(_context): AxumState<ServerState>,
+    Path((chat_id, message_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let url = format!("http://127.0.0.1:18082/stream/{chat_id}/{message_id}");
+    let mut req = client.get(&url);
+    if let Some(range) = headers.get(RANGE) {
+        req = req.header(reqwest::header::RANGE, range);
+    }
+
+    let upstream = match req.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Telegram Streamer request failed: {err}"),
+            )
+                .into_response()
+        }
+    };
+
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+
+    for (k, v) in upstream.headers() {
+        if matches!(
+            k.as_str(),
+            "content-type"
+                | "content-length"
+                | "content-range"
+                | "accept-ranges"
+                | "cache-control"
+                | "etag"
+                | "last-modified"
+                | "content-disposition"
+        ) {
+            builder = builder.header(k, v);
+        }
+    }
+    builder = builder.header("access-control-allow-origin", "*");
+    builder = builder.header("access-control-allow-headers", "*");
+
+    let body = Body::from_stream(upstream.bytes_stream());
+    builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn proxy_telegram_user_thumb(
+    AxumState(_context): AxumState<ServerState>,
+    Path((chat_id, message_id)): Path<(String, String)>,
+) -> Response {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:18082/thumb/{chat_id}/{message_id}");
+    let upstream = match client.get(&url).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Thumb request failed: {err}"),
+            )
+                .into_response()
+        }
+    };
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    for (k, v) in upstream.headers() {
+        if matches!(k.as_str(), "content-type" | "content-length" | "cache-control") {
+            builder = builder.header(k, v);
+        }
+    }
+    let body = Body::from_stream(upstream.bytes_stream());
+    builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

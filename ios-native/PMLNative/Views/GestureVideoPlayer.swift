@@ -28,9 +28,7 @@ struct GestureVideoPlayerSheet: View {
     @State private var accelLabel: String?
     @State private var currentFallbackURL: URL?
     @State private var currentSourceLabel: String?
-    @State private var currentRemotePath: String?
     @State private var usedFallback = false
-    @State private var retriedDirect = false
 
     @State private var isPlaying = false
     @State private var currentTime: Double = 0
@@ -38,8 +36,7 @@ struct GestureVideoPlayerSheet: View {
     @State private var rate: Float = 1
     @State private var muted = false
     @State private var volume: Float = 1
-    @State private var controlsVisible = false
-    @State private var hasFirstFrame = false
+    @State private var controlsVisible = true
     @State private var controlsTask: Task<Void, Never>?
 
     @State private var resumeSeconds: Double = 0
@@ -97,8 +94,7 @@ struct GestureVideoPlayerSheet: View {
         playlist: [VideoPlaylistItem] = [],
         playlistIndex: Int? = nil,
         fallbackURL: URL? = nil,
-        sourceLabel: String? = nil,
-        remotePath: String? = nil
+        sourceLabel: String? = nil
     ) {
         self.startAt = startAt
         _playlist = State(initialValue: playlist)
@@ -108,7 +104,6 @@ struct GestureVideoPlayerSheet: View {
         _currentIndex = State(initialValue: playlistIndex)
         _currentFallbackURL = State(initialValue: fallbackURL)
         _currentSourceLabel = State(initialValue: sourceLabel)
-        _currentRemotePath = State(initialValue: remotePath)
         _accelLabel = State(initialValue: sourceLabel)
     }
 
@@ -119,7 +114,7 @@ struct GestureVideoPlayerSheet: View {
                 PlayerLayerContainer(player: player, gravity: videoGravity)
                     .ignoresSafeArea()
 
-                if let poster, !hasFirstFrame {
+                if let poster, duration <= 0 {
                     Image(uiImage: poster)
                         .resizable()
                         .scaledToFit()
@@ -221,15 +216,7 @@ struct GestureVideoPlayerSheet: View {
                         }
                         Menu {
                             Button { showPlaylist = true } label: {
-                                Label("选集", systemImage: "list.bullet")
-                            }
-                            Menu("倍速") {
-                                ForEach([0.5, 1.0, 1.25, 1.5, 2.0], id: \.self) { value in
-                                    Button(String(format: "%.2gx", value)) { setRate(Float(value)) }
-                                }
-                            }
-                            Button { toggleOrientation() } label: {
-                                Label("横竖屏", systemImage: "rectangle.landscape.rotate")
+                                Label("播放列表", systemImage: "list.bullet")
                             }
                             Menu {
                                 Button("关闭字幕") {
@@ -273,8 +260,7 @@ struct GestureVideoPlayerSheet: View {
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, 18)
-                    .padding(.top, 8)
-                    .safeAreaPadding(.top, 4)
+                    .padding(.top, 20)
                 }
             }
             .overlay(alignment: .leading) {
@@ -307,10 +293,7 @@ struct GestureVideoPlayerSheet: View {
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(.bottom, 130)
                 }
-            }
-            .statusBarHidden(true)
-            .persistentSystemOverlays(.hidden)
-            .toolbar(.hidden, for: .navigationBar)
+            }            .statusBarHidden(true)
         }
         .onAppear(perform: setup)
         .onAppear {
@@ -412,15 +395,35 @@ struct GestureVideoPlayerSheet: View {
                         .disabled(!canGoNext)
                     }
                     Spacer()
-                    Text(String(format: "%.2gx", rate))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.8))
+                    Menu {
+                        ForEach([0.5, 1.0, 1.25, 1.5, 2.0], id: \.self) { value in
+                            Button(String(format: "%.2gx", value)) { setRate(Float(value)) }
+                        }
+                    } label: {
+                        Text(String(format: "%.2gx", rate))
+                            .font(.caption.weight(.semibold))
+                    }
+                    Button {
+                        toggleAspect()
+                    } label: {
+                        Text(videoGravity == .resizeAspect ? "适配" : "填充")
+                            .font(.caption.weight(.semibold))
+                    }
+                    Button {
+                        showPlaylist = true
+                    } label: {
+                        Image(systemName: "list.bullet")
+                    }
+                    Button {
+                        toggleOrientation()
+                    } label: {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    }
                 }
                 .foregroundStyle(.white)
             }
             .padding(.horizontal, 20)
-            .padding(.bottom, 12)
-            .safeAreaPadding(.bottom, 4)
+            .padding(.bottom, 8)
             .padding(.top, 10)
             .background(
                 LinearGradient(colors: [.clear, .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
@@ -609,28 +612,6 @@ struct GestureVideoPlayerSheet: View {
         }
     }
 
-    /// 直连 CDN 过期时重新向 AList `/d` 要签名，并从当前时间续播。只试一次。
-    @MainActor
-    private func retryExpiredDirect(at target: Double, resume: Bool) async -> Bool {
-        guard !retriedDirect else { return false }
-        let label = currentSourceLabel ?? ""
-        guard label.contains("直连") else { return false }
-        let path = currentRemotePath ?? playlist.first { $0.assetId == currentAssetId }?.remotePath
-        guard let assetId = currentAssetId, let path, !path.isEmpty else { return false }
-        retriedDirect = true
-        guard let source = await model.playbackSource(assetId: assetId, remotePath: path),
-              source.label?.contains("直连") == true else { return false }
-        currentURL = source.url
-        currentFallbackURL = source.fallbackURL
-        currentSourceLabel = source.label
-        currentRemotePath = path
-        accelLabel = "AList 直连"
-        player.replaceCurrentItem(with: makePlayerItem(source.url))
-        guard await waitUntilReady() else { return false }
-        requestSeek(to: target, resume: resume, debounce: false)
-        return true
-    }
-
     @MainActor
     private func recoverPlayback(at target: Double) async {
         guard !isRecovering else { return }
@@ -639,10 +620,9 @@ struct GestureVideoPlayerSheet: View {
         seekRequestID += 1
         seekTask?.cancel()
         var url = currentURL
-        if player.currentItem?.status == .failed {
-            if await retryExpiredDirect(at: target, resume: true) { return }
-            showHUD("直连失败，请重试", seconds: 2)
-            return
+        if player.currentItem?.status == .failed, let fallback = currentFallbackURL {
+            url = fallback
+            accelLabel = "服务器中转"
         }
         player.replaceCurrentItem(with: makePlayerItem(url))
         if await waitUntilReady(timeout: 8) {
@@ -682,11 +662,10 @@ struct GestureVideoPlayerSheet: View {
     }
     private func loadCurrent(trackResume: Bool) {
         let item = makePlayerItem(currentURL)
-        item.preferredForwardBufferDuration = 0.5
+        let isMOV = currentURL.pathExtension.lowercased() == "mov"
+        item.preferredForwardBufferDuration = isMOV ? 1.5 : 2
         player.replaceCurrentItem(with: item)
-        player.automaticallyWaitsToMinimizeStalling = false
-        hasFirstFrame = false
-        accelLabel = currentSourceLabel ?? "AList 直连"
+        player.automaticallyWaitsToMinimizeStalling = true
         poster = currentAssetId.flatMap { thumbService.images[$0] }
         if poster == nil, let assetId = currentAssetId, let client = model.apiClient {
             Task {
@@ -715,6 +694,7 @@ struct GestureVideoPlayerSheet: View {
         } else {
             begin(from: 0)
         }
+        Task { await refreshAccelLabel() }
         Task { await loadSubtitles() }
     }
 
@@ -737,6 +717,28 @@ struct GestureVideoPlayerSheet: View {
             }
         } else {
             begin(from: 0)
+        }
+    }
+
+    @MainActor
+    private func refreshAccelLabel() async {
+        guard let currentAssetId, let client = model.apiClient else {
+            accelLabel = nil
+            return
+        }
+        guard accelLabel == nil else { return }
+        guard let info = try? await client.mediaStreamInfo(assetId: currentAssetId) else {
+            accelLabel = nil
+            return
+        }
+        if info.accelerated {
+            accelLabel = "115 直连"
+        } else if info.provider == "cd2" {
+            accelLabel = "CD2 中转"
+        } else if info.provider == "alist" {
+            accelLabel = "AList 中转"
+        } else {
+            accelLabel = nil
         }
     }
 
@@ -789,10 +791,8 @@ struct GestureVideoPlayerSheet: View {
         currentURL = source.url
         currentFallbackURL = source.fallbackURL
         currentSourceLabel = source.label
-        currentRemotePath = item.remotePath ?? currentRemotePath
         accelLabel = source.label
         usedFallback = false
-        retriedDirect = false
         showPlaylist = false
         loadCurrent(trackResume: false)
     }
@@ -1035,16 +1035,25 @@ struct GestureVideoPlayerSheet: View {
                 duration = seconds.isFinite ? seconds : 0
             }
             if player.currentItem?.status == .failed, !usedFallback {
+                usedFallback = true
                 let target = currentTime
                 let wasPlaying = isPlaying
                 Task { @MainActor in
-                    if await retryExpiredDirect(at: target, resume: wasPlaying) { return }
-                    usedFallback = true
-                    showHUD("直连失败，请重试", seconds: 2)
+                    var fallback = currentFallbackURL
+                    if fallback == nil, let assetId = currentAssetId {
+                        fallback = await model.fallbackMediaURL(assetId: assetId)
+                    }
+                    guard let fallback else {
+                        usedFallback = false
+                        return
+                    }
+                    player.replaceCurrentItem(with: makePlayerItem(fallback))
+                    accelLabel = "服务器中转"
+                    poster = nil
+                    if await waitUntilReady() {
+                        requestSeek(to: target, resume: wasPlaying, debounce: false)
+                    }
                 }
-            }
-            if player.timeControlStatus == .playing || currentTime > 0.05 {
-                hasFirstFrame = true
             }
             isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
             if isBuffering, isPlaying, player.currentItem?.status == .readyToPlay {
