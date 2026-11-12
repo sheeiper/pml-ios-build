@@ -601,7 +601,12 @@ async fn dispatch_command(
         }
         "scan_domain" => {
             let domain = payload.get("domain").and_then(Value::as_str).unwrap_or("").to_owned();
-            result_response(four_domains::scan_domain(app.clone(), app.state::<MediaLibraryState>(), &domain).await)
+            let force = payload.get("force").and_then(Value::as_bool).unwrap_or(false);
+            if force {
+                result_response(four_domains::scan_domain_full(app.clone(), app.state::<MediaLibraryState>(), &domain).await)
+            } else {
+                result_response(four_domains::scan_domain(app.clone(), app.state::<MediaLibraryState>(), &domain).await)
+            }
         }
         "clean_domain" => {
             let domain = payload.get("domain").and_then(Value::as_str).unwrap_or("").to_owned();

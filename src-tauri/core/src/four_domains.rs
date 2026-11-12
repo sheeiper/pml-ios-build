@@ -836,7 +836,15 @@ pub async fn scan_domain(
     state: State<'_, media_library::MediaLibraryState>,
     domain: &str,
 ) -> Result<ScanSummary, String> {
-    scan_provider_tree(app, state, domain, "", true).await
+    scan_provider_tree(app, state, domain, "", true, true).await
+}
+
+pub async fn scan_domain_full(
+    app: AppHandle,
+    state: State<'_, media_library::MediaLibraryState>,
+    domain: &str,
+) -> Result<ScanSummary, String> {
+    scan_provider_tree(app, state, domain, "", true, false).await
 }
 
 /// Recursive scoped scan for original scan/retry commands; unlike interactive
@@ -847,7 +855,7 @@ pub(crate) async fn scan_domain_subtree(
     domain: &str,
     path: &str,
 ) -> Result<ScanSummary, String> {
-    scan_provider_tree(app, state, domain, path, true).await
+    scan_provider_tree(app, state, domain, path, true, true).await
 }
 
 pub async fn refresh_domain_path(
@@ -886,7 +894,7 @@ async fn scan_path_v2(
     domain: &str,
     folder_path: &str,
 ) -> Result<ScanSummary, String> {
-    scan_provider_tree(app, state, domain, folder_path, false).await
+    scan_provider_tree(app, state, domain, folder_path, false, false).await
 }
 
 // Fetch everything before opening a write transaction. A failed or malformed listing
@@ -897,6 +905,7 @@ async fn scan_provider_tree(
     domain: &str,
     folder_path: &str,
     recursive: bool,
+    incremental: bool,
 ) -> Result<ScanSummary, String> {
     if !domain_valid(domain) {
         return Err("未知域".into());
@@ -927,12 +936,34 @@ async fn scan_provider_tree(
             .map_err(|error| error.to_string())?;
     }
 
+    // 增量扫描剪枝缓存：预加载已完成快照的子目录及其修改时间和 etag
+    let cached_subdirs: HashMap<String, (Option<String>, Option<String>)> = if incremental && recursive {
+        let connection = open_v2(&app)?;
+        let mut stmt = connection.prepare(
+            "SELECT e.remote_path, e.modified_at, e.etag
+             FROM provider_directory_entries e
+             JOIN provider_directory_snapshots s
+               ON s.domain = e.domain AND s.root_id = e.root_id AND s.parent_path = e.remote_path
+             WHERE e.domain = ?1 AND e.root_id = ?2 AND e.is_directory = 1"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![domain, &root_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?),
+            ))
+        }).map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    } else {
+        HashMap::new()
+    };
+
     let mut queue = std::collections::VecDeque::from([start_path.clone()]);
     let mut visited = HashSet::new();
     let mut files: Vec<(String, String, String, Option<String>, String, i64, Option<String>, Option<String>)> = Vec::new();
     let mut listings = Vec::new();
     let fetched: Result<(), String> = async {
     while let Some(directory) = queue.pop_front() {
+        tokio::task::yield_now().await;
         if !visited.insert(directory.clone()) {
             continue;
         }
@@ -940,10 +971,22 @@ async fn scan_provider_tree(
             .map_err(|error| format!("目录读取失败 {directory}: {error}"))?;
         validate_provider_listing(&directory, &entries)?;
         listings.push((directory.clone(), entries.clone()));
-        if recursive { tokio::time::sleep(Duration::from_millis(80)).await; }
+        if recursive { tokio::time::sleep(Duration::from_millis(30)).await; }
         for entry in entries {
             if entry.is_directory {
-                if recursive { queue.push_back(entry.path); }
+                if recursive {
+                    if incremental {
+                        if let Some((cached_mod, cached_etag)) = cached_subdirs.get(&entry.path) {
+                            let mod_match = entry.modified_at.is_some() && entry.modified_at == *cached_mod;
+                            let etag_match = entry.etag.is_some() && entry.etag == *cached_etag;
+                            if mod_match || etag_match {
+                                // 目录修改时间或 etag 一致，且历史快照完整，跳过此子树递归
+                                continue;
+                            }
+                        }
+                    }
+                    queue.push_back(entry.path);
+                }
             } else if let Some(media_type) = domain_media_type(domain, &entry.path) {
                 let name = entry.name.clone();
                 let parent = parent_path(&entry.path);

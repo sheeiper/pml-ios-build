@@ -1260,8 +1260,6 @@ pub async fn scan_library(
     for (domain,id,path) in configured {
         if let Some(wanted) = root_id.as_ref() {
             if wanted != &id { continue; }
-        } else if domain != "vault" && domain != "comics" {
-            continue;
         }
         if let Some(folder) = folder_path.as_ref() {
             let folder = normalize_remote_path(folder)?;
@@ -1463,7 +1461,7 @@ async fn run_scan_library(
             for path in jobs {
                 update_scan_progress(&progress,|p| {
                     p.current_root=Some(root.remote_path.clone());p.current_directory=Some(path.clone());
-                    p.message=format!("正在扫描域 {}/{}：{}",index+1,roots.len(),path);
+                    p.message=format!("正在增量扫描域 {}/{}：{}",index+1,roots.len(),path);
                 });
                 let state=app.state::<MediaLibraryState>();
                 let outcome=if paths.is_some() {
@@ -1475,6 +1473,7 @@ async fn run_scan_library(
                     Ok(summary)=>{total+=summary.scanned.max(0) as usize;}
                     Err(error)=>{root_failed.push(path.clone());errors.push(format!("{path}: {error}"));}
                 }
+                tokio::task::yield_now().await;
             }
             failed.remove(&root.id);
             if !root_failed.is_empty(){failed.insert(root.id.clone(),root_failed);}
@@ -8455,6 +8454,9 @@ pub async fn serve_media_axum(
                         while buf.len() < TARGET_CHUNK_SIZE {
                             match tokio::time::timeout(std::time::Duration::from_millis(15), body.next()).await {
                                 Ok(Some(Ok(next_b))) => {
+                                    if next_b.is_empty() {
+                                        break;
+                                    }
                                     buf.extend_from_slice(&next_b);
                                 }
                                 _ => break,
@@ -8622,6 +8624,9 @@ async fn pipe_proxy_response(
             break;
         };
         let chunk = chunk.map_err(|error| format!("读取媒体流失败：{error}"))?;
+        if chunk.is_empty() {
+            break;
+        }
         let current_ts = now();
         if current_ts.saturating_sub(last_chunk_ts) >= 3 {
             last_chunk_ts = current_ts;
