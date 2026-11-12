@@ -14,6 +14,8 @@ struct TelegramFeedView: View {
     
     @State private var loadingDialogs = false
     @State private var loadingMessages = false
+    @State private var loadingOlder = false
+    @State private var hasMoreOlder = true
     @State private var errorText: String?
     @State private var filterAds = true
     @State private var filterDuplicates = true
@@ -216,17 +218,83 @@ struct TelegramFeedView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 16) {
-                        ForEach(messages) { msg in
-                            messageCard(msg)
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        LazyVStack(spacing: 16) {
+                            // 顶部：向上翻看加载更早历史消息
+                            if hasMoreOlder && !messages.isEmpty {
+                                if loadingOlder {
+                                    HStack(spacing: 8) {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("正在加载更早历史消息...")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.vertical, 8)
+                                } else {
+                                    Button {
+                                        Task { await loadOlderMessages() }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "arrow.up.circle")
+                                            Text("点击或往上翻加载更早消息")
+                                        }
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(.secondary)
+                                        .padding(.vertical, 6)
+                                        .padding(.horizontal, 14)
+                                        .background(Color(uiColor: .secondarySystemBackground), in: Capsule())
+                                    }
+                                    .padding(.top, 4)
+                                    .onAppear {
+                                        Task { await loadOlderMessages() }
+                                    }
+                                }
+                            }
+
+                            ForEach(messages) { msg in
+                                messageCard(msg)
+                                    .id(msg.id)
+                            }
+
+                            // 底部锚点：保证最新的内容在最下方
+                            Color.clear
+                                .frame(height: 1)
+                                .id("BOTTOM_MSG_ANCHOR")
+                        }
+                        .padding(16)
+                    }
+                    .refreshable {
+                        if let d = selectedDialog {
+                            await loadMessages(chatId: d.id)
                         }
                     }
-                    .padding(16)
-                }
-                .refreshable {
-                    if let d = selectedDialog {
-                        await loadMessages(chatId: d.id)
+                    .overlay(alignment: .bottomTrailing) {
+                        Button {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                                scrollProxy.scrollTo("BOTTOM_MSG_ANCHOR", anchor: .bottom)
+                            }
+                        } label: {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 34))
+                                .foregroundStyle(Color.accentColor.opacity(0.85))
+                                .background(Circle().fill(Color(uiColor: .systemBackground)))
+                                .shadow(color: .black.opacity(0.18), radius: 4, x: 0, y: 2)
+                        }
+                        .padding(.trailing, 20)
+                        .padding(.bottom, 16)
+                    }
+                    .onChange(of: selectedDialog?.id) { _ in
+                        scrollProxy.scrollTo("BOTTOM_MSG_ANCHOR", anchor: .bottom)
+                    }
+                    .onChange(of: messages.count) { _ in
+                        if !loadingOlder {
+                            scrollProxy.scrollTo("BOTTOM_MSG_ANCHOR", anchor: .bottom)
+                        }
+                    }
+                    .onAppear {
+                        scrollProxy.scrollTo("BOTTOM_MSG_ANCHOR", anchor: .bottom)
                     }
                 }
             }
@@ -729,20 +797,57 @@ struct TelegramFeedView: View {
         guard let client = model.apiClient else { return }
         loadingMessages = true
         messages = []
+        hasMoreOlder = true
         do {
             let msgs = try await client.telegramUserMessages(
                 chatId: chatId,
                 offsetId: 0,
-                limit: 50,
+                limit: 40,
                 filterAds: currentConfig.filterAds,
                 filterDuplicates: currentConfig.filterDuplicates,
                 config: currentConfig
             )
-            messages = msgs
+            // Telegram API 默认返回从新到旧 [最新, 次新, ..., 较早]
+            // 反转为时间正序：[较早, ..., 次新, 最新]，使最新内容呈现在最下方
+            messages = msgs.reversed()
         } catch {
             errorText = error.localizedDescription
         }
         loadingMessages = false
+    }
+
+    private func loadOlderMessages() async {
+        guard let d = selectedDialog, let client = model.apiClient, !loadingOlder, hasMoreOlder else { return }
+        guard let oldestMsgId = messages.map(\.id).min(), oldestMsgId > 1 else {
+            hasMoreOlder = false
+            return
+        }
+        loadingOlder = true
+        do {
+            let olderMsgs = try await client.telegramUserMessages(
+                chatId: d.id,
+                offsetId: oldestMsgId,
+                limit: 30,
+                filterAds: currentConfig.filterAds,
+                filterDuplicates: currentConfig.filterDuplicates,
+                config: currentConfig
+            )
+            if olderMsgs.isEmpty {
+                hasMoreOlder = false
+            } else {
+                let existingIds = Set(messages.map(\.id))
+                let newUnique = olderMsgs.filter { !existingIds.contains($0.id) }
+                if newUnique.isEmpty {
+                    hasMoreOlder = false
+                } else {
+                    // 反转后拼接到最顶部
+                    messages = newUnique.reversed() + messages
+                }
+            }
+        } catch {
+            // 加载较早历史遇到网络或限流时静默容错
+        }
+        loadingOlder = false
     }
 
     private func linkBadgeTitle(_ type: String) -> String {
