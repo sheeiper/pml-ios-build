@@ -1548,6 +1548,16 @@ async fn dispatch_command(
             }
             forward_to_tg_streamer(reqwest::Method::GET, &path, None).await
         }
+        "telegram_user_list_comments" => {
+            let chat_id = payload.get("chat_id").and_then(Value::as_i64).or_else(|| {
+                payload.get("chat_id").and_then(Value::as_str).and_then(|s| s.parse().ok())
+            }).unwrap_or(0);
+            let message_id = payload.get("message_id").and_then(Value::as_i64).unwrap_or(0);
+            let offset_id = payload.get("offset_id").and_then(Value::as_i64).unwrap_or(0);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(50);
+            let path = format!("/user/comments?chat_id={chat_id}&message_id={message_id}&offset_id={offset_id}&limit={limit}");
+            forward_to_tg_streamer(reqwest::Method::GET, &path, None).await
+        }
         _ => error_response(format!("不支持的 API：{command}")),
     }
 }

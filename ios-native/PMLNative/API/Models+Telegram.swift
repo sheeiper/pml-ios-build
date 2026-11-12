@@ -121,11 +121,13 @@ public struct TelegramNativeOfflineLink: Identifiable, Codable, Hashable {
     public let code: String?
     public let type: String
     public let copyText: String
+    public let textWithoutLinks: String?
     public let source: String?
 
     enum CodingKeys: String, CodingKey {
         case name, url, code, type, source
         case copyText = "copy_text"
+        case textWithoutLinks = "text_without_links"
     }
 }
 
@@ -146,6 +148,7 @@ public struct TelegramNativeMessage: Identifiable, Codable, Hashable {
     public let albumCount: Int?
     public let mediaList: [TelegramNativeMediaItem]?
     public let repliesResources: [TelegramNativeMessage]?
+    public let repliesCount: Int?
     public let isDuplicate: Bool?
 
     enum CodingKeys: String, CodingKey {
@@ -160,6 +163,49 @@ public struct TelegramNativeMessage: Identifiable, Codable, Hashable {
         case albumCount = "album_count"
         case mediaList = "media_list"
         case repliesResources = "replies_resources"
+        case repliesCount = "replies_count"
         case isDuplicate = "is_duplicate"
+    }
+}
+
+public struct TelegramNativeComment: Identifiable, Codable, Hashable {
+    public let id: Int64
+    public let chatId: Int64?
+    public let date: String?
+    public let text: String?
+    public let senderName: String?
+    public let senderUsername: String?
+    public let isVideo: Bool?
+    public let hasPhoto: Bool?
+    public let video: TelegramNativeVideo?
+    public let offlineLinks: [TelegramNativeOfflineLink]?
+    public let reactions: [TelegramNativeReaction]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, date, text, video, reactions
+        case chatId = "chat_id"
+        case senderName = "sender_name"
+        case senderUsername = "sender_username"
+        case isVideo = "is_video"
+        case hasPhoto = "has_photo"
+        case offlineLinks = "offline_links"
+    }
+}
+
+public struct TelegramNativeCommentsResponse: Codable {
+    public let ok: Bool
+    public let parentId: Int64?
+    public let parentTitle: String?
+    public let parentText: String?
+    public let comments: [TelegramNativeComment]?
+    public let offlineLinks: [TelegramNativeOfflineLink]?
+    public let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, error, comments
+        case parentId = "parent_id"
+        case parentTitle = "parent_title"
+        case parentText = "parent_text"
+        case offlineLinks = "offline_links"
     }
 }

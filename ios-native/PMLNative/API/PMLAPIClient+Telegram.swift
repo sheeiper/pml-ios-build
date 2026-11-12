@@ -137,6 +137,26 @@ extension PMLAPIClient {
         return components.url
     }
 
+    /// 获取某条消息的按需评论列表与评论内提取的离线链接
+    func telegramUserComments(
+        chatId: Int64,
+        messageId: Int64,
+        offsetId: Int64 = 0,
+        limit: Int = 50
+    ) async throws -> TelegramNativeCommentsResponse {
+        let args: [String: Any] = [
+            "chat_id": chatId,
+            "message_id": messageId,
+            "offset_id": offsetId,
+            "limit": limit
+        ]
+        let resp: TelegramNativeCommentsResponse = try await command("telegram_user_list_comments", arguments: args)
+        guard resp.ok else {
+            throw APIError.server(resp.error ?? "获取评论列表失败")
+        }
+        return resp
+    }
+
     /// 获取图片/视频缩略图 URL
     func telegramUserThumbURL(chatId: Int64, messageId: Int64) -> URL? {
         guard var components = URLComponents(url: configuration.baseURL, resolvingAgainstBaseURL: false) else {
