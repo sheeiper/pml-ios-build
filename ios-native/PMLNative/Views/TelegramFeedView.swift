@@ -53,7 +53,22 @@ struct TelegramFeedView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                if selectedDialog != nil {
+                if let dialog = selectedDialog {
+                    Button {
+                        Task {
+                            await markSelectedDialogAsRead()
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "checkmark.circle")
+                            if let count = dialog.unreadCount, count > 0 {
+                                Text("\(count)")
+                                    .font(.caption2.bold())
+                            }
+                        }
+                    }
+                    .accessibilityLabel("一键已读")
+
                     Button {
                         if let cfg = selectedDialog?.config {
                             currentConfig = cfg
@@ -778,6 +793,23 @@ struct TelegramFeedView: View {
             }
         } catch {
             triggerToast("操作失败: \(error.localizedDescription)")
+        }
+    }
+
+    private func markSelectedDialogAsRead() async {
+        guard let d = selectedDialog, let client = model.apiClient else { return }
+        do {
+            try await client.telegramUserMarkRead(chatId: d.id)
+            if let idx = dialogs.firstIndex(where: { $0.id == d.id }) {
+                dialogs[idx].unreadCount = 0
+            }
+            if let idx = subscribedDialogs.firstIndex(where: { $0.id == d.id }) {
+                subscribedDialogs[idx].unreadCount = 0
+            }
+            selectedDialog?.unreadCount = 0
+            triggerToast("✅ 已一键标记已读")
+        } catch {
+            triggerToast("标记已读失败: \(error.localizedDescription)")
         }
     }
 

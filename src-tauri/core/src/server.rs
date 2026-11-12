@@ -1558,6 +1558,9 @@ async fn dispatch_command(
             let path = format!("/user/comments?chat_id={chat_id}&message_id={message_id}&offset_id={offset_id}&limit={limit}");
             forward_to_tg_streamer(reqwest::Method::GET, &path, None).await
         }
+        "telegram_user_read_acknowledge" => {
+            forward_to_tg_streamer(reqwest::Method::POST, "/user/read_acknowledge", Some(payload)).await
+        }
         _ => error_response(format!("不支持的 API：{command}")),
     }
 }

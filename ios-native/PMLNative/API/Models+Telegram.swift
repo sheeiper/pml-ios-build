@@ -61,7 +61,7 @@ public struct TelegramNativeDialog: Identifiable, Codable, Hashable {
     public let pinned: Bool?
     public let folderIds: [Int]?
     public let username: String?
-    public let unreadCount: Int?
+    public var unreadCount: Int?
     public let lastMessage: String?
     public let date: String?
 

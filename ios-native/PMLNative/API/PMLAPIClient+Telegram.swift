@@ -165,4 +165,31 @@ extension PMLAPIClient {
         components.path = "/api/telegram-user-thumb/\(chatId)/\(messageId)"
         return components.url
     }
+
+    struct TelegramReadAckResponse: Decodable {
+        let ok: Bool
+        let chatId: Int64?
+        let maxId: Int64?
+        let error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case ok, error
+            case chatId = "chat_id"
+            case maxId = "max_id"
+        }
+    }
+
+    /// 一键将指定频道/会话标记为已读（同步官方 Telegram 服务器）
+    @discardableResult
+    func telegramUserMarkRead(chatId: Int64, maxId: Int64? = nil) async throws -> Bool {
+        var args: [String: Any] = ["chat_id": chatId]
+        if let maxId {
+            args["max_id"] = maxId
+        }
+        let resp: TelegramReadAckResponse = try await command("telegram_user_read_acknowledge", arguments: args)
+        guard resp.ok else {
+            throw APIError.server(resp.error ?? "标记已读失败")
+        }
+        return true
+    }
 }
