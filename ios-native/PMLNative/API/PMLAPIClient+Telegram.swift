@@ -25,12 +25,25 @@ extension PMLAPIClient {
         let ok: Bool
         let chatId: Int64?
         let isSubscribed: Bool?
+        let config: TelegramNativeChannelConfig?
         let error: String?
 
         enum CodingKeys: String, CodingKey {
-            case ok, error
+            case ok, error, config
             case chatId = "chat_id"
             case isSubscribed = "is_subscribed"
+        }
+    }
+
+    struct TelegramUpdateConfigResponse: Decodable {
+        let ok: Bool
+        let chatId: Int64?
+        let config: TelegramNativeChannelConfig?
+        let error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case ok, error, config
+            case chatId = "chat_id"
         }
     }
 
@@ -67,21 +80,48 @@ extension PMLAPIClient {
         return resp.isSubscribed ?? false
     }
 
+    /// 更新频道订阅过滤配置（视频、图片、离线下载链接、评论区穿透、防广告、防重复）
+    func telegramUpdateSubscriptionConfig(chatId: Int64, config: TelegramNativeChannelConfig) async throws -> TelegramNativeChannelConfig {
+        let resp: TelegramUpdateConfigResponse = try await command("telegram_user_update_subscription", arguments: [
+            "chat_id": chatId,
+            "config": [
+                "show_videos": config.showVideos,
+                "show_photos": config.showPhotos,
+                "show_links": config.showLinks,
+                "penetrate_comments": config.penetrateComments,
+                "filter_ads": config.filterAds,
+                "filter_duplicates": config.filterDuplicates
+            ]
+        ])
+        guard resp.ok, let cfg = resp.config else {
+            throw APIError.server(resp.error ?? "更新频道配置失败")
+        }
+        return cfg
+    }
+
     /// 获取指定会话的过滤后纯净消息流
     func telegramUserMessages(
         chatId: Int64,
         offsetId: Int64 = 0,
         limit: Int = 30,
         filterAds: Bool = true,
-        filterDuplicates: Bool = true
+        filterDuplicates: Bool = true,
+        config: TelegramNativeChannelConfig? = nil
     ) async throws -> [TelegramNativeMessage] {
-        let resp: TelegramMessagesResponse = try await command("telegram_user_list_messages", arguments: [
+        var args: [String: Any] = [
             "chat_id": chatId,
             "offset_id": offsetId,
             "limit": limit,
             "filter_ads": filterAds,
             "filter_duplicates": filterDuplicates
-        ])
+        ]
+        if let config = config {
+            args["show_videos"] = config.showVideos
+            args["show_photos"] = config.showPhotos
+            args["show_links"] = config.showLinks
+            args["penetrate_comments"] = config.penetrateComments
+        }
+        let resp: TelegramMessagesResponse = try await command("telegram_user_list_messages", arguments: args)
         guard resp.ok else {
             throw APIError.server(resp.error ?? "获取 Telegram 消息失败")
         }

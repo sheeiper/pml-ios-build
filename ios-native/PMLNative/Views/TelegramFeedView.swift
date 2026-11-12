@@ -18,6 +18,8 @@ struct TelegramFeedView: View {
     @State private var filterAds = true
     @State private var filterDuplicates = true
     @State private var showAllDialogsSheet = false
+    @State private var showChannelFilterSheet = false
+    @State private var currentConfig = TelegramNativeChannelConfig()
     
     // 播放器状态
     @State private var activeVideoTarget: VideoTarget?
@@ -49,7 +51,19 @@ struct TelegramFeedView: View {
         .navigationTitle("Telegram 订阅")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if selectedDialog != nil {
+                    Button {
+                        if let cfg = selectedDialog?.config {
+                            currentConfig = cfg
+                        }
+                        showChannelFilterSheet = true
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .accessibilityLabel("过滤设置")
+                }
+
                 Button {
                     showAllDialogsSheet = true
                 } label: {
@@ -107,6 +121,9 @@ struct TelegramFeedView: View {
         .sheet(isPresented: $showAllDialogsSheet) {
             allDialogsManagementSheet
         }
+        .sheet(isPresented: $showChannelFilterSheet) {
+            channelFilterSheet
+        }
         .task {
             await loadDialogsAndSubscriptions()
         }
@@ -123,6 +140,7 @@ struct TelegramFeedView: View {
                         let isSelected = selectedDialog?.id == d.id
                         Button {
                             selectedDialog = d
+                            currentConfig = d.config ?? TelegramNativeChannelConfig()
                             Task { await loadMessages(chatId: d.id) }
                         } label: {
                             HStack(spacing: 6) {
@@ -239,6 +257,11 @@ struct TelegramFeedView: View {
                     .lineLimit(8)
             }
 
+            // 离线下载资源盒子 (磁力/网盘/电驴 + 快速复制)
+            if let links = msg.offlineLinks, !links.isEmpty {
+                offlineLinksSection(links)
+            }
+
             // 4. 评论区穿透资源盒子 (正片/网盘)
             if let replies = msg.repliesResources, !replies.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -284,6 +307,107 @@ struct TelegramFeedView: View {
         }
         .padding(14)
         .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    // MARK: - 离线下载资源列表卡片
+    private func offlineLinksSection(_ links: [TelegramNativeOfflineLink]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.subheadline)
+                    .foregroundStyle(.purple)
+                Text("离线下载资源 (\(links.count))")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.purple)
+                Spacer()
+                Text("快速导入 115 / 迅雷")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach(links) { lk in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Text(linkBadgeTitle(lk.type))
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(linkBadgeColor(lk.type).opacity(0.18), in: Capsule())
+                            .foregroundStyle(linkBadgeColor(lk.type))
+
+                        if lk.source == "comment" {
+                            Text("评论区")
+                                .font(.caption2.weight(.medium))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Color.blue.opacity(0.12), in: Capsule())
+                                .foregroundStyle(.blue)
+                        }
+
+                        if let code = lk.code, !code.isEmpty {
+                            Text("提取码: \(code)")
+                                .font(.caption2.weight(.bold).monospaced())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.15), in: Capsule())
+                                .foregroundStyle(.orange)
+                        }
+                        Spacer()
+                    }
+
+                    Text(lk.name)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+
+                    Text(lk.url)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    HStack(spacing: 8) {
+                        Button {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            UIPasteboard.general.string = lk.copyText
+                            triggerToast("⚡ 已复制名称与离线链接！")
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "bolt.fill")
+                                Text("复制名称+链接")
+                            }
+                            .font(.caption.weight(.bold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.purple, in: Capsule())
+                            .foregroundStyle(.white)
+                        }
+
+                        Button {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            let linkWithCode = lk.url + (lk.code.map { " 提取码: " + $0 } ?? "")
+                            UIPasteboard.general.string = linkWithCode
+                            triggerToast("📋 已复制下载链接")
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc.on.doc")
+                                Text("仅复制链接")
+                            }
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
+                            .foregroundStyle(.primary)
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+                .padding(10)
+                .background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 10))
+            }
+        }
+        .padding(12)
+        .background(Color.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
     }
 
     // 视频卡片行（点击直调 GestureVideoPlayerSheet）
@@ -460,7 +584,114 @@ struct TelegramFeedView: View {
         }
     }
 
+    // MARK: - 频道订阅与过滤配置 Sheet
+    private var channelFilterSheet: some View {
+        NavigationStack {
+            Form {
+                if let d = selectedDialog {
+                    Section {
+                        HStack(spacing: 12) {
+                            Circle()
+                                .fill(Color.accentColor.opacity(0.18))
+                                .frame(width: 44, height: 44)
+                                .overlay {
+                                    Text(String(d.title.prefix(1)).uppercased())
+                                        .font(.headline.weight(.bold))
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(d.title)
+                                    .font(.headline)
+                                Text("ID: \(d.id) · \(d.isChannel == true ? "频道" : "群组")")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                Section("显示内容类型 (至少勾选一项)") {
+                    Toggle(isOn: $currentConfig.showVideos) {
+                        Label("🎬 视频 (Videos)", systemImage: "video.fill")
+                    }
+                    Toggle(isOn: $currentConfig.showPhotos) {
+                        Label("📷 图片 (Photos)", systemImage: "photo.fill")
+                    }
+                    Toggle(isOn: $currentConfig.showLinks) {
+                        Label("🧲 离线下载链接 (Offline Links)", systemImage: "arrow.down.circle.fill")
+                    }
+                }
+
+                Section("高级识别与过滤引擎") {
+                    Toggle(isOn: $currentConfig.penetrateComments) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("💬 开启评论区识别", systemImage: "bubble.left.and.bubble.right.fill")
+                            Text("自动穿透抓取评论区里的视频、图片和离线下载链接")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Toggle(isOn: $currentConfig.filterAds) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("🛡️ 智能防广告过滤", systemImage: "shield.fill")
+                            Text("自动过滤博彩、洗钱、黑产等垃圾广告")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Toggle(isOn: $currentConfig.filterDuplicates) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("♻️ 智能防刷屏消重", systemImage: "arrow.2.squarepath")
+                            Text("基于文本指纹与媒体哈希折叠重复推送")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("订阅过滤设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("取消") {
+                        showChannelFilterSheet = false
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("保存并应用") {
+                        Task {
+                            await saveChannelConfig()
+                        }
+                    }
+                    .bold()
+                }
+            }
+        }
+    }
+
     // MARK: - 数据请求与操作
+
+    private func saveChannelConfig() async {
+        guard let d = selectedDialog, let client = model.apiClient else { return }
+        do {
+            let updated = try await client.telegramUpdateSubscriptionConfig(chatId: d.id, config: currentConfig)
+            if let idx = dialogs.firstIndex(where: { $0.id == d.id }) {
+                dialogs[idx].config = updated
+            }
+            if let idx = subscribedDialogs.firstIndex(where: { $0.id == d.id }) {
+                subscribedDialogs[idx].config = updated
+            }
+            selectedDialog?.config = updated
+            showChannelFilterSheet = false
+            triggerToast("✅ 频道过滤设置已更新")
+            await loadMessages(chatId: d.id)
+        } catch {
+            triggerToast("保存失败: \(error.localizedDescription)")
+        }
+    }
 
     private func loadDialogsAndSubscriptions() async {
         guard let client = model.apiClient else { return }
@@ -471,6 +702,7 @@ struct TelegramFeedView: View {
             subscribedDialogs = res.dialogs.filter { $0.isSubscribed == true }
             if selectedDialog == nil, let first = subscribedDialogs.first {
                 selectedDialog = first
+                currentConfig = first.config ?? TelegramNativeChannelConfig()
                 await loadMessages(chatId: first.id)
             }
         } catch {
@@ -488,15 +720,44 @@ struct TelegramFeedView: View {
                 chatId: chatId,
                 offsetId: 0,
                 limit: 50,
-                filterAds: filterAds,
-                filterDuplicates: filterDuplicates
+                filterAds: currentConfig.filterAds,
+                filterDuplicates: currentConfig.filterDuplicates,
+                config: currentConfig
             )
-            // 时间正序或倒序（iOS 流一般倒序最新在前）
             messages = msgs
         } catch {
             errorText = error.localizedDescription
         }
         loadingMessages = false
+    }
+
+    private func linkBadgeTitle(_ type: String) -> String {
+        switch type {
+        case "magnet": return "🧲 磁力链"
+        case "115": return "📦 115网盘"
+        case "quark": return "⚡ 夸克网盘"
+        case "baidu": return "☁️ 百度网盘"
+        case "pikpak": return "🚀 PikPak"
+        case "ed2k": return "🐴 ED2K电驴"
+        case "thunder": return "⚡ 迅雷下载"
+        case "aliyun": return "📂 阿里云盘"
+        case "uc": return "🛸 UC网盘"
+        case "xunlei": return "🌩️ 迅雷云盘"
+        default: return "🔗 离线下载"
+        }
+    }
+
+    private func linkBadgeColor(_ type: String) -> Color {
+        switch type {
+        case "magnet": return .orange
+        case "115": return .red
+        case "quark": return .green
+        case "baidu": return .blue
+        case "pikpak": return .purple
+        case "ed2k": return .brown
+        case "thunder": return .yellow
+        default: return .indigo
+        }
     }
 
     private func toggleSub(_ dialog: TelegramNativeDialog) async {

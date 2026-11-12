@@ -14,6 +14,40 @@ public struct TelegramNativeFolder: Identifiable, Codable, Hashable {
     }
 }
 
+public struct TelegramNativeChannelConfig: Codable, Hashable {
+    public var showVideos: Bool
+    public var showPhotos: Bool
+    public var showLinks: Bool
+    public var penetrateComments: Bool
+    public var filterAds: Bool
+    public var filterDuplicates: Bool
+
+    public init(
+        showVideos: Bool = true,
+        showPhotos: Bool = true,
+        showLinks: Bool = true,
+        penetrateComments: Bool = true,
+        filterAds: Bool = true,
+        filterDuplicates: Bool = true
+    ) {
+        self.showVideos = showVideos
+        self.showPhotos = showPhotos
+        self.showLinks = showLinks
+        self.penetrateComments = penetrateComments
+        self.filterAds = filterAds
+        self.filterDuplicates = filterDuplicates
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case showVideos = "show_videos"
+        case showPhotos = "show_photos"
+        case showLinks = "show_links"
+        case penetrateComments = "penetrate_comments"
+        case filterAds = "filter_ads"
+        case filterDuplicates = "filter_duplicates"
+    }
+}
+
 public struct TelegramNativeDialog: Identifiable, Codable, Hashable {
     public let id: Int64
     public let title: String
@@ -22,6 +56,7 @@ public struct TelegramNativeDialog: Identifiable, Codable, Hashable {
     public let isGroup: Bool?
     public let isUser: Bool?
     public var isSubscribed: Bool?
+    public var config: TelegramNativeChannelConfig?
     public let archived: Bool?
     public let pinned: Bool?
     public let folderIds: [Int]?
@@ -31,7 +66,7 @@ public struct TelegramNativeDialog: Identifiable, Codable, Hashable {
     public let date: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, title, username, archived, pinned, date
+        case id, title, username, archived, pinned, date, config
         case isSavedMessages = "is_saved_messages"
         case isChannel = "is_channel"
         case isGroup = "is_group"
@@ -79,6 +114,21 @@ public struct TelegramNativeMediaItem: Identifiable, Codable, Hashable {
     }
 }
 
+public struct TelegramNativeOfflineLink: Identifiable, Codable, Hashable {
+    public var id: String { url }
+    public let name: String
+    public let url: String
+    public let code: String?
+    public let type: String
+    public let copyText: String
+    public let source: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, url, code, type, source
+        case copyText = "copy_text"
+    }
+}
+
 public struct TelegramNativeMessage: Identifiable, Codable, Hashable {
     public let id: Int64
     public let chatId: Int64
@@ -88,6 +138,7 @@ public struct TelegramNativeMessage: Identifiable, Codable, Hashable {
     public let hasPhoto: Bool?
     public let isVideo: Bool?
     public let video: TelegramNativeVideo?
+    public let offlineLinks: [TelegramNativeOfflineLink]?
     public let views: Int64?
     public let reactions: [TelegramNativeReaction]?
     public let replyToMsgId: Int64?
@@ -103,6 +154,7 @@ public struct TelegramNativeMessage: Identifiable, Codable, Hashable {
         case isAd = "is_ad"
         case hasPhoto = "has_photo"
         case isVideo = "is_video"
+        case offlineLinks = "offline_links"
         case replyToMsgId = "reply_to_msg_id"
         case isAlbum = "is_album"
         case albumCount = "album_count"

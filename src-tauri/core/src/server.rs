@@ -1522,6 +1522,9 @@ async fn dispatch_command(
         "telegram_user_toggle_subscription" => {
             forward_to_tg_streamer(reqwest::Method::POST, "/user/subscriptions/toggle", Some(payload)).await
         }
+        "telegram_user_update_subscription" => {
+            forward_to_tg_streamer(reqwest::Method::POST, "/user/subscriptions/update", Some(payload)).await
+        }
         "telegram_user_list_messages" => {
             let chat_id = payload.get("chat_id").and_then(Value::as_i64).or_else(|| {
                 payload.get("chat_id").and_then(Value::as_str).and_then(|s| s.parse().ok())
@@ -1530,7 +1533,19 @@ async fn dispatch_command(
             let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(30);
             let filter_ads = payload.get("filter_ads").and_then(Value::as_bool).unwrap_or(true);
             let filter_duplicates = payload.get("filter_duplicates").and_then(Value::as_bool).unwrap_or(true);
-            let path = format!("/user/messages?chat_id={chat_id}&offset_id={offset_id}&limit={limit}&filter_ads={filter_ads}&filter_duplicates={filter_duplicates}");
+            let mut path = format!("/user/messages?chat_id={chat_id}&offset_id={offset_id}&limit={limit}&filter_ads={filter_ads}&filter_duplicates={filter_duplicates}");
+            if let Some(sv) = payload.get("show_videos").and_then(Value::as_bool) {
+                path.push_str(&format!("&show_videos={sv}"));
+            }
+            if let Some(sp) = payload.get("show_photos").and_then(Value::as_bool) {
+                path.push_str(&format!("&show_photos={sp}"));
+            }
+            if let Some(sl) = payload.get("show_links").and_then(Value::as_bool) {
+                path.push_str(&format!("&show_links={sl}"));
+            }
+            if let Some(pc) = payload.get("penetrate_comments").and_then(Value::as_bool) {
+                path.push_str(&format!("&penetrate_comments={pc}"));
+            }
             forward_to_tg_streamer(reqwest::Method::GET, &path, None).await
         }
         _ => error_response(format!("不支持的 API：{command}")),
