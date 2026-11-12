@@ -947,6 +947,11 @@ struct TelegramFeedView: View {
 
     private func removeURLsFromText(_ text: String) -> String {
         var t = text
+        // 1. 解开 Markdown 链接 [标签](链接) -> 标签
+        t = t.replacingOccurrences(of: #"\x5B([^\x5D\r\n]+)\x5D\([^\)\r\n]+\)"#, with: "$1", options: .regularExpression)
+        // 2. 剥离 Markdown 格式装饰字符
+        t = t.replacingOccurrences(of: #"[`\*_~]"#, with: "", options: .regularExpression)
+        // 3. 剥离网络与离线协议链接
         t = t.replacingOccurrences(of: "https?://\\S+", with: "", options: .regularExpression)
         t = t.replacingOccurrences(of: "magnet:\\?\\S+", with: "", options: .regularExpression)
         t = t.replacingOccurrences(of: "ed2k://\\S+", with: "", options: .regularExpression)
@@ -1221,6 +1226,11 @@ struct TelegramCommentsSheet: View {
 
     private func removeURLs(_ text: String) -> String {
         var t = text
+        // 1. 解开 Markdown 链接 [标签](链接) -> 标签
+        t = t.replacingOccurrences(of: #"\x5B([^\x5D\r\n]+)\x5D\([^\)\r\n]+\)"#, with: "$1", options: .regularExpression)
+        // 2. 剥离 Markdown 格式装饰字符
+        t = t.replacingOccurrences(of: #"[`\*_~]"#, with: "", options: .regularExpression)
+        // 3. 剥离网络与离线协议链接
         t = t.replacingOccurrences(of: "https?://\\S+", with: "", options: .regularExpression)
         t = t.replacingOccurrences(of: "magnet:\\?\\S+", with: "", options: .regularExpression)
         t = t.replacingOccurrences(of: "ed2k://\\S+", with: "", options: .regularExpression)
