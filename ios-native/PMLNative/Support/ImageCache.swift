@@ -7,15 +7,19 @@ final class ImageCache {
 
     private let cache = NSCache<NSString, UIImage>()
     private let session: URLSession
+    private var inFlight: [String: Task<UIImage?, Never>] = [:]
     private var serverBaseURL: URL?
     private var serverAuthHeader: String?
 
     private init() {
         let configuration = URLSessionConfiguration.default
         configuration.requestCachePolicy = .returnCacheDataElseLoad
+        configuration.httpMaximumConnectionsPerHost = 8
+        configuration.timeoutIntervalForRequest = 20
         configuration.urlCache = URLCache(memoryCapacity: 64 * 1024 * 1024, diskCapacity: 512 * 1024 * 1024)
         session = URLSession(configuration: configuration)
         cache.countLimit = 400
+        cache.totalCostLimit = 160 * 1024 * 1024
     }
 
     /// 服务器模式下，服务器同源图片（漫画页/封面/大图）需要 Basic 认证。
@@ -48,24 +52,45 @@ final class ImageCache {
         return request
     }
 
-    private func key(_ url: URL, maxPixel: CGFloat?) -> NSString {
-        "\(url.absoluteString)|\(maxPixel.map { Int($0.rounded()) } ?? 0)" as NSString
+    private func keyString(_ url: URL, maxPixel: CGFloat?) -> String {
+        "\(url.absoluteString)|\(maxPixel.map { Int($0.rounded()) } ?? 0)"
     }
 
     func cached(_ url: URL, maxPixel: CGFloat? = nil) -> UIImage? {
-        cache.object(forKey: key(url, maxPixel: maxPixel))
+        cache.object(forKey: keyString(url, maxPixel: maxPixel) as NSString)
     }
 
     func image(for url: URL, maxPixel: CGFloat? = nil) async -> UIImage? {
-        if let cached = cached(url, maxPixel: maxPixel) { return cached }
-        do {
-            let (data, _) = try await session.data(for: makeRequest(url))
-            guard let image = Self.decode(data, maxPixel: maxPixel) else { return nil }
-            cache.setObject(image, forKey: key(url, maxPixel: maxPixel))
-            return image
-        } catch {
-            return nil
+        let k = keyString(url, maxPixel: maxPixel)
+        if let hit = cache.object(forKey: k as NSString) { return hit }
+        if let existing = inFlight[k] {
+            return await existing.value
         }
+
+        let request = makeRequest(url)
+        let session = self.session
+        let task = Task<UIImage?, Never> {
+            do {
+                let (data, response) = try await session.data(for: request)
+                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    return nil
+                }
+                return await Task.detached(priority: .userInitiated) {
+                    Self.decodeOffMain(data, maxPixel: maxPixel)
+                }.value
+            } catch {
+                return nil
+            }
+        }
+        inFlight[k] = task
+        let loaded = await task.value
+        inFlight.removeValue(forKey: k)
+
+        if let loaded {
+            let cost = Int(loaded.size.width * loaded.size.height * loaded.scale * loaded.scale * 4)
+            cache.setObject(loaded, forKey: k as NSString, cost: max(1, cost))
+        }
+        return loaded
     }
 
     /// 先查内存缓存，未命中再走网络。`maxPixel` 用于浏览大图时降采样，避免 SwiftUI 缩放卡顿。
@@ -74,24 +99,27 @@ final class ImageCache {
         return await image(for: url, maxPixel: maxPixel)
     }
 
-    private static func decode(_ data: Data, maxPixel: CGFloat?) -> UIImage? {
-        guard let maxPixel, maxPixel > 0 else { return UIImage(data: data) }
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-            return UIImage(data: data)
+    nonisolated static func decodeOffMain(_ data: Data, maxPixel: CGFloat?) -> UIImage? {
+        guard !data.isEmpty else { return nil }
+        if let maxPixel, maxPixel > 0,
+           let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            ]
+            if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                let img = UIImage(cgImage: cgImage)
+                return img.preparingForDisplay() ?? img
+            }
         }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-        ]
-        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return UIImage(data: data)
-        }
-        return UIImage(cgImage: cgImage)
+        guard let img = UIImage(data: data) else { return nil }
+        return img.preparingForDisplay() ?? img
     }
 }
 
-func pmlDownscaledJPEG(_ image: UIImage, maxPixel: CGFloat = 480, quality: CGFloat = 0.82) -> Data? {
+nonisolated func pmlDownscaledJPEG(_ image: UIImage, maxPixel: CGFloat = 480, quality: CGFloat = 0.82) -> Data? {
     let longest = max(image.size.width, image.size.height)
     guard longest > 0 else { return image.jpegData(compressionQuality: quality) }
     let scale = min(1, maxPixel / longest)

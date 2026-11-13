@@ -62,6 +62,7 @@ public struct TelegramNativeDialog: Identifiable, Codable, Hashable {
     public let folderIds: [Int]?
     public let username: String?
     public var unreadCount: Int?
+    public let readInboxMaxId: Int64?
     public let lastMessage: String?
     public let date: String?
 
@@ -74,6 +75,7 @@ public struct TelegramNativeDialog: Identifiable, Codable, Hashable {
         case isSubscribed = "is_subscribed"
         case folderIds = "folder_ids"
         case unreadCount = "unread_count"
+        case readInboxMaxId = "read_inbox_max_id"
         case lastMessage = "last_message"
     }
 }
@@ -150,6 +152,7 @@ public struct TelegramNativeMessage: Identifiable, Codable, Hashable {
     public let repliesResources: [TelegramNativeMessage]?
     public let repliesCount: Int?
     public let isDuplicate: Bool?
+    public var isUnread: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id, date, text, video, views, reactions
@@ -165,6 +168,7 @@ public struct TelegramNativeMessage: Identifiable, Codable, Hashable {
         case repliesResources = "replies_resources"
         case repliesCount = "replies_count"
         case isDuplicate = "is_duplicate"
+        case isUnread = "is_unread"
     }
 }
 

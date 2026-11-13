@@ -306,17 +306,31 @@ struct DomainBrowserView: View {
         return folders + files
     }
 
-    private static func modifiedDate(_ raw: String?) -> Date {
-        guard let raw, !raw.isEmpty else { return .distantPast }
+    private static let isoFractional: ISO8601DateFormatter = {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = iso.date(from: raw) { return date }
+        return iso
+    }()
+
+    private static let isoPlain: ISO8601DateFormatter = {
+        let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
-        if let date = iso.date(from: raw) { return date }
+        return iso
+    }()
+
+    private static let rfcFormatter: DateFormatter = {
         let rfc = DateFormatter()
         rfc.locale = Locale(identifier: "en_US_POSIX")
         rfc.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        return rfc.date(from: raw) ?? .distantPast
+        return rfc
+    }()
+
+    private static func modifiedDate(_ raw: String?) -> Date {
+        guard let raw, !raw.isEmpty else { return .distantPast }
+        if let date = isoFractional.date(from: raw) ?? isoPlain.date(from: raw) {
+            return date
+        }
+        return rfcFormatter.date(from: raw) ?? .distantPast
     }
 
     private var listView: some View {

@@ -62,36 +62,15 @@ struct DirectoryView: View {
     @State private var folderComic: ComicFolderTarget?
     @State private var showRemoteSearch = false
 
-    @ObservedObject private var thumbs = ThumbnailService.shared
-
-    /// Sort locally so name order follows the system locale (拼音/自然数字) and
-    /// switching sort takes effect immediately, instead of waiting for a reload.
-    private var sortedEntries: [RemoteBrowserEntry] {
-        entries.sorted { left, right in
-            if left.isDirectory != right.isDirectory { return left.isDirectory }
-            switch sort {
-            case .name:
-                break
-            case .newest:
-                let l = modifiedDate(left.modifiedAt) ?? .distantPast
-                let r = modifiedDate(right.modifiedAt) ?? .distantPast
-                if l != r { return l > r }
-            case .size:
-                if left.sizeBytes != right.sizeBytes { return left.sizeBytes > right.sizeBytes }
-            }
-            let ordered = left.name.localizedStandardCompare(right.name)
-            if ordered == .orderedSame {
-                return left.path < right.path
-            }
-            return ordered == .orderedAscending
-        }
-    }
-
-    private var visibleEntries: [RemoteBrowserEntry] {
-        let sorted = sortedEntries
-        guard !searchText.isEmpty else { return sorted }
-        return sorted.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-    }
+    // 预计算与缓存的衍生状态，彻底消除每次视图刷新重复执行 O(N log N) 排序与 DateFormatter 解析
+    @State private var cachedSortedEntries: [RemoteBrowserEntry] = []
+    @State private var visibleEntries: [RemoteBrowserEntry] = []
+    @State private var parsedTimestampByPath: [String: TimeInterval] = [:]
+    @State private var formattedMetaByPath: [String: String] = [:]
+    @State private var cachedPlayableVideos: [RemoteBrowserEntry] = []
+    @State private var cachedResumeVideo: RemoteBrowserEntry?
+    @State private var cachedFolderCoverId: String?
+    @State private var cachedFolderMeta: String = "0 个文件"
 
     private var imageEntries: [RemoteBrowserEntry] {
         visibleEntries.filter { $0.isImage }
@@ -118,6 +97,9 @@ struct DirectoryView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索当前目录")
+        .onChange(of: searchText) { _, _ in
+            applySearchFilter()
+        }
         .refreshable { await reload(force: true) }
         .task { await bootstrap() }
         .toolbar {
@@ -156,7 +138,7 @@ struct DirectoryView: View {
                     }
                     .onChange(of: sort) { _, newValue in
                         BrowsePreferences.shared.setSort(newValue, rootId: root.id, path: path)
-                        Task { await reload(force: false) }
+                        recomputeEntries(resetDates: false)
                     }
                     .photosPicker(isPresented: $showCoverPicker, selection: $coverItem, matching: .images)
                     .onChange(of: coverItem) { _, item in
@@ -249,11 +231,7 @@ struct DirectoryView: View {
         ZStack {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(.quaternary.opacity(0.35))
-            if let id = folderCoverId, let image = thumbs.images[id] {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
+            AssetThumbnailView(assetId: cachedFolderCoverId, contentMode: .fill) {
                 Image(systemName: root.kind == "comics" ? "book.closed.fill" : "folder.fill")
                     .font(.title2)
                     .foregroundStyle(.tint)
@@ -261,34 +239,22 @@ struct DirectoryView: View {
         }
         .frame(width: 92, height: 128)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .task(id: folderCoverId) {
-            guard let id = folderCoverId else { return }
-            await thumbs.image(assetId: id, client: model.apiClient)
-        }
     }
 
     private var playableVideos: [RemoteBrowserEntry] {
-        visibleEntries.filter { $0.isVideo && $0.assetId != nil }
+        cachedPlayableVideos
     }
 
     private var resumeVideo: RemoteBrowserEntry? {
-        playableVideos.filter { ($0.progressSeconds ?? 0) > 2 }
-            .max { ($0.progressSeconds ?? 0) < ($1.progressSeconds ?? 0) }
+        cachedResumeVideo
     }
 
     private var folderCoverId: String? {
-        visibleEntries.compactMap(\.coverAssetId).first
-            ?? visibleEntries.first(where: { !$0.isDirectory })?.assetId
+        cachedFolderCoverId
     }
 
     private var folderMeta: String {
-        let folders = visibleEntries.filter(\.isDirectory).count
-        let files = visibleEntries.filter { !$0.isDirectory }.count
-        let time = visibleEntries.compactMap { modifiedDate($0.modifiedAt) }.max()
-        var parts = ["\(files) 个文件"]
-        if folders > 0 { parts.append("\(folders) 个文件夹") }
-        if let time { parts.append(DirectoryView.modifiedDisplay.string(from: time)) }
-        return parts.joined(separator: " · ")
+        cachedFolderMeta
     }
 
     private func playFolder() async {
@@ -549,23 +515,15 @@ struct DirectoryView: View {
         ZStack {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(.quaternary.opacity(0.3))
-            if let id = thumbId, let image = thumbs.images[id] {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
+            AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
                 Image(systemName: symbol(for: entry))
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(.tint)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
-        .task(id: thumbId) {
-            guard let id = thumbId else { return }
-            await thumbs.image(assetId: id, client: model.apiClient)
-        }
     }
 
     @ViewBuilder
@@ -630,11 +588,7 @@ struct DirectoryView: View {
         ZStack {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(.quaternary.opacity(0.3))
-            if let id = thumbId, let image = thumbs.images[id] {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
+            AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
                 Image(systemName: symbol(for: entry))
                     .font(.system(size: max(14, size * 0.34), weight: .semibold))
                     .foregroundStyle(.tint)
@@ -642,13 +596,96 @@ struct DirectoryView: View {
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .task(id: thumbId) {
-            guard let id = thumbId else { return }
-            await thumbs.image(assetId: id, client: model.apiClient)
-        }
     }
 
-    // MARK: - 数据
+    // MARK: - 数据与预计算缓存
+
+    @MainActor
+    private func recomputeEntries(resetDates: Bool) {
+        var timestamps = resetDates ? [:] : parsedTimestampByPath
+        var metas = resetDates ? [:] : formattedMetaByPath
+
+        for entry in entries {
+            if timestamps[entry.path] == nil {
+                if let date = modifiedDate(entry.modifiedAt) {
+                    timestamps[entry.path] = date.timeIntervalSince1970
+                    let timeStr = DirectoryView.modifiedDisplay.string(from: date)
+                    if entry.isDirectory {
+                        metas[entry.path] = timeStr
+                    } else {
+                        metas[entry.path] = "\(pmlFormatBytes(entry.sizeBytes)) · \(timeStr)"
+                    }
+                } else {
+                    timestamps[entry.path] = -Double.greatestFiniteMagnitude
+                    metas[entry.path] = entry.isDirectory ? "文件夹" : pmlFormatBytes(entry.sizeBytes)
+                }
+            }
+        }
+        parsedTimestampByPath = timestamps
+        formattedMetaByPath = metas
+
+        let currentSort = sort
+        cachedSortedEntries = entries.sorted { left, right in
+            if left.isDirectory != right.isDirectory { return left.isDirectory }
+            switch currentSort {
+            case .name:
+                break
+            case .newest:
+                let l = timestamps[left.path] ?? -Double.greatestFiniteMagnitude
+                let r = timestamps[right.path] ?? -Double.greatestFiniteMagnitude
+                if l != r { return l > r }
+            case .size:
+                if left.sizeBytes != right.sizeBytes { return left.sizeBytes > right.sizeBytes }
+            }
+            let ordered = left.name.localizedStandardCompare(right.name)
+            if ordered == .orderedSame {
+                return left.path < right.path
+            }
+            return ordered == .orderedAscending
+        }
+        applySearchFilter()
+    }
+
+    @MainActor
+    private func applySearchFilter() {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentVisible: [RemoteBrowserEntry]
+        if trimmed.isEmpty {
+            currentVisible = cachedSortedEntries
+        } else {
+            currentVisible = cachedSortedEntries.filter { $0.name.localizedCaseInsensitiveContains(trimmed) }
+        }
+        visibleEntries = currentVisible
+
+        let videos = currentVisible.filter { $0.isVideo && $0.assetId != nil }
+        cachedPlayableVideos = videos
+        cachedResumeVideo = videos
+            .filter { ($0.progressSeconds ?? 0) > 2 }
+            .max { ($0.progressSeconds ?? 0) < ($1.progressSeconds ?? 0) }
+        cachedFolderCoverId = currentVisible.compactMap(\.coverAssetId).first
+            ?? currentVisible.first(where: { !$0.isDirectory })?.assetId
+
+        var folderCount = 0
+        var fileCount = 0
+        var maxTimestamp: TimeInterval = -Double.greatestFiniteMagnitude
+        for entry in currentVisible {
+            if entry.isDirectory {
+                folderCount += 1
+            } else {
+                fileCount += 1
+            }
+            if let ts = parsedTimestampByPath[entry.path], ts > maxTimestamp {
+                maxTimestamp = ts
+            }
+        }
+        var parts = ["\(fileCount) 个文件"]
+        if folderCount > 0 { parts.append("\(folderCount) 个文件夹") }
+        if maxTimestamp > -Double.greatestFiniteMagnitude / 2 {
+            let latestDate = Date(timeIntervalSince1970: maxTimestamp)
+            parts.append(DirectoryView.modifiedDisplay.string(from: latestDate))
+        }
+        cachedFolderMeta = parts.joined(separator: " · ")
+    }
 
     private func bootstrap() async {
         layout = BrowsePreferences.shared.layout(rootId: root.id, path: path)
@@ -684,11 +721,8 @@ struct DirectoryView: View {
         errorText = ""
         do {
             if let domain, force {
-                // Do not hide provider failures behind a cached child listing.
                 _ = try await client.refreshDomainPath(domain: domain, path: path)
             }
-            // Use the compatibility DTO in both routes so directory covers,
-            // thumbnails, duration and progress survive domain navigation too.
             let page = try await client.remoteChildren(
                 rootId: root.id,
                 path: path,
@@ -699,10 +733,11 @@ struct DirectoryView: View {
             nextCursor = page.nextCursor
             if force {
                 for id in page.items.compactMap({ $0.assetId ?? $0.coverAssetId }) {
-                    thumbs.forget(assetId: id)
+                    ThumbnailService.shared.forget(assetId: id)
                 }
             }
-            prefetchThumbnails(page.items)
+            recomputeEntries(resetDates: true)
+            prefetchThumbnails(visibleEntries)
             if !force && entries.isEmpty && nextCursor == nil && !autoRefreshed {
                 autoRefreshed = true
                 let fresh = try await client.remoteChildren(
@@ -713,6 +748,8 @@ struct DirectoryView: View {
                 )
                 entries = fresh.items
                 nextCursor = fresh.nextCursor
+                recomputeEntries(resetDates: true)
+                prefetchThumbnails(visibleEntries)
             }
             loading = false
         } catch {
@@ -721,7 +758,6 @@ struct DirectoryView: View {
                 return
             }
             let message = error.localizedDescription
-            // 会话在后台可能失效：自动重连后重试一次。
             if !retried && (message.contains("尚未连接") || message.contains("未连接")) {
                 _ = try? await client.restoreConnection()
                 loading = false
@@ -735,9 +771,9 @@ struct DirectoryView: View {
 
     @MainActor
     private func prefetchThumbnails(_ items: [RemoteBrowserEntry]) {
-        let ids = items.prefix(24).compactMap { $0.assetId ?? $0.coverAssetId }
+        let ids = items.prefix(12).compactMap { $0.assetId ?? $0.coverAssetId }
         guard !ids.isEmpty else { return }
-        thumbs.prefetch(assetIds: Array(ids), client: model.apiClient)
+        ThumbnailService.shared.prefetch(assetIds: Array(ids), client: model.apiClient)
     }
 
     private func loadMore(cursor: String) async {
@@ -752,6 +788,7 @@ struct DirectoryView: View {
             )
             entries.append(contentsOf: page.items)
             nextCursor = page.nextCursor
+            recomputeEntries(resetDates: false)
             prefetchThumbnails(page.items)
         } catch {
             if !pmlIsCancellation(error) {
@@ -762,7 +799,7 @@ struct DirectoryView: View {
     }
 
     private func open(_ entry: RemoteBrowserEntry) async {
-        guard let client = model.apiClient else { return }
+        guard model.apiClient != nil else { return }
         guard let assetId = entry.assetId else {
             errorText = "该文件没有可预览的索引资源"
             return
@@ -783,28 +820,24 @@ struct DirectoryView: View {
             }
             return
         }
-        do {
-            guard let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else {
-                errorText = "无法获取播放地址"
-                return
-            }
-            let videos = visibleEntries.filter { $0.isVideo && $0.assetId != nil }
-            videoPlaylist = videos.map {
-                VideoPlaylistItem(id: $0.id, title: $0.name, assetId: $0.assetId, remotePath: $0.path)
-            }
-            videoPlaylistIndex = videos.firstIndex(where: { $0.id == entry.id })
-            preview = PreviewItem(
-                url: source.url,
-                isVideo: entry.isVideo,
-                assetId: assetId,
-                title: entry.name,
-                fallbackURL: source.fallbackURL,
-                sourceLabel: source.label,
-                remotePath: entry.path
-            )
-        } catch {
-            errorText = error.localizedDescription
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else {
+            errorText = "无法获取播放地址"
+            return
         }
+        let videos = cachedPlayableVideos
+        videoPlaylist = videos.map {
+            VideoPlaylistItem(id: $0.id, title: $0.name, assetId: $0.assetId, remotePath: $0.path)
+        }
+        videoPlaylistIndex = videos.firstIndex(where: { $0.id == entry.id })
+        preview = PreviewItem(
+            url: source.url,
+            isVideo: entry.isVideo,
+            assetId: assetId,
+            title: entry.name,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: entry.path
+        )
     }
 
     // MARK: - 展示辅助
@@ -822,13 +855,13 @@ struct DirectoryView: View {
     }
 
     private func metaLine(_ entry: RemoteBrowserEntry) -> String {
-        let time = formattedModified(entry.modifiedAt)
-        if entry.isDirectory {
-            return time ?? "文件夹"
+        if let cached = formattedMetaByPath[entry.path] {
+            return cached
         }
-        let size = pmlFormatBytes(entry.sizeBytes)
-        if let time { return "\(size) · \(time)" }
-        return size
+        if entry.isDirectory {
+            return "文件夹"
+        }
+        return pmlFormatBytes(entry.sizeBytes)
     }
 
     private func formattedModified(_ raw: String?) -> String? {

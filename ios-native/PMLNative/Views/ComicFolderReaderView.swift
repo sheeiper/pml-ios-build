@@ -89,12 +89,15 @@ struct ComicFolderReaderView: View {
             .task { await load() }
             .task(id: currentPage) {
                 guard !pages.isEmpty else { return }
-                for offset in 1...2 {
+                for offset in [1, 2, 3, -1] {
                     let index = currentPage + offset
                     guard pages.indices.contains(index) else { continue }
-                    await ensureURL(pages[index])
-                    if let url = urls[pages[index].path] {
-                        _ = await ImageCache.shared.cachedOrLoad(url, maxPixel: 1600)
+                    let entry = pages[index]
+                    await ensureURL(entry)
+                    if let url = resolvedURL(for: entry) {
+                        Task {
+                            _ = await ImageCache.shared.cachedOrLoad(url, maxPixel: 1600)
+                        }
                     }
                 }
             }
@@ -171,10 +174,15 @@ struct ComicFolderReaderView: View {
         [start, start + 1].filter { $0 < pages.count }
     }
 
+    private func resolvedURL(for entry: RemoteBrowserEntry) -> URL? {
+        if let cached = urls[entry.path] { return cached }
+        return model.alistDirectURL(remotePath: entry.path)
+    }
+
     @ViewBuilder
     private func pageView(_ entry: RemoteBrowserEntry, index: Int, updatesCursor: Bool = true) -> some View {
         Group {
-            if let url = urls[entry.path] {
+            if let url = resolvedURL(for: entry) {
                 CachedImageView(url: url, contentMode: .fit, minHeight: 320, maxPixel: 1600)
                     .frame(maxWidth: .infinity)
             } else {
@@ -218,10 +226,13 @@ struct ComicFolderReaderView: View {
     }
 
     private func ensureURL(_ entry: RemoteBrowserEntry) async {
-        guard urls[entry.path] == nil, let assetId = entry.assetId else { return }
+        guard urls[entry.path] == nil else { return }
         if let direct = model.alistDirectURL(remotePath: entry.path) {
             urls[entry.path] = direct
-        } else if let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) {
+            return
+        }
+        guard let assetId = entry.assetId else { return }
+        if let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) {
             urls[entry.path] = source.url
         }
     }

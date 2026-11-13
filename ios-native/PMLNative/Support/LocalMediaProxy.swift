@@ -1,39 +1,114 @@
 import Foundation
 import Network
 
-/// 最小 App 内视频代理：AVPlayer 只访问 127.0.0.1。
-/// 代理跟随 AList `/d` 的 302 并转发 Range。链接过期只重试原始 `/d`，不回退服务器。
+/// 高性能 App 内直连媒体代理：
+/// 1. 共享单 URLSession 连接池，复用 TCP/TLS 连接，告别每次拖动进度条重新握手；
+/// 2. 自动缓存 AList `/d` 302 重定向后的真实 CDN 直链（过期/403 自动重取），省去每次 Range 探测的 302 往返；
+/// 3. 监听 AVPlayer 断开事件（FIN/RST 与发送失败），毫秒级取消上游下载任务，杜绝后台僵尸流占满连接数；
+/// 4. 纯异步背压控制（移除 15s DispatchSemaphore 阻塞），彻底解决连续拖动进度条或看几个视频后卡死的问题。
 final class LocalMediaProxy: NSObject {
     static let shared = LocalMediaProxy()
 
-    private struct Stream {
+    fileprivate final class StreamEntry {
+        let token: String
         let direct: URL
-        let fallback: URL?
-        let fallbackHeaders: [String: String]
+        var resolvedURL: URL?
+        var resolvedAt: Date?
+        var lastAccess: Date = Date()
+
+        init(token: String, direct: URL) {
+            self.token = token
+            self.direct = direct
+        }
     }
 
-    private let queue = DispatchQueue(label: "pml.local-proxy")
+    fileprivate let queue = DispatchQueue(label: "pml.local-proxy", qos: .userInitiated)
     private let lock = NSLock()
-    private var streams: [String: Stream] = [:]
+    private var streamsByToken: [String: StreamEntry] = [:]
+    private var tokenByDirectURL: [String: String] = [:]
     private var listener: NWListener?
     private var port: UInt16?
     private var starting = false
     private var waiters: [CheckedContinuation<UInt16?, Never>] = []
 
+    fileprivate let demux = ProxySessionDemux()
+    fileprivate lazy var upstreamSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 3600
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpMaximumConnectionsPerHost = 8
+        config.waitsForConnectivity = false
+        let delegateQueue = OperationQueue()
+        delegateQueue.name = "pml.local-proxy.upstream"
+        delegateQueue.maxConcurrentOperationCount = 8
+        delegateQueue.qualityOfService = .userInitiated
+        return URLSession(configuration: config, delegate: demux, delegateQueue: delegateQueue)
+    }()
+
     private override init() { super.init() }
 
     func register(directURL: URL) async -> URL? {
         guard let port = await ensureStarted() else { return nil }
-        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let key = directURL.absoluteString
+        let token: String
         lock.lock()
-        streams[token] = Stream(direct: directURL, fallback: nil, fallbackHeaders: [:])
+        if let existing = tokenByDirectURL[key], let entry = streamsByToken[existing] {
+            entry.lastAccess = Date()
+            token = existing
+        } else {
+            let newToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            let entry = StreamEntry(token: newToken, direct: directURL)
+            streamsByToken[newToken] = entry
+            tokenByDirectURL[key] = newToken
+            token = newToken
+            pruneStreamsLocked()
+        }
         lock.unlock()
         let ext = directURL.pathExtension.isEmpty ? "mp4" : directURL.pathExtension
         return URL(string: "http://127.0.0.1:\(port)/p/\(token).\(ext)")
     }
 
+    private func pruneStreamsLocked() {
+        guard streamsByToken.count > 96 else { return }
+        let sorted = streamsByToken.values.sorted { $0.lastAccess < $1.lastAccess }
+        for victim in sorted.prefix(streamsByToken.count - 64) {
+            streamsByToken.removeValue(forKey: victim.token)
+            tokenByDirectURL.removeValue(forKey: victim.direct.absoluteString)
+        }
+    }
+
+    fileprivate func cachedTargetURL(for entry: StreamEntry) -> (url: URL, isCachedRedirect: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        entry.lastAccess = Date()
+        if let resolved = entry.resolvedURL,
+           let at = entry.resolvedAt,
+           Date().timeIntervalSince(at) < 480 {
+            return (resolved, true)
+        }
+        return (entry.direct, false)
+    }
+
+    fileprivate func updateResolvedURL(_ url: URL?, for entry: StreamEntry) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let url, url != entry.direct {
+            entry.resolvedURL = url
+            entry.resolvedAt = Date()
+        } else if url == nil {
+            entry.resolvedURL = nil
+            entry.resolvedAt = nil
+        }
+    }
+
     private func ensureStarted() async -> UInt16? {
-        if let port { return port }
+        lock.lock()
+        if let port {
+            lock.unlock()
+            return port
+        }
+        lock.unlock()
         return await withCheckedContinuation { continuation in
             lock.lock()
             if let port {
@@ -52,6 +127,9 @@ final class LocalMediaProxy: NSObject {
     private func startListener() {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
+        if let tcpOptions = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcpOptions.noDelay = true
+        }
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
         do {
             let listener = try NWListener(using: parameters, on: .any)
@@ -87,12 +165,14 @@ final class LocalMediaProxy: NSObject {
         for waiter in currentWaiters { waiter.resume(returning: currentPort) }
     }
 
-    private func stream(for path: String) -> Stream? {
+    private func streamEntry(for path: String) -> StreamEntry? {
         guard let token = path.split(separator: "/").last.map(String.init) else { return nil }
         let stem = token.split(separator: ".").first.map(String.init) ?? token
         lock.lock()
         defer { lock.unlock() }
-        return streams[stem]
+        let entry = streamsByToken[stem]
+        entry?.lastAccess = Date()
+        return entry
     }
 
     private func accept(_ connection: NWConnection) {
@@ -130,7 +210,7 @@ final class LocalMediaProxy: NSObject {
             respond(connection, status: "405 Method Not Allowed", headers: [:], body: Data())
             return
         }
-        guard let stream = stream(for: path) else {
+        guard let entry = streamEntry(for: path) else {
             respond(connection, status: "404 Not Found", headers: ["Content-Type": "text/plain"], body: Data("not found".utf8))
             return
         }
@@ -144,8 +224,9 @@ final class LocalMediaProxy: NSObject {
             if name == "if-range" { ifRange = value }
         }
         let transfer = ProxyTransfer(
+            proxy: self,
             connection: connection,
-            stream: box(for: stream),
+            entry: entry,
             method: method,
             range: range,
             ifRange: ifRange
@@ -163,22 +244,88 @@ final class LocalMediaProxy: NSObject {
     }
 }
 
-private final class ProxyTransfer: NSObject, URLSessionDataDelegate {
+/// 共享 URLSession 的任务分发器，避免每次 Range 请求创建独立 URLSession。
+fileprivate final class ProxySessionDemux: NSObject, URLSessionDataDelegate {
+    private let lock = NSLock()
+    private var transfers: [Int: ProxyTransfer] = [:]
+
+    func register(_ transfer: ProxyTransfer, for taskIdentifier: Int) {
+        lock.lock()
+        transfers[taskIdentifier] = transfer
+        lock.unlock()
+    }
+
+    func unregister(taskIdentifier: Int) {
+        lock.lock()
+        transfers.removeValue(forKey: taskIdentifier)
+        lock.unlock()
+    }
+
+    private func transfer(for task: URLSessionTask) -> ProxyTransfer? {
+        lock.lock()
+        defer { lock.unlock() }
+        return transfers[task.taskIdentifier]
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let transfer = transfer(for: dataTask) else {
+            completionHandler(.cancel)
+            return
+        }
+        transfer.handleResponse(dataTask: dataTask, response: response, completionHandler: completionHandler)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let transfer = transfer(for: dataTask) else {
+            dataTask.cancel()
+            return
+        }
+        transfer.handleData(dataTask: dataTask, data: data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let current = transfer(for: task)
+        unregister(taskIdentifier: task.taskIdentifier)
+        current?.handleComplete(task: task, error: error)
+    }
+}
+
+fileprivate final class ProxyTransfer: NSObject {
+    private weak var proxy: LocalMediaProxy?
     private let connection: NWConnection
-    private let stream: LocalMediaProxyStreamBox
+    private let entry: LocalMediaProxy.StreamEntry
     private let method: String
     private let range: String?
     private let ifRange: String?
-    private var session: URLSession?
+
+    private let stateLock = NSLock()
     private var task: URLSessionDataTask?
-    private var usedFallback = false
+    private var usedCachedRedirect = false
     private var retriedDirect = false
     private var sentHeaders = false
     private var completed = false
+    private var suspended = false
+    private var queuedBytes = 0
 
-    init(connection: NWConnection, stream: LocalMediaProxyStreamBox, method: String, range: String?, ifRange: String?) {
+    private static let highWaterMark = 1_572_864 // 1.5 MB
+    private static let lowWaterMark = 524_288    // 512 KB
+
+    init(
+        proxy: LocalMediaProxy,
+        connection: NWConnection,
+        entry: LocalMediaProxy.StreamEntry,
+        method: String,
+        range: String?,
+        ifRange: String?
+    ) {
+        self.proxy = proxy
         self.connection = connection
-        self.stream = stream
+        self.entry = entry
         self.method = method
         self.range = range
         self.ifRange = ifRange
@@ -186,117 +333,279 @@ private final class ProxyTransfer: NSObject, URLSessionDataDelegate {
     }
 
     func start() {
-        request(url: stream.direct, headers: [:])
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.abortTransfer()
+            default:
+                break
+            }
+        }
+        watchClientDisconnect()
+
+        guard let proxy else {
+            abortTransfer()
+            return
+        }
+        let target = proxy.cachedTargetURL(for: entry)
+        usedCachedRedirect = target.isCachedRedirect
+        startUpstream(url: target.url)
     }
 
-    private func request(url: URL, headers: [String: String]) {
+    /// 监听 AVPlayer 主动关闭连接（例如拖动进度条放弃旧 Range 时发送 FIN）。
+    private func watchClientDisconnect() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] _, _, isComplete, error in
+            guard let self else { return }
+            if isComplete || error != nil {
+                self.abortTransfer()
+            }
+        }
+    }
+
+    private func startUpstream(url: URL) {
+        guard let proxy else {
+            abortTransfer()
+            return
+        }
+        stateLock.lock()
+        guard !completed else {
+            stateLock.unlock()
+            return
+        }
+        stateLock.unlock()
+
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = 30
+        request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if let range { request.setValue(range, forHTTPHeaderField: "Range") }
         if let ifRange { request.setValue(ifRange, forHTTPHeaderField: "If-Range") }
-        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
 
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 3600
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-        self.session = session
-        let task = session.dataTask(with: request)
-        self.task = task
-        task.resume()
+        let newTask = proxy.upstreamSession.dataTask(with: request)
+        stateLock.lock()
+        if let old = task {
+            proxy.demux.unregister(taskIdentifier: old.taskIdentifier)
+            old.cancel()
+        }
+        task = newTask
+        suspended = false
+        queuedBytes = 0
+        proxy.demux.register(self, for: newTask.taskIdentifier)
+        stateLock.unlock()
+
+        newTask.resume()
     }
 
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+    func handleResponse(
+        dataTask: URLSessionDataTask,
+        response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        stateLock.lock()
+        if completed {
+            stateLock.unlock()
+            completionHandler(.cancel)
+            return
+        }
+        stateLock.unlock()
+
         guard let http = response as? HTTPURLResponse else {
             completionHandler(.cancel)
             fail()
             return
         }
-        if !retriedDirect, [403, 410].contains(http.statusCode) {
-            retriedDirect = true
-            completionHandler(.cancel)
-            session.invalidateAndCancel()
-            request(url: stream.direct, headers: [:])
-            return
-        }
-        guard http.statusCode == 200 || http.statusCode == 206 else {
+
+        // 如果缓存的 302 CDN 直链过期或返回非 200/206，自动清缓存并回退原始 AList `/d` 重取一次
+        if !(http.statusCode == 200 || http.statusCode == 206) {
+            if (usedCachedRedirect || !retriedDirect), let proxy {
+                usedCachedRedirect = false
+                retriedDirect = true
+                proxy.updateResolvedURL(nil, for: entry)
+                proxy.demux.unregister(taskIdentifier: dataTask.taskIdentifier)
+                completionHandler(.cancel)
+                startUpstream(url: entry.direct)
+                return
+            }
             completionHandler(.cancel)
             fail()
             return
         }
+
+        // 缓存 302 重定向后的最终 CDN 地址，加速后续所有 Seek Range 请求
+        if let finalURL = http.url {
+            proxy?.updateResolvedURL(finalURL, for: entry)
+        }
+
         let headers = http.allHeaderFields.reduce(into: [String: String]()) { result, item in
             if let key = item.key as? String, let value = item.value as? String {
-                result[key] = value
+                result[key.lowercased()] = value
             }
         }
         var head = "HTTP/1.1 \(http.statusCode) \(HTTPURLResponse.localizedString(forStatusCode: http.statusCode))\r\n"
         head += "Connection: close\r\n"
         head += "Accept-Ranges: bytes\r\n"
-        for name in ["Content-Type", "Content-Length", "Content-Range", "Last-Modified", "ETag"] {
-            if let value = headers[name] { head += "\(name): \(value)\r\n" }
+        let passthrough = [
+            ("content-type", "Content-Type"),
+            ("content-length", "Content-Length"),
+            ("content-range", "Content-Range"),
+            ("last-modified", "Last-Modified"),
+            ("etag", "ETag"),
+        ]
+        for (lower, canonical) in passthrough {
+            if let value = headers[lower] {
+                head += "\(canonical): \(value)\r\n"
+            }
         }
         head += "\r\n"
         let payload = Data(head.utf8)
-        connection.send(content: payload, completion: .contentProcessed { _ in })
+
+        stateLock.lock()
         sentHeaders = true
+        stateLock.unlock()
+
+        connection.send(content: payload, completion: .contentProcessed { [weak self] error in
+            if error != nil {
+                self?.abortTransfer()
+            }
+        })
         completionHandler(.allow)
-        if method == "HEAD" { finish() }
+        if method == "HEAD" {
+            finish()
+        }
     }
 
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard !completed else { return }
-        let semaphore = DispatchSemaphore(value: 0)
-        connection.send(content: data, completion: .contentProcessed { _ in semaphore.signal() })
-        _ = semaphore.wait(timeout: .now() + 15)
-    }
+    func handleData(dataTask: URLSessionDataTask, data: Data) {
+        let byteCount = data.count
+        guard byteCount > 0 else { return }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error, !sentHeaders {
-            _ = error
-            fail()
+        stateLock.lock()
+        if completed {
+            stateLock.unlock()
+            dataTask.cancel()
             return
+        }
+        queuedBytes += byteCount
+        let shouldSuspend = !suspended && queuedBytes > Self.highWaterMark
+        if shouldSuspend {
+            suspended = true
+            dataTask.suspend()
+        }
+        stateLock.unlock()
+
+        connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil {
+                self.abortTransfer()
+                return
+            }
+            self.stateLock.lock()
+            self.queuedBytes = max(0, self.queuedBytes - byteCount)
+            let shouldResume = !self.completed && self.suspended && self.queuedBytes <= Self.lowWaterMark
+            if shouldResume {
+                self.suspended = false
+                self.task?.resume()
+            }
+            self.stateLock.unlock()
+        })
+    }
+
+    func handleComplete(task completedTask: URLSessionTask, error: Error?) {
+        stateLock.lock()
+        let isCurrent = (task?.taskIdentifier == completedTask.taskIdentifier)
+        let alreadyCompleted = completed
+        let hadSentHeaders = sentHeaders
+        let canRetryDirect = !alreadyCompleted && !hadSentHeaders && (usedCachedRedirect || !retriedDirect)
+        stateLock.unlock()
+
+        guard isCurrent, !alreadyCompleted else { return }
+
+        if error != nil {
+            if canRetryDirect, let proxy {
+                usedCachedRedirect = false
+                retriedDirect = true
+                proxy.updateResolvedURL(nil, for: entry)
+                startUpstream(url: entry.direct)
+                return
+            }
+            if !hadSentHeaders {
+                fail()
+                return
+            }
         }
         finish()
     }
 
-    private func finish() {
-        guard !completed else { return }
+    fileprivate func abortTransfer() {
+        stateLock.lock()
+        guard !completed else {
+            stateLock.unlock()
+            return
+        }
         completed = true
-        session?.finishTasksAndInvalidate()
-        session = nil
-        connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
-            self.connection.cancel()
+        let currentTask = task
+        let wasSuspended = suspended
+        suspended = false
+        task = nil
+        stateLock.unlock()
+
+        if let currentTask {
+            proxy?.demux.unregister(taskIdentifier: currentTask.taskIdentifier)
+            if wasSuspended { currentTask.resume() }
+            currentTask.cancel()
+        }
+        connection.stateUpdateHandler = nil
+        connection.cancel()
+    }
+
+    private func finish() {
+        stateLock.lock()
+        guard !completed else {
+            stateLock.unlock()
+            return
+        }
+        completed = true
+        let currentTask = task
+        let wasSuspended = suspended
+        suspended = false
+        task = nil
+        stateLock.unlock()
+
+        if let currentTask {
+            proxy?.demux.unregister(taskIdentifier: currentTask.taskIdentifier)
+            if wasSuspended { currentTask.resume() }
+        }
+        connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
+            self?.connection.stateUpdateHandler = nil
+            self?.connection.cancel()
         })
     }
 
     private func fail() {
-        guard !completed else { return }
+        stateLock.lock()
+        guard !completed else {
+            stateLock.unlock()
+            return
+        }
         completed = true
-        session?.invalidateAndCancel()
-        session = nil
+        let currentTask = task
+        let wasSuspended = suspended
+        suspended = false
+        task = nil
+        stateLock.unlock()
+
+        if let currentTask {
+            proxy?.demux.unregister(taskIdentifier: currentTask.taskIdentifier)
+            if wasSuspended { currentTask.resume() }
+            currentTask.cancel()
+        }
         let body = Data("upstream failed".utf8)
-        var head = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        let head = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         var payload = Data(head.utf8)
-        head = ""
         payload.append(body)
-        connection.send(content: payload, completion: .contentProcessed { _ in self.connection.cancel() })
-    }
-}
-
-/// 暴露给 ProxyTransfer 的流配置（避免嵌套类型可见性问题）。
-struct LocalMediaProxyStreamBox {
-    let direct: URL
-    let fallback: URL?
-    let fallbackHeaders: [String: String]
-}
-
-private extension LocalMediaProxy {
-    /// Bridge private Stream to the transfer box.
-    private func box(for stream: Stream) -> LocalMediaProxyStreamBox {
-        LocalMediaProxyStreamBox(direct: stream.direct, fallback: stream.fallback, fallbackHeaders: stream.fallbackHeaders)
+        connection.send(content: payload, completion: .contentProcessed { [weak self] _ in
+            self?.connection.stateUpdateHandler = nil
+            self?.connection.cancel()
+        })
     }
 }

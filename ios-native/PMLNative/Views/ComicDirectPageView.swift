@@ -11,10 +11,15 @@ struct ComicDirectPageView: View {
     @State private var failed = false
     @State private var sourceLabel: String?
 
+    private var displayImage: UIImage? {
+        if let image { return image }
+        return ComicDirectStore.shared.cachedImage(assetId: assetId, index: page.index)
+    }
+
     var body: some View {
         Group {
-            if let image {
-                Image(uiImage: image)
+            if let current = displayImage {
+                Image(uiImage: current)
                     .resizable()
                     .scaledToFit()
                     .frame(maxWidth: .infinity)

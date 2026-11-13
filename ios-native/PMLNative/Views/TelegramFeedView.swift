@@ -182,8 +182,16 @@ struct TelegramFeedView: View {
                                     .fill(isSelected ? Color.white : Color.accentColor)
                                     .frame(width: 8, height: 8)
                                 Text(d.title)
-                                    .font(.subheadline.weight(isSelected ? .bold : .medium))
+                                    .font(.subheadline.weight(isSelected ? .bold : ((d.unreadCount ?? 0) > 0 ? .bold : .medium)))
                                     .lineLimit(1)
+                                if let unread = d.unreadCount, unread > 0 {
+                                    Text("\(unread)")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(isSelected ? Color.white : Color.blue, in: Capsule())
+                                        .foregroundStyle(isSelected ? Color.accentColor : Color.white)
+                                }
                             }
                             .padding(.horizontal, 14)
                             .padding(.vertical, 8)
@@ -254,6 +262,10 @@ struct TelegramFeedView: View {
                             }
 
                             ForEach(messages) { msg in
+                                if msg.id == firstUnreadMsgId {
+                                    unreadDividerView
+                                        .id("UNREAD_DIVIDER_ANCHOR")
+                                }
                                 messageCard(msg)
                                     .id(msg.id)
                             }
@@ -313,6 +325,14 @@ struct TelegramFeedView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if msg.isUnread == true {
+                    Text("NEW 未读")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.blue)
+                }
                 if msg.isAlbum == true, let count = msg.albumCount {
                     Text("🎞️ 合集 \(count) 项")
                         .font(.caption2.weight(.bold))
@@ -385,7 +405,14 @@ struct TelegramFeedView: View {
             }
         }
         .padding(14)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(msg.isUnread == true ? Color.blue.opacity(0.06) : Color(uiColor: .secondarySystemBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(msg.isUnread == true ? Color.blue.opacity(0.4) : Color.clear, lineWidth: 1.5)
+        )
     }
 
     // MARK: - 离线下载资源列表卡片
@@ -793,6 +820,33 @@ struct TelegramFeedView: View {
         loadingDialogs = false
     }
 
+    private var firstUnreadMsgId: Int64? {
+        // messages 为时间正序 [较早 -> 最新]，找到第一条未读消息 ID
+        messages.first(where: { $0.isUnread == true })?.id
+    }
+
+    private var unreadDividerView: some View {
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(Color.blue.opacity(0.35))
+                .frame(height: 1)
+            HStack(spacing: 4) {
+                Image(systemName: "bookmark.fill")
+                    .font(.system(size: 10))
+                Text("上次看到这里 · 以下为未读新消息")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(Color.blue)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Color.blue.opacity(0.12), in: Capsule())
+            Rectangle()
+                .fill(Color.blue.opacity(0.35))
+                .frame(height: 1)
+        }
+        .padding(.vertical, 6)
+    }
+
     private func loadMessages(chatId: Int64) async {
         guard let client = model.apiClient else { return }
         loadingMessages = true
@@ -802,7 +856,7 @@ struct TelegramFeedView: View {
             let msgs = try await client.telegramUserMessages(
                 chatId: chatId,
                 offsetId: 0,
-                limit: 40,
+                limit: 50,
                 filterAds: currentConfig.filterAds,
                 filterDuplicates: currentConfig.filterDuplicates,
                 config: currentConfig
@@ -827,7 +881,7 @@ struct TelegramFeedView: View {
             let olderMsgs = try await client.telegramUserMessages(
                 chatId: d.id,
                 offsetId: oldestMsgId,
-                limit: 30,
+                limit: 50,
                 filterAds: currentConfig.filterAds,
                 filterDuplicates: currentConfig.filterDuplicates,
                 config: currentConfig
@@ -912,6 +966,9 @@ struct TelegramFeedView: View {
                 subscribedDialogs[idx].unreadCount = 0
             }
             selectedDialog?.unreadCount = 0
+            for idx in messages.indices {
+                messages[idx].isUnread = false
+            }
             triggerToast("✅ 已一键标记已读")
         } catch {
             triggerToast("标记已读失败: \(error.localizedDescription)")

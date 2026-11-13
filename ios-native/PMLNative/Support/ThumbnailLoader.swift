@@ -4,22 +4,33 @@ import UIKit
 @MainActor
 final class ThumbnailLoader: ObservableObject {
     @Published private(set) var images: [String: UIImage] = [:]
-    private var inFlight = Set<String>()
+    private var inFlight: [String: Task<UIImage?, Never>] = [:]
     private var failed = Set<String>()
 
     func image(assetId: String, client: PMLAPIClient?) async -> UIImage? {
         if let cached = images[assetId] { return cached }
-        guard let client, !inFlight.contains(assetId), !failed.contains(assetId) else { return nil }
-        inFlight.insert(assetId)
-        defer { inFlight.remove(assetId) }
-        guard let thumbnail = try? await client.assetThumbnail(assetId: assetId),
-              let data = Data(base64Encoded: thumbnail.dataBase64),
-              let image = UIImage(data: data) else {
+        if let existing = inFlight[assetId] { return await existing.value }
+        guard let client, !failed.contains(assetId) else { return nil }
+        let task = Task<UIImage?, Never> {
+            guard let thumbnail = try? await client.assetThumbnail(assetId: assetId) else {
+                return nil
+            }
+            let base64 = thumbnail.dataBase64
+            return await Task.detached(priority: .utility) {
+                guard let data = Data(base64Encoded: base64) else { return nil }
+                return ImageCache.decodeOffMain(data, maxPixel: 360)
+            }.value
+        }
+        inFlight[assetId] = task
+        let decoded = await task.value
+        inFlight.removeValue(forKey: assetId)
+        if let decoded {
+            images[assetId] = decoded
+            return decoded
+        } else {
             failed.insert(assetId)
             return nil
         }
-        images[assetId] = image
-        return image
     }
 }
 

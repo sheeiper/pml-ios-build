@@ -79,7 +79,7 @@ struct ImageViewer: View {
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: 0) {
                         ForEach(context.entries) { entry in
-                            ZoomableImagePage(url: urls[entry.id], posterAssetId: entry.assetId)
+                            ZoomableImagePage(url: resolvedURL(for: entry), posterAssetId: entry.assetId)
                                 .frame(width: geo.size.width, height: geo.size.height)
                                 .id(entry.id)
                                 .task { await load(entry) }
@@ -106,7 +106,7 @@ struct ImageViewer: View {
         ScrollView {
             LazyVStack(spacing: 0) {
                 ForEach(context.entries) { entry in
-                    CachedImageView(url: urls[entry.id], contentMode: .fit, minHeight: 360)
+                    CachedImageView(url: resolvedURL(for: entry), contentMode: .fit, minHeight: 360, maxPixel: 1800)
                         .frame(maxWidth: .infinity)
                         .task { await load(entry) }
                         .onAppear {
@@ -133,24 +133,38 @@ struct ImageViewer: View {
         return favorites.contains(assetId)
     }
 
+    /// 同步计算 AList `/d` 直链，首帧即可发起图片加载，无需等待二次状态刷新。
+    private func resolvedURL(for entry: RemoteBrowserEntry) -> URL? {
+        if let cached = urls[entry.id] { return cached }
+        return model.alistDirectURL(remotePath: entry.path)
+    }
+
     @MainActor
-    private func load(_ entry: RemoteBrowserEntry) async {
-        guard urls[entry.id] == nil else { return }
-        if let direct = model.alistDirectURL(remotePath: entry.path) {
-            urls[entry.id] = direct
-            return
+    private func load(_ entry: RemoteBrowserEntry) async -> URL? {
+        if let existing = resolvedURL(for: entry) {
+            if urls[entry.id] == nil {
+                urls[entry.id] = existing
+            }
+            return existing
         }
         guard let assetId = entry.assetId,
-              let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else { return }
+              let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else { return nil }
         urls[entry.id] = source.url
+        return source.url
     }
 
     @MainActor
     private func prefetch(around center: Int) async {
-        for offset in -2...2 {
+        let pixelLimit: CGFloat = webtoonMode ? 1800 : 2400
+        for offset in [0, 1, -1, 2, 3, -2] {
             let idx = center + offset
             guard context.entries.indices.contains(idx) else { continue }
-            await load(context.entries[idx])
+            let entry = context.entries[idx]
+            if let url = await load(entry) {
+                Task {
+                    _ = await ImageCache.shared.cachedOrLoad(url, maxPixel: pixelLimit)
+                }
+            }
         }
     }
 
@@ -182,12 +196,18 @@ private struct ZoomableImagePage: View {
 
     @State private var image: UIImage?
 
+    private var displayImage: UIImage? {
+        if let image { return image }
+        guard let url else { return nil }
+        return ImageCache.shared.cached(url, maxPixel: 2400)
+    }
+
     var body: some View {
         ZStack {
             Color.black
-            if let image {
-                ZoomScrollRepresentable(image: image)
-            } else if let posterAssetId, let poster = ThumbnailService.shared.images[posterAssetId] {
+            if let current = displayImage {
+                ZoomScrollRepresentable(image: current)
+            } else if let posterAssetId, let poster = ThumbnailService.shared.cachedImage(assetId: posterAssetId) {
                 Image(uiImage: poster)
                     .resizable()
                     .scaledToFit()
@@ -198,6 +218,10 @@ private struct ZoomableImagePage: View {
         }
         .task(id: url) {
             guard let url else { return }
+            if let hit = ImageCache.shared.cached(url, maxPixel: 2400) {
+                image = hit
+                return
+            }
             image = await ImageCache.shared.cachedOrLoad(url, maxPixel: 2400)
         }
     }

@@ -57,8 +57,10 @@ struct GestureVideoPlayerSheet: View {
     @State private var dragBaseVolume: Float = 1
     @State private var seekPreview: Double?
     @State private var isScrubbing = false
+    @State private var scrubWasPlaying = true
     @State private var pendingSeek: Double?
     @State private var isBuffering = false
+    @State private var isSeeking = false
     @State private var didReachEnd = false
     @State private var seekGeneration = 0
     @State private var seekTask: Task<Void, Never>?
@@ -79,8 +81,6 @@ struct GestureVideoPlayerSheet: View {
     @State private var videoGravity: AVLayerVideoGravity = .resizeAspect
     @AppStorage("pml.player.scrubRange") private var scrubRangeSetting: Double = 180
     @State private var baseBrightness: CGFloat = UIScreen.main.brightness
-    @State private var poster: UIImage?
-    @ObservedObject private var thumbService = ThumbnailService.shared
 
     private enum DragMode { case seek, brightness, volume }
 
@@ -114,14 +114,6 @@ struct GestureVideoPlayerSheet: View {
                 Color.black.ignoresSafeArea()
                 PlayerLayerContainer(player: player, gravity: videoGravity)
                     .ignoresSafeArea()
-
-                if let poster, duration <= 0 {
-                    Image(uiImage: poster)
-                        .resizable()
-                        .scaledToFit()
-                        .ignoresSafeArea()
-                        .allowsHitTesting(false)
-                }
 
                 Color.clear
                     .contentShape(Rectangle())
@@ -168,7 +160,7 @@ struct GestureVideoPlayerSheet: View {
                     .padding(.vertical, 12)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
-                if isBuffering {
+                if isBuffering || isSeeking {
                     ProgressView()
                         .controlSize(.large)
                         .tint(.white)
@@ -366,10 +358,13 @@ struct GestureVideoPlayerSheet: View {
                     onScrubStart: {
                         if !isScrubbing {
                             isScrubbing = true
-                            player.pause()
+                            scrubWasPlaying = isPlaying
+                            controlsTask?.cancel()
                         }
                     },
-                    onScrub: { seconds in pendingSeek = seconds },
+                    onScrub: { seconds in
+                        pendingSeek = seconds
+                    },
                     onScrubEnd: { seconds in
                         pendingSeek = seconds
                         finishScrub()
@@ -558,14 +553,15 @@ struct GestureVideoPlayerSheet: View {
         return player.currentItem?.status == .readyToPlay
     }
 
-    /// 所有 seek 统一入口：120ms 内合并，只让最后一个请求执行，避免滑块/双击/横滑并发。
+    /// 所有 seek 统一入口：80ms 内合并，只让最后一个请求执行，避免滑块/双击/横滑并发。
     private func requestSeek(to seconds: Double, resume: Bool, debounce: Bool = true) {
         seekRequestID += 1
         let request = seekRequestID
         seekTask?.cancel()
+        seekWatchdog?.cancel()
         seekTask = Task { @MainActor in
             if debounce {
-                try? await Task.sleep(nanoseconds: 120_000_000)
+                try? await Task.sleep(nanoseconds: 80_000_000)
             }
             guard !Task.isCancelled, request == seekRequestID else { return }
             await performSeek(to: seconds, resume: resume, request: request)
@@ -575,79 +571,34 @@ struct GestureVideoPlayerSheet: View {
     @MainActor
     private func performSeek(to seconds: Double, resume: Bool, request: Int) async {
         guard let item = player.currentItem, request == seekRequestID else { return }
+        isSeeking = true
+        defer {
+            if request == seekRequestID {
+                isSeeking = false
+            }
+        }
         if item.status != .readyToPlay {
-            guard await waitUntilReady(timeout: 6), request == seekRequestID else { return }
+            guard await waitUntilReady(timeout: 6), !Task.isCancelled, request == seekRequestID else { return }
         }
         item.cancelPendingSeeks()
         let total = item.duration.seconds.isFinite ? item.duration.seconds : duration
-        let target = min(max(0, seconds), max(0, total))
-        let time = CMTime(seconds: target, preferredTimescale: 600)
-        let tolerance = CMTime(seconds: 0.4, preferredTimescale: 600)
-        // 先挂看门狗：即使 seek 本身卡住，也能重建 item 恢复。
-        armSeekWatchdog(target: target, request: request)
-        let didSeek = await player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance)
-        guard request == seekRequestID else { return }
-        guard didSeek || abs(player.currentTime().seconds - target) < 1.5 else { return }
+        let target = total > 0 ? min(max(0, seconds), max(0, total)) : max(0, seconds)
         currentTime = target
+        let time = CMTime(seconds: target, preferredTimescale: 600)
+        // 使用关键帧容差（1.2s），避免直连网络下精确逐帧解码整个 GOP 导致拖动进度条卡顿
+        let tolerance = CMTime(seconds: 1.2, preferredTimescale: 600)
+        _ = await player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance)
+        guard !Task.isCancelled, request == seekRequestID else { return }
         if resume {
-            player.play()
             isPlaying = true
+            player.playImmediately(atRate: rate)
+            scheduleHideControls()
         } else {
             player.pause()
             isPlaying = false
         }
     }
 
-    /// seek 后 4 秒仍没有画面/时间没有前进，就重建 item 并从目标位置恢复。
-    private func armSeekWatchdog(target: Double, request: Int) {
-        seekWatchdog?.cancel()
-        seekWatchdog = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
-            guard !Task.isCancelled, request == seekRequestID, isPlaying else { return }
-            let current = player.currentTime().seconds
-            let stalled = player.currentItem?.status == .failed
-                || player.timeControlStatus == .waitingToPlayAtSpecifiedRate
-                || !current.isFinite
-            guard stalled else { return }
-            await recoverPlayback(at: target)
-        }
-    }
-
-    @MainActor
-    private func recoverPlayback(at target: Double) async {
-        guard !isRecovering else { return }
-        isRecovering = true
-        defer { isRecovering = false }
-        seekRequestID += 1
-        seekTask?.cancel()
-        var url = currentURL
-        if player.currentItem?.status == .failed, let fallback = currentFallbackURL {
-            url = fallback
-            accelLabel = "服务器中转"
-        }
-        player.replaceCurrentItem(with: makePlayerItem(url))
-        if await waitUntilReady(timeout: 8) {
-            requestSeek(to: target, resume: true, debounce: false)
-        }
-    }
-
-    private func recoverFromStall() {
-        guard stallRecoveryTask == nil else { return }
-        stallRecoveryTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 7_000_000_000)
-            guard !Task.isCancelled, isPlaying,
-                  player.timeControlStatus == .waitingToPlayAtSpecifiedRate else {
-                stallRecoveryTask = nil
-                return
-            }
-            let target = currentTime
-            player.replaceCurrentItem(with: makePlayerItem(currentURL))
-            if await waitUntilReady() {
-                requestSeek(to: target, resume: true, debounce: false)
-            }
-            stallRecoveryTask = nil
-        }
-    }
     private func configureAudioSession() {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .moviePlayback, options: [])
@@ -656,29 +607,34 @@ struct GestureVideoPlayerSheet: View {
 
     private func makePlayerItem(_ url: URL) -> AVPlayerItem {
         let headers = model.playbackHeaders(for: url)
-        guard !headers.isEmpty else { return AVPlayerItem(url: url) }
-        let options: [String: Any] = [pmlAVURLAssetHTTPHeaderFieldsKey: headers]
-        let asset = AVURLAsset(url: url, options: options)
-        return AVPlayerItem(asset: asset)
-    }
-    private func loadCurrent(trackResume: Bool) {
-        let item = makePlayerItem(currentURL)
-        let isMOV = currentURL.pathExtension.lowercased() == "mov"
-        item.preferredForwardBufferDuration = isMOV ? 1.5 : 2
-        player.replaceCurrentItem(with: item)
-        player.automaticallyWaitsToMinimizeStalling = true
-        poster = currentAssetId.flatMap { thumbService.images[$0] }
-        if poster == nil, let assetId = currentAssetId, let client = model.apiClient {
-            Task {
-                if let image = await thumbService.image(assetId: assetId, client: client) {
-                    poster = image
-                }
-            }
+        let asset: AVURLAsset
+        if headers.isEmpty {
+            asset = AVURLAsset(url: url)
+        } else {
+            asset = AVURLAsset(url: url, options: [pmlAVURLAssetHTTPHeaderFieldsKey: headers])
         }
+        let item = AVPlayerItem(asset: asset)
+        let isMOV = url.pathExtension.lowercased() == "mov"
+        item.preferredForwardBufferDuration = isMOV ? 1.5 : 3.0
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        return item
+    }
+
+    private func loadCurrent(trackResume: Bool) {
+        seekTask?.cancel()
+        seekWatchdog?.cancel()
+        stallRecoveryTask?.cancel()
+        isSeeking = false
+        isScrubbing = false
+        pendingSeek = nil
+
+        let item = makePlayerItem(currentURL)
+        player.automaticallyWaitsToMinimizeStalling = true
+        player.replaceCurrentItem(with: item)
 
         player.isMuted = muted
         player.volume = volume
-        currentTime = 0
+        currentTime = max(0, startAt)
         duration = 0
         resumeVisible = false
         resumeChecked = !trackResume
@@ -688,36 +644,52 @@ struct GestureVideoPlayerSheet: View {
         subtitleTracks = []
         subtitleCues = []
         subtitleTitle = nil
-        if trackResume, startAt > 1 {
-            begin(from: startAt)
-        } else if trackResume {
-            Task { await checkResume() }
-        } else {
-            begin(from: 0)
+
+        // 立即启动播放与缓冲，不阻塞等待远程历史进度 RPC，大幅提升起播速度
+        begin(from: trackResume ? startAt : 0)
+
+        if trackResume && startAt <= 1 {
+            let initialSeekID = seekRequestID
+            let loadingAssetId = currentAssetId
+            Task {
+                await checkResume(expectedAssetId: loadingAssetId, initialSeekID: initialSeekID)
+            }
         }
         Task { await refreshAccelLabel() }
         Task { await loadSubtitles() }
+        prefetchAdjacentEpisode()
     }
 
     @MainActor
-    private func checkResume() async {
-        guard !resumeChecked else { return }
-        resumeChecked = true
-        guard let currentAssetId, let client = model.apiClient else {
-            begin(from: 0)
-            return
+    private func checkResume(expectedAssetId: String?, initialSeekID: Int) async {
+        guard let expectedAssetId, let client = model.apiClient else { return }
+        guard let saved = try? await client.playbackProgress(assetId: expectedAssetId),
+              saved > 3 else { return }
+        guard currentAssetId == expectedAssetId,
+              !isScrubbing,
+              seekRequestID == initialSeekID else { return }
+        resumeSeconds = saved
+        resumeToastSeconds = saved
+        showResumeToast = true
+        requestSeek(to: saved, resume: isPlaying, debounce: false)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            showResumeToast = false
         }
-        if let saved = try? await client.playbackProgress(assetId: currentAssetId), saved > 2 {
-            resumeSeconds = saved
-            begin(from: saved)
-            resumeToastSeconds = saved
-            showResumeToast = true
+    }
+
+    /// 预热下一集的本地代理流与重定向，让切换上下集更丝滑。
+    private func prefetchAdjacentEpisode() {
+        guard let index = resolvedIndex else { return }
+        for offset in [1, -1] {
+            let neighborIdx = index + offset
+            guard playlist.indices.contains(neighborIdx) else { continue }
+            let neighbor = playlist[neighborIdx]
+            guard let remotePath = neighbor.remotePath,
+                  let direct = model.alistDirectURL(remotePath: remotePath) else { continue }
             Task {
-                try? await Task.sleep(nanoseconds: 6_000_000_000)
-                showResumeToast = false
+                _ = await LocalMediaProxy.shared.register(directURL: direct)
             }
-        } else {
-            begin(from: 0)
         }
     }
 
@@ -769,8 +741,8 @@ struct GestureVideoPlayerSheet: View {
         }
         let target = index + offset
         guard playlist.indices.contains(target) else { return }
-        await playIndex(target)
         showHUD(offset > 0 ? "下一集" : "上一集", seconds: 1.2)
+        await playIndex(target)
     }
 
     @MainActor
@@ -781,20 +753,29 @@ struct GestureVideoPlayerSheet: View {
             showHUD("该视频无法播放", seconds: 2)
             return
         }
-        guard let source = await model.playbackSource(assetId: assetId, remotePath: item.remotePath) else {
-            showHUD("获取播放地址失败", seconds: 2)
-            return
-        }
         saveProgress()
+        // 先立即取消当前播放流与挂起任务、更新标题状态，做到 0 延迟响应
+        seekTask?.cancel()
+        seekWatchdog?.cancel()
+        stallRecoveryTask?.cancel()
+        player.pause()
         currentIndex = index
         currentTitle = item.title
         currentAssetId = assetId
+        showPlaylist = false
+        isBuffering = true
+
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: item.remotePath) else {
+            isBuffering = false
+            showHUD("获取播放地址失败", seconds: 2)
+            return
+        }
+        guard currentAssetId == assetId else { return }
         currentURL = source.url
         currentFallbackURL = source.fallbackURL
         currentSourceLabel = source.label
         accelLabel = source.label
         usedFallback = false
-        showPlaylist = false
         loadCurrent(trackResume: false)
     }
 
@@ -804,15 +785,13 @@ struct GestureVideoPlayerSheet: View {
 
     private func seekToStart() {
         showResumeToast = false
-        player.seek(to: .zero)
-        currentTime = 0
+        requestSeek(to: 0, resume: true, debounce: false)
     }
 
     private func begin(from seconds: Double) {
         resumeVisible = false
-        player.rate = rate
-        player.play()
         isPlaying = true
+        player.playImmediately(atRate: rate)
         scheduleHideControls()
         if seconds > 1 {
             Task { @MainActor in
@@ -834,23 +813,23 @@ struct GestureVideoPlayerSheet: View {
     }
 
     private func finishScrub() {
+        let shouldPlay = scrubWasPlaying
         isScrubbing = false
         guard let target = pendingSeek else { return }
         pendingSeek = nil
         currentTime = target
-        let shouldPlay = isPlaying
-        requestSeek(to: target, resume: shouldPlay)
+        requestSeek(to: target, resume: shouldPlay, debounce: false)
     }
 
     private func togglePlay() {
-        if player.timeControlStatus == .playing {
+        if isPlaying && player.timeControlStatus != .paused {
             player.pause()
             isPlaying = false
             controlsVisible = true
             controlsTask?.cancel()
         } else {
-            player.play()
             isPlaying = true
+            player.playImmediately(atRate: rate)
             scheduleHideControls()
         }
     }
@@ -921,8 +900,6 @@ struct GestureVideoPlayerSheet: View {
                 dragMode = .seek
                 dragBaseTime = currentTime
                 seekWasPlaying = isPlaying
-                isPlaying = false
-                player.pause()
                 lastSeekHapticSecond = currentTime
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
             } else if dy > dx * 1.5 {
@@ -986,13 +963,9 @@ struct GestureVideoPlayerSheet: View {
         }
         if dragMode == .seek, let target = seekPreview {
             let clamped = min(max(0, target), max(0, duration))
-            player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
             currentTime = clamped
+            requestSeek(to: clamped, resume: seekWasPlaying, debounce: false)
             saveProgress()
-            if seekWasPlaying {
-                player.play()
-                isPlaying = true
-            }
         }
         seekWasPlaying = false
         dragMode = nil
@@ -1021,7 +994,7 @@ struct GestureVideoPlayerSheet: View {
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
             queue: .main
         ) { time in
-            if !isScrubbing, pendingSeek == nil {
+            if !isScrubbing, !isSeeking, pendingSeek == nil {
                 currentTime = time.seconds.isFinite ? time.seconds : 0
             }
             if duration > 1, currentTime >= duration - 0.6, !didReachEnd {
@@ -1033,7 +1006,9 @@ struct GestureVideoPlayerSheet: View {
             }
             if let item = player.currentItem {
                 let seconds = item.duration.seconds
-                duration = seconds.isFinite ? seconds : 0
+                if seconds.isFinite && seconds > 0 {
+                    duration = seconds
+                }
             }
             if player.currentItem?.status == .failed, !usedFallback {
                 usedFallback = true
@@ -1050,20 +1025,13 @@ struct GestureVideoPlayerSheet: View {
                     }
                     player.replaceCurrentItem(with: makePlayerItem(fallback))
                     accelLabel = "服务器中转"
-                    poster = nil
                     if await waitUntilReady() {
                         requestSeek(to: target, resume: wasPlaying, debounce: false)
                     }
                 }
             }
             isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
-            if isBuffering, isPlaying, player.currentItem?.status == .readyToPlay {
-                recoverFromStall()
-            } else {
-                stallRecoveryTask?.cancel()
-                stallRecoveryTask = nil
-            }
-            if currentTime - lastSavedAt >= 3 {
+            if currentTime - lastSavedAt >= 5 {
                 lastSavedAt = currentTime
                 saveProgress()
             }
@@ -1078,16 +1046,28 @@ struct GestureVideoPlayerSheet: View {
     }
 
     private func teardown() {
+        seekTask?.cancel()
+        seekWatchdog?.cancel()
+        stallRecoveryTask?.cancel()
+        controlsTask?.cancel()
+        hudTask?.cancel()
+        pressTask?.cancel()
         if let timeObserver {
             player.removeTimeObserver(timeObserver)
         }
         timeObserver = nil
+        if let backgroundObserver {
+            NotificationCenter.default.removeObserver(backgroundObserver)
+        }
+        backgroundObserver = nil
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+        }
+        endObserver = nil
         saveProgress()
         player.pause()
+        player.replaceCurrentItem(with: nil)
         UIScreen.main.brightness = baseBrightness
-        controlsTask?.cancel()
-        hudTask?.cancel()
-        pressTask?.cancel()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }
@@ -1109,29 +1089,92 @@ struct PlayerLayerContainer: UIViewRepresentable {
     }
 }
 
+/// 禁用 CoreAnimation 隐式动画并在首帧就绪且完成全屏布局后再显示，彻底消除起播顶部矩形跳动闪烁。
 final class VideoLayerUIView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
 
     private var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    private var readyObservation: NSKeyValueObservation?
 
     var player: AVPlayer? {
         get { playerLayer.player }
-        set { playerLayer.player = newValue }
+        set {
+            guard playerLayer.player !== newValue else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            playerLayer.player = newValue
+            updateVisibility()
+            CATransaction.commit()
+        }
     }
 
     var videoGravity: AVLayerVideoGravity {
         get { playerLayer.videoGravity }
-        set { playerLayer.videoGravity = newValue }
+        set {
+            guard playerLayer.videoGravity != newValue else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            playerLayer.videoGravity = newValue
+            CATransaction.commit()
+        }
     }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        playerLayer.videoGravity = .resizeAspect
         backgroundColor = .black
+        clipsToBounds = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        playerLayer.videoGravity = .resizeAspect
+        playerLayer.opacity = 0
+        playerLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "frame": NSNull(),
+            "contents": NSNull(),
+            "sublayers": NSNull(),
+            "opacity": NSNull(),
+        ]
+        CATransaction.commit()
+
+        readyObservation = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.updateVisibility()
+            }
+        }
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        super.layoutSubviews()
+        playerLayer.frame = bounds
+        if let sublayers = playerLayer.sublayers {
+            for sub in sublayers {
+                sub.removeAllAnimations()
+            }
+        }
+        updateVisibility()
+        CATransaction.commit()
+    }
+
+    override func action(for layer: CALayer, forKey event: String) -> CAAction? {
+        NSNull()
+    }
+
+    private func updateVisibility() {
+        let shouldShow = playerLayer.isReadyForDisplay && bounds.width > 10 && bounds.height > 10
+        let targetOpacity: Float = shouldShow ? 1.0 : 0.0
+        if playerLayer.opacity != targetOpacity {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            playerLayer.opacity = targetOpacity
+            CATransaction.commit()
+        }
     }
 }
 
