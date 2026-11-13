@@ -54,6 +54,7 @@ final class ThumbnailService: ObservableObject {
         return images[assetId]
     }
 
+    @discardableResult
     func image(assetId: String, client: PMLAPIClient?) async -> UIImage? {
         if let image = images[assetId] { return image }
         if let failed = failedAt[assetId], Date().timeIntervalSince(failed) < 30 { return nil }

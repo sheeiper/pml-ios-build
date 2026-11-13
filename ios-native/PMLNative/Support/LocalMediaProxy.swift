@@ -50,23 +50,25 @@ final class LocalMediaProxy: NSObject {
 
     func register(directURL: URL) async -> URL? {
         guard let port = await ensureStarted() else { return nil }
-        let key = directURL.absoluteString
-        let token: String
-        lock.lock()
-        if let existing = tokenByDirectURL[key], let entry = streamsByToken[existing] {
-            entry.lastAccess = Date()
-            token = existing
-        } else {
-            let newToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-            let entry = StreamEntry(token: newToken, direct: directURL)
-            streamsByToken[newToken] = entry
-            tokenByDirectURL[key] = newToken
-            token = newToken
-            pruneStreamsLocked()
-        }
-        lock.unlock()
+        let token = upsertToken(for: directURL)
         let ext = directURL.pathExtension.isEmpty ? "mp4" : directURL.pathExtension
         return URL(string: "http://127.0.0.1:\(port)/p/\(token).\(ext)")
+    }
+
+    private func upsertToken(for directURL: URL) -> String {
+        let key = directURL.absoluteString
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = tokenByDirectURL[key], let entry = streamsByToken[existing] {
+            entry.lastAccess = Date()
+            return existing
+        }
+        let newToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let entry = StreamEntry(token: newToken, direct: directURL)
+        streamsByToken[newToken] = entry
+        tokenByDirectURL[key] = newToken
+        pruneStreamsLocked()
+        return newToken
     }
 
     private func pruneStreamsLocked() {
@@ -102,13 +104,16 @@ final class LocalMediaProxy: NSObject {
         }
     }
 
-    private func ensureStarted() async -> UInt16? {
+    private func currentPort() -> UInt16? {
         lock.lock()
-        if let port {
-            lock.unlock()
-            return port
+        defer { lock.unlock() }
+        return port
+    }
+
+    private func ensureStarted() async -> UInt16? {
+        if let existing = currentPort() {
+            return existing
         }
-        lock.unlock()
         return await withCheckedContinuation { continuation in
             lock.lock()
             if let port {

@@ -140,6 +140,7 @@ struct ImageViewer: View {
     }
 
     @MainActor
+    @discardableResult
     private func load(_ entry: RemoteBrowserEntry) async -> URL? {
         if let existing = resolvedURL(for: entry) {
             if urls[entry.id] == nil {

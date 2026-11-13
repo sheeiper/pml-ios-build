@@ -91,7 +91,7 @@ final class ComicDirectStore {
         Task { _ = await image(assetId: assetId, index: index, model: model) }
     }
 
-    private func fetchAndDecodePage(page: ComicArchivePageEntry, archiveURL: URL) async -> UIImage? {
+    private func fetchAndDecodePage(page: ComicArchiveManifestPage, archiveURL: URL) async -> UIImage? {
         let compLen = Int(page.compressedSize)
         let uncompLen = Int(page.uncompressedSize)
         let method = page.compressionMethod

@@ -7,6 +7,7 @@ final class ThumbnailLoader: ObservableObject {
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
     private var failed = Set<String>()
 
+    @discardableResult
     func image(assetId: String, client: PMLAPIClient?) async -> UIImage? {
         if let cached = images[assetId] { return cached }
         if let existing = inFlight[assetId] { return await existing.value }
