@@ -93,15 +93,13 @@ final class ThumbnailService: ObservableObject {
             if accessOrder.count > Self.maxCachedImages {
                 let overflow = accessOrder.count - Self.maxCachedImages
                 for oldKey in accessOrder.prefix(overflow) {
-                    images.removeValue(forKey(oldKey))
+                    images.removeValue(forKey: oldKey)
                 }
                 accessOrder.removeFirst(overflow)
             }
         }
         images[assetId] = image
     }
-
-    private func forKey(_ key: String) -> String { key }
 
     /// 节流通知旧的 @ObservedObject 订阅者，避免短时间几十张封面解码引发主线程重绘风暴。
     private func scheduleNotify() {
