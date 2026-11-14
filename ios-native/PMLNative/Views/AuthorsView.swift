@@ -507,6 +507,7 @@ struct AuthorProfileView: View {
                     sourceLabel: item.sourceLabel,
                     remotePath: item.remotePath
                 )
+                .id(item.id)
                 .environmentObject(model)
             } else {
                 ImageViewerSheet(url: item.url)
@@ -742,6 +743,7 @@ struct AuthorProfileView: View {
                         } label: {
                             authorEntryRow(entry)
                         }
+                        .id("dir-\(entry.path)")
                         .buttonStyle(.plain)
                     } else {
                         Button {
@@ -749,6 +751,7 @@ struct AuthorProfileView: View {
                         } label: {
                             authorEntryRow(entry)
                         }
+                        .id("file-\(entry.path)")
                         .buttonStyle(.plain)
                     }
                 }
@@ -762,6 +765,7 @@ struct AuthorProfileView: View {
                         } label: {
                             authorEntryCell(entry)
                         }
+                        .id("dir-\(entry.path)")
                         .buttonStyle(.plain)
                     } else {
                         Button {
@@ -769,6 +773,7 @@ struct AuthorProfileView: View {
                         } label: {
                             authorEntryCell(entry)
                         }
+                        .id("file-\(entry.path)")
                         .buttonStyle(.plain)
                     }
                 }
@@ -777,37 +782,32 @@ struct AuthorProfileView: View {
     }
 
     private func authorEntryCell(_ entry: RemoteBrowserEntry) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let thumbId = entry.assetId ?? entry.coverAssetId
+        return VStack(alignment: .leading, spacing: 4) {
             Color.clear
                 .aspectRatio(layout == .wall ? 1 : 0.8, contentMode: .fit)
                 .overlay {
                     ZStack {
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(.quaternary.opacity(0.3))
-                        if let id = entry.assetId ?? entry.coverAssetId, let image = covers.images[id] {
-                            Image(uiImage: image)
-                                .resizable()
-                                .scaledToFill()
-                        } else {
+                        AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
                             Image(systemName: entry.isDirectory ? "folder.fill" : (entry.isVideo ? "play.rectangle.fill" : "photo.fill"))
                                 .font(.title3)
                                 .foregroundStyle(entry.isDirectory ? Color.accentColor : Color.secondary)
                         }
                     }
+                    .allowsHitTesting(false)
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .clipped()
             Text(pmlDisplayName(entry.name))
                 .font(.caption2)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
         .contentShape(Rectangle())
-        .task {
-            if let id = entry.assetId ?? entry.coverAssetId {
-                await covers.image(assetId: id, client: model.apiClient)
-            }
-        }
     }
 
     private func authorEntryRow(_ entry: RemoteBrowserEntry) -> some View {

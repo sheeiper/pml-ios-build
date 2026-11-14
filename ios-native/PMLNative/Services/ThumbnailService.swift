@@ -34,7 +34,8 @@ actor AsyncGate {
 /// 缩略图服务：
 /// 1. 内存缓存 + 正在进行的任务去重合并（避免 prefetch 与 cell.task 冲突返回 nil）；
 /// 2. 所有 Base64 解码、ImageIO 降采样与位图预解压（preparingForDisplay）均在后台线程执行，零阻塞主线程；
-/// 3. 对 ObservableObject 广播做节流合并（180ms），并为 DirectoryView 提供独立单 Cell 刷新的视图，彻底根治打开目录卡顿。
+/// 3. 对 ObservableObject 广播做节流合并（180ms），并为 DirectoryView 提供独立单 Cell 刷新的视图，彻底根治打开目录卡顿；
+/// 4. 切换目录时自动取消上一级目录的预取任务，且慢速原图降采样不占用快速缓存槽位。
 @MainActor
 final class ThumbnailService: ObservableObject {
     static let shared = ThumbnailService()
@@ -43,9 +44,10 @@ final class ThumbnailService: ObservableObject {
     private var accessOrder: [String] = []
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
     private var failedAt: [String: Date] = [:]
-    private let fetchGate = AsyncGate(limit: 8)
+    private let fetchGate = AsyncGate(limit: 4)
     private let generateGate = AsyncGate(limit: 2)
     private var notifyTask: Task<Void, Never>?
+    private var prefetchTask: Task<Void, Never>?
 
     private static let maxCachedImages = 450
 
@@ -64,14 +66,12 @@ final class ThumbnailService: ObservableObject {
         guard let client else { return nil }
 
         let task = Task<UIImage?, Never> { @MainActor in
-            await self.fetchGate.acquire()
-            let generated = await Self.loadOrGenerate(
+            await Self.loadOrGenerate(
                 assetId: assetId,
                 client: client,
+                fetchGate: self.fetchGate,
                 generateGate: self.generateGate
             )
-            await self.fetchGate.release()
-            return generated
         }
         inFlight[assetId] = task
         let result = await task.value
@@ -93,13 +93,15 @@ final class ThumbnailService: ObservableObject {
             if accessOrder.count > Self.maxCachedImages {
                 let overflow = accessOrder.count - Self.maxCachedImages
                 for oldKey in accessOrder.prefix(overflow) {
-                    images.removeValue(forKey: oldKey)
+                    images.removeValue(forKey(oldKey))
                 }
                 accessOrder.removeFirst(overflow)
             }
         }
         images[assetId] = image
     }
+
+    private func forKey(_ key: String) -> String { key }
 
     /// 节流通知旧的 @ObservedObject 订阅者，避免短时间几十张封面解码引发主线程重绘风暴。
     private func scheduleNotify() {
@@ -111,14 +113,16 @@ final class ThumbnailService: ObservableObject {
         }
     }
 
-    /// 目录加载后适量预取前 12 个封面。
+    /// 目录加载后适量预取前 8 个封面，并在进入新目录时立即取消旧目录的预取队列。
     func prefetch(assetIds: [String], client: PMLAPIClient?) {
+        prefetchTask?.cancel()
+        prefetchTask = nil
         guard let client else { return }
         var seen = Set<String>()
         let ids = assetIds.filter { seen.insert($0).inserted && images[$0] == nil }
         guard !ids.isEmpty else { return }
-        Task { @MainActor in
-            for id in ids.prefix(12) {
+        prefetchTask = Task { @MainActor in
+            for id in ids.prefix(8) {
                 if Task.isCancelled { break }
                 if images[id] != nil || inFlight[id] != nil { continue }
                 _ = await self.image(assetId: id, client: client)
@@ -135,9 +139,13 @@ final class ThumbnailService: ObservableObject {
     private static func loadOrGenerate(
         assetId: String,
         client: PMLAPIClient,
+        fetchGate: AsyncGate,
         generateGate: AsyncGate
     ) async -> UIImage? {
-        guard let input = try? await client.thumbnailInput(assetId: assetId) else { return nil }
+        await fetchGate.acquire()
+        let input = try? await client.thumbnailInput(assetId: assetId)
+        await fetchGate.release()
+        guard let input else { return nil }
 
         // 1. 优先命中服务端已缓存 Base64 缩略图，并在后台线程解码 + 预解压位图
         if let cached = input.cached {
@@ -184,7 +192,10 @@ final class ThumbnailService: ObservableObject {
     }
 }
 
-/// 独立单 Cell 缩略图组件：只刷新当前 Cell 自身状态，绝不触发父级列表或整个目录树重绘。
+/// 独立单 Cell 缩略图组件：
+/// 1. 只刷新当前 Cell 自身状态，绝不触发父级列表或整个目录树重绘；
+/// 2. 使用 GeometryReader 严格锁死缩略图布局宽高并关闭内部 HitTesting（`.allowsHitTesting(false)`），
+///    彻底杜绝 16:9 / 9:16 封面在 `.fill` 模式下超出单元格边界、导致点击视频时误触相邻视频的问题！
 struct AssetThumbnailView<Placeholder: View>: View {
     let assetId: String?
     var contentMode: ContentMode = .fill
@@ -195,15 +206,23 @@ struct AssetThumbnailView<Placeholder: View>: View {
     @State private var loadedId: String?
 
     var body: some View {
-        Group {
-            if let current = resolvedImage {
-                Image(uiImage: current)
-                    .resizable()
-                    .aspectRatio(contentMode: contentMode)
-            } else {
-                placeholder()
+        GeometryReader { geo in
+            ZStack {
+                if let current = resolvedImage {
+                    Image(uiImage: current)
+                        .resizable()
+                        .aspectRatio(contentMode: contentMode)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                } else {
+                    placeholder()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
         }
+        .allowsHitTesting(false)
         .task(id: assetId) {
             guard let assetId, !assetId.isEmpty else {
                 image = nil

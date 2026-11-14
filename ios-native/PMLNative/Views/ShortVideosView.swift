@@ -33,17 +33,20 @@ private enum ShortsDuration: Int, CaseIterable, Identifiable {
     }
 }
 
-/// 短视频：上下整页翻动，预加载下一条，双击暂停，长按 2x，横滑 seek。
-/// 页面保持简洁：顶部筛选/静音/更多，右侧头像/收藏/连播，底部作者/标题/进度。
+/// 短视频：上下整页翻动，智能目录均衡随机推荐（未看优先 + 同目录打散轮询），支持一键刷新队列、预加载下一条、双击暂停、长按 2x、横滑 seek。
 struct ShortVideosView: View {
     @EnvironmentObject private var model: AppModel
 
     @State private var items: [LibraryAsset] = []
+    @State private var candidatePool: [LibraryAsset] = []
     @State private var nextCursor: String?
     @State private var currentID: String?
     @State private var loading = false
     @State private var loadingMore = false
     @State private var errorText = ""
+    @State private var refreshTurns = 0
+    @State private var toastText: String?
+    @State private var toastTask: Task<Void, Never>?
 
     @State private var player = AVPlayer()
     @AppStorage("pml.shortVideo.muted") private var muted = true
@@ -61,6 +64,8 @@ struct ShortVideosView: View {
     @State private var authorFilterName: String?
     @State private var isBinge = false
     @State private var bingeName = ""
+    @State private var savedRandomQueue: [LibraryAsset] = []
+    @State private var savedRandomID: String?
 
     @State private var preloadedID: String?
     @State private var preloadedItem: AVPlayerItem?
@@ -76,6 +81,7 @@ struct ShortVideosView: View {
     @State private var hudIcon: String?
     @State private var hudTask: Task<Void, Never>?
     @State private var timeObserver: Any?
+    @State private var endObserver: NSObjectProtocol?
 
     @State private var isSeeking = false
     @State private var seekResume = false
@@ -87,79 +93,95 @@ struct ShortVideosView: View {
 
     var body: some View {
         ZStack {
-                Color.black.ignoresSafeArea()
+            Color.black.ignoresSafeArea()
 
-                ScrollView(.vertical) {
-                    LazyVStack(spacing: 0) {
-                        ForEach(items) { item in
-                            slide(item: item)
-                                .containerRelativeFrame([.horizontal, .vertical])
-                        }
-                        if loadingMore {
-                            ProgressView().tint(.white).padding(24)
+            ScrollView(.vertical) {
+                LazyVStack(spacing: 0) {
+                    ForEach(items) { item in
+                        slide(item: item)
+                            .containerRelativeFrame([.horizontal, .vertical])
+                    }
+                    if loadingMore {
+                        ProgressView().tint(.white).padding(24)
+                    }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollTargetBehavior(.paging)
+            .scrollPosition(id: $currentID)
+            .scrollIndicators(.hidden)
+            .background(Color.black)
+        }
+        .overlay(alignment: .top) { topBar }
+        .overlay(alignment: .trailing) { rightRail.padding(.bottom, 104) }
+        .overlay(alignment: .bottom) { bottomInfo }
+        .overlay(alignment: .center) { centerOverlay }
+        .overlay { scrubOverlay }
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .tabBar)
+        .task {
+            configureAudioSession()
+            addTimeObserver()
+            addEndObserver()
+            if items.isEmpty {
+                await loadFeed(reset: true)
+            } else if let currentID {
+                await activate(currentID)
+            }
+        }
+        .onChange(of: currentID) { _, newValue in
+            Task {
+                await activate(newValue)
+                await loadMoreIfNeeded(current: newValue)
+            }
+        }
+        .onChange(of: scope) { _, _ in Task { await resetAndReload() } }
+        .onChange(of: durationFilter) { _, _ in Task { await resetAndReload() } }
+        .onDisappear {
+            saveProgress(force: true)
+            if let timeObserver { player.removeTimeObserver(timeObserver) }
+            timeObserver = nil
+            if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+            endObserver = nil
+            player.pause()
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
+        .sheet(item: $authorSheet) { author in
+            NavigationStack {
+                AuthorProfileView(author: author)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("完成") { authorSheet = nil }
                         }
                     }
-                    .scrollTargetLayout()
-                }
-                .scrollTargetBehavior(.paging)
-                .scrollPosition(id: $currentID)
-                .scrollIndicators(.hidden)
-                .background(Color.black)
             }
-            .overlay(alignment: .top) { topBar }
-            .overlay(alignment: .trailing) { rightRail.padding(.bottom, 104) }
-            .overlay(alignment: .bottom) { bottomInfo }
-            .overlay(alignment: .center) { centerOverlay }
-            .overlay { scrubOverlay }
-            .toolbar(.hidden, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .tabBar)
-            .task {
-                configureAudioSession()
-                addTimeObserver()
-                await loadFeed(reset: true)
+            .environmentObject(model)
+        }
+        .sheet(item: $systemPlayer) { item in
+            SystemPlayerView(url: item.url).ignoresSafeArea()
+        }
+        .sheet(item: $directoryTarget) { target in
+            NavigationStack {
+                DirectoryView(root: target.root, path: target.path)
+                    .environmentObject(model)
             }
-            .onChange(of: currentID) { _, newValue in
-                Task {
-                    await activate(newValue)
-                    await loadMoreIfNeeded(current: newValue)
-                }
-            }
-            .onChange(of: scope) { _, _ in Task { await resetAndReload() } }
-            .onChange(of: durationFilter) { _, _ in Task { await resetAndReload() } }
-            .onDisappear {
-                saveProgress(force: true)
-                if let timeObserver { player.removeTimeObserver(timeObserver) }
-                timeObserver = nil
-                player.pause()
-                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            }
-            .sheet(item: $authorSheet) { author in
-                NavigationStack {
-                    AuthorProfileView(author: author)
-                        .toolbar {
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button("完成") { authorSheet = nil }
-                            }
-                        }
-                }
-                .environmentObject(model)
-            }
-            .sheet(item: $systemPlayer) { item in
-                SystemPlayerView(url: item.url).ignoresSafeArea()
-            }
-            .sheet(item: $directoryTarget) { target in
-                NavigationStack {
-                    DirectoryView(root: target.root, path: target.path)
-                        .environmentObject(model)
-                }
-            }
-            .overlay {
-                if items.isEmpty && !loading && !errorText.isEmpty {
-                    ContentUnavailableView("短视频不可用", systemImage: "play.slash", description: Text(errorText))
-                } else if items.isEmpty && !loading {
+        }
+        .overlay {
+            if items.isEmpty && !loading && !errorText.isEmpty {
+                ContentUnavailableView("短视频不可用", systemImage: "play.slash", description: Text(errorText))
+            } else if items.isEmpty && !loading {
+                VStack(spacing: 14) {
                     ContentUnavailableView("还没有短视频", systemImage: "play.rectangle", description: Text("扫描资料库后，mp4 / mov / m4v / webm 会进入短视频。"))
+                    Button {
+                        Task { await refreshQueue() }
+                    } label: {
+                        Label("刷新队列", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
             }
+        }
         .background(Color.black)
         .preferredColorScheme(.dark)
     }
@@ -196,89 +218,137 @@ struct ShortVideosView: View {
         .id(item.id)
         .clipped()
     }
+
     // MARK: - 顶部 / 右侧 / 底部
 
     private var topBar: some View {
-        HStack(spacing: 10) {
-            Menu {
-                Picker("范围", selection: $scope) {
-                    ForEach(ShortsScope.allCases) { item in
-                        Text(item.title).tag(item)
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Menu {
+                    Picker("范围", selection: $scope) {
+                        ForEach(ShortsScope.allCases) { item in
+                            Text(item.title).tag(item)
+                        }
                     }
-                }
-                Divider()
-                Picker("时长", selection: $durationFilter) {
-                    ForEach(ShortsDuration.allCases) { item in
-                        Text(item.title).tag(item)
-                    }
-                }
-                if authorFilterId != nil || isBinge {
                     Divider()
-                    Button("退出筛选", systemImage: "xmark") { clearContextFilter() }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "line.3.horizontal.decrease.circle")
-                    Text(contextLabel)
-                        .lineLimit(1)
-                }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(.black.opacity(0.35), in: Capsule())
-            }
-
-            Spacer()
-
-            Button(action: toggleMute) {
-                Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .font(.system(size: 15, weight: .semibold))
+                    Picker("时长", selection: $durationFilter) {
+                        ForEach(ShortsDuration.allCases) { item in
+                            Text(item.title).tag(item)
+                        }
+                    }
+                    if authorFilterId != nil || isBinge {
+                        Divider()
+                        Button("退出筛选", systemImage: "xmark") { clearContextFilter() }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                        Text(contextLabel)
+                            .lineLimit(1)
+                    }
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.white)
-                    .frame(width: 36, height: 36)
-                    .background(.black.opacity(0.35), in: Circle())
-            }
-
-            Menu {
-                Button { Task { await openAuthor() } } label: {
-                    Label("作者主页", systemImage: "person.crop.circle")
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.35), in: Capsule())
                 }
-                .disabled(currentAsset?.authorId == nil)
-                if let id = currentAsset?.authorId, let name = currentAsset?.authorName {
+
+                if isBinge {
                     Button {
-                        authorFilterId = id
-                        authorFilterName = name
-                        Task { await resetAndReload() }
+                        exitBingeMode()
                     } label: {
-                        Label("只看作者：\(name)", systemImage: "person.crop.circle.badge.checkmark")
+                        HStack(spacing: 4) {
+                            Image(systemName: "xmark.circle.fill")
+                            Text("退出连播")
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(Color.accentColor.opacity(0.85), in: Capsule())
                     }
                 }
-                Button { Task { await openDirectory() } } label: {
-                    Label("所在目录", systemImage: "folder")
-                }
-                .disabled(currentAsset?.rootId == nil)
-                Button { Task { await startBinge() } } label: {
-                    Label("连播当前目录", systemImage: "rectangle.stack.badge.play")
-                }
-                .disabled(currentAsset == nil)
-                Button { Task { await openSystemPlayer() } } label: {
-                    Label("系统播放器", systemImage: "rectangle.inset.filled.and.person.filled")
-                }
-                .disabled(currentAsset == nil)
-                Divider()
-                Button { Task { await resetAndReload() } } label: {
-                    Label("刷新推荐", systemImage: "arrow.clockwise")
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 17, weight: .semibold))
+
+                Spacer()
+
+                Button {
+                    Task { await refreshQueue() }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 13, weight: .semibold))
+                            .rotationEffect(.degrees(Double(refreshTurns) * 360))
+                            .animation(.easeInOut(duration: 0.55), value: refreshTurns)
+                        Text("刷新队列")
+                            .font(.caption.weight(.semibold))
+                    }
                     .foregroundStyle(.white)
-                    .frame(width: 36, height: 36)
-                    .background(.black.opacity(0.35), in: Circle())
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.35), in: Capsule())
+                }
+                .disabled(loading)
+                .accessibilityLabel("刷新随机播放队列")
+
+                Button(action: toggleMute) {
+                    Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(.black.opacity(0.35), in: Circle())
+                }
+
+                Menu {
+                    Button { Task { await refreshQueue() } } label: {
+                        Label("刷新随机队列", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    Divider()
+                    Button { Task { await openAuthor() } } label: {
+                        Label("作者主页", systemImage: "person.crop.circle")
+                    }
+                    .disabled(currentAsset?.authorId == nil)
+                    if let id = currentAsset?.authorId, let name = currentAsset?.authorName {
+                        Button {
+                            authorFilterId = id
+                            authorFilterName = name
+                            Task { await resetAndReload() }
+                        } label: {
+                            Label("只看作者：\(name)", systemImage: "person.crop.circle.badge.checkmark")
+                        }
+                    }
+                    Button { Task { await openDirectory() } } label: {
+                        Label("所在目录", systemImage: "folder")
+                    }
+                    .disabled(currentAsset?.rootId == nil)
+                    Button { Task { await startBinge() } } label: {
+                        Label("连播当前目录", systemImage: "rectangle.stack.badge.play")
+                    }
+                    .disabled(currentAsset == nil)
+                    Button { Task { await openSystemPlayer() } } label: {
+                        Label("系统播放器", systemImage: "rectangle.inset.filled.and.person.filled")
+                    }
+                    .disabled(currentAsset == nil)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(.black.opacity(0.35), in: Circle())
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 8)
+
+            if let toastText {
+                Text(toastText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 8)
     }
 
     private var rightRail: some View {
@@ -305,16 +375,30 @@ struct ShortVideosView: View {
                 }
             }
 
-            Button { Task { await startBinge() } } label: {
+            Button { Task { await toggleBinge() } } label: {
                 VStack(spacing: 3) {
                     Image(systemName: isBinge ? "rectangle.stack.fill" : "rectangle.stack")
                         .font(.system(size: 24))
                         .foregroundStyle(isBinge ? Color.accentColor : Color.white)
-                    Text("连播")
+                    Text(isBinge ? "退出连播" : "连播")
                         .font(.caption2)
                         .foregroundStyle(.white.opacity(0.9))
                 }
             }
+
+            Button { Task { await refreshQueue() } } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 23, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .rotationEffect(.degrees(Double(refreshTurns) * 360))
+                        .animation(.easeInOut(duration: 0.55), value: refreshTurns)
+                    Text("刷新")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.9))
+                }
+            }
+            .disabled(loading)
         }
         .padding(.trailing, 14)
     }
@@ -427,7 +511,7 @@ struct ShortVideosView: View {
 
     private var centerOverlay: some View {
         ZStack {
-            if isBuffering {
+            if isBuffering || (loading && items.isEmpty) {
                 ProgressView().controlSize(.large).tint(.white)
             } else if let hudIcon {
                 Image(systemName: hudIcon)
@@ -448,7 +532,7 @@ struct ShortVideosView: View {
         .allowsHitTesting(!isBuffering)
     }
 
-    // MARK: - 数据
+    // MARK: - 智能随机推荐算法（对齐 Web 端 orderedShortFeed）
 
     private var contextLabel: String {
         if isBinge { return "连播 · \(bingeName)" }
@@ -456,7 +540,83 @@ struct ShortVideosView: View {
         return scope.title
     }
 
-    /// Business state belongs to the selected core, not device-wide preferences.
+    /// 对齐 Web 端 `orderedShortFeed(values, avoidId)`：
+    /// 1. 按 `parentPath`（所属目录/合集）分桶，每个桶再按 `seenIDs` 拆分为 `fresh`（未看）和 `watched`（已看）；
+    /// 2. 先轮询抽取所有桶的 `fresh` 视频，再轮询抽取 `watched` 视频；每轮将活跃目录桶随机洗牌后各随机抽 1 条；
+    /// 3. 彻底解决简单洗牌导致大合集连续出现、体感重复的问题，并保证刷新后首条不与刚看的 `avoidId` 重复。
+    private func orderedShortFeed(_ values: [LibraryAsset], avoidId: String? = nil) -> [LibraryAsset] {
+        var seen = Set<String>()
+        var uniqueValues: [LibraryAsset] = []
+        uniqueValues.reserveCapacity(values.count)
+        for item in values where seen.insert(item.id).inserted {
+            uniqueValues.append(item)
+        }
+        guard uniqueValues.count > 1 else { return uniqueValues }
+
+        struct Bucket {
+            var fresh: [LibraryAsset] = []
+            var watched: [LibraryAsset] = []
+        }
+
+        var groups: [String: Bucket] = [:]
+        for item in uniqueValues {
+            let key = "path:\(item.parentPath.isEmpty ? "/" : item.parentPath)"
+            var bucket = groups[key] ?? Bucket()
+            if seenIDs.contains(item.id) {
+                bucket.watched.append(item)
+            } else {
+                bucket.fresh.append(item)
+            }
+            groups[key] = bucket
+        }
+
+        var result: [LibraryAsset] = []
+        result.reserveCapacity(uniqueValues.count)
+
+        func takeRound(isFresh: Bool) {
+            var activeKeys = groups.keys.filter { key in
+                guard let bucket = groups[key] else { return false }
+                return isFresh ? !bucket.fresh.isEmpty : !bucket.watched.isEmpty
+            }
+            while !activeKeys.isEmpty {
+                activeKeys.shuffle()
+                for key in activeKeys {
+                    guard var bucket = groups[key] else { continue }
+                    if isFresh {
+                        guard !bucket.fresh.isEmpty else { continue }
+                        let idx = Int.random(in: 0..<bucket.fresh.count)
+                        result.append(bucket.fresh.remove(at: idx))
+                    } else {
+                        guard !bucket.watched.isEmpty else { continue }
+                        let idx = Int.random(in: 0..<bucket.watched.count)
+                        result.append(bucket.watched.remove(at: idx))
+                    }
+                    groups[key] = bucket
+                }
+                activeKeys.removeAll { key in
+                    guard let bucket = groups[key] else { return true }
+                    return isFresh ? bucket.fresh.isEmpty : bucket.watched.isEmpty
+                }
+            }
+        }
+
+        takeRound(isFresh: true)
+        takeRound(isFresh: false)
+
+        if let avoidId, result.count > 1, result[0].id == avoidId {
+            if let replacement = result.firstIndex(where: { $0.id != avoidId }) {
+                result.swapAt(0, replacement)
+            }
+        }
+        return result
+    }
+
+    /// 生成基于资产哈希环（`asset_<16hex>`）的随机游标起点，确保每次进入或刷新队列都能从全库不同区间随机采样。
+    private func randomCatalogCursor() -> String {
+        let prefix = Int.random(in: 0..<0xd800)
+        return String(format: "v2catalog|asset_%04x", prefix)
+    }
+
     @MainActor
     private func hydrateState(client: PMLAPIClient) async throws {
         async let favoriteIDs = client.favoriteIds()
@@ -467,6 +627,13 @@ struct ShortVideosView: View {
     }
 
     private func matchesScope(_ asset: LibraryAsset) -> Bool {
+        if let maxDur = durationFilter.rawValue > 0 ? Int64(durationFilter.rawValue) : nil,
+           let dur = asset.durationSeconds, dur > maxDur {
+            return false
+        }
+        if let authorFilterId, !authorFilterId.isEmpty, asset.authorId != authorFilterId {
+            return false
+        }
         switch scope {
         case .all: return true
         case .unwatched: return !seenIDs.contains(asset.id)
@@ -474,7 +641,37 @@ struct ShortVideosView: View {
         }
     }
 
-    private func loadFeed(reset: Bool) async {
+    /// 一键刷新随机队列：保留历史状态、重新在全库随机采样并按目录均衡洗牌，立即切到新队列首条播放。
+    @MainActor
+    private func refreshQueue() async {
+        guard !loading else { return }
+        refreshTurns += 1
+        let previousID = currentAsset?.id ?? currentID
+        if isBinge {
+            isBinge = false
+            bingeName = ""
+            savedRandomQueue = []
+        }
+        await loadFeed(reset: true, avoidId: previousID, isManualRefresh: true)
+        showToast("已刷新随机队列")
+    }
+
+    private func showToast(_ text: String) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            toastText = text
+        }
+        toastTask?.cancel()
+        toastTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if !Task.isCancelled {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    toastText = nil
+                }
+            }
+        }
+    }
+
+    private func loadFeed(reset: Bool, avoidId: String? = nil, isManualRefresh: Bool = false) async {
         guard let client = model.apiClient else { return }
         if reset {
             guard !loading else { return }
@@ -485,51 +682,111 @@ struct ShortVideosView: View {
             loadingMore = true
         }
         do {
-            if reset { try await hydrateState(client: client) }
-            var collected = reset ? [] : items
-            var cursor = reset ? nil : nextCursor
+            if reset {
+                try? await hydrateState(client: client)
+            }
+
+            if scope == .favorites && reset {
+                let favAssets = (try? await client.favoriteAssets(limit: 240)) ?? []
+                let videos = favAssets.filter { $0.mediaType == "video" && matchesScope($0) }
+                let ordered = orderedShortFeed(videos, avoidId: avoidId)
+                items = ordered
+                nextCursor = nil
+                loading = false
+                loadingMore = false
+                if let firstID = ordered.first?.id {
+                    currentID = firstID
+                    await activate(firstID, force: true)
+                }
+                return
+            }
+
+            var rawBatch: [LibraryAsset] = []
+            let useRandomStart = reset && (authorFilterId == nil || authorFilterId?.isEmpty == true)
+            var cursor: String? = reset ? (useRandomStart ? randomCatalogCursor() : nil) : nextCursor
+            var wrappedAround = false
             var attempts = 0
-            repeat {
+            let maxAttempts = reset ? 3 : 2
+
+            while attempts < maxAttempts {
                 let page = try await client.shortVideoFeed(
                     cursor: cursor,
-                    limit: 12,
+                    limit: 48,
                     authorId: authorFilterId,
                     maxDurationSeconds: durationFilter.rawValue
                 )
-                let existing = Set(collected.map(\.id))
-                let filtered = page.items.filter { matchesScope($0) && !existing.contains($0.id) }
-                collected.append(contentsOf: filtered)
+                let filtered = page.items.filter { matchesScope($0) }
+                rawBatch.append(contentsOf: filtered)
                 nextCursor = page.nextCursor
                 cursor = page.nextCursor
                 attempts += 1
-                if cursor == nil || collected.count >= 8 || attempts >= 3 { break }
-            } while true
 
-            items = collected
-            loadingMore = false
+                // 如果从随机哈希游标起步到达末尾，自动回绕到开头补齐候选池
+                if cursor == nil && useRandomStart && !wrappedAround && rawBatch.count < 36 {
+                    wrappedAround = true
+                    cursor = nil
+                    nextCursor = nil
+                    continue
+                }
+                if cursor == nil || rawBatch.count >= (reset ? 48 : 24) {
+                    break
+                }
+            }
+
+            // 维护会话候选池，让手动刷新队列时拥有更丰富的跨目录候选样本
+            var poolById: [String: LibraryAsset] = [:]
+            for item in candidatePool where matchesScope(item) {
+                poolById[item.id] = item
+            }
+            for item in rawBatch {
+                poolById[item.id] = item
+            }
+            if poolById.count > 360 {
+                candidatePool = Array(poolById.values.shuffled().prefix(360))
+            } else {
+                candidatePool = Array(poolById.values)
+            }
+
             if reset {
-                currentID = items.first?.id
+                let sourcePool = isManualRefresh && candidatePool.count > rawBatch.count ? candidatePool : rawBatch
+                let ordered = orderedShortFeed(sourcePool, avoidId: avoidId)
+                items = ordered
+                loading = false
+                loadingMore = false
+                if let firstID = ordered.first?.id {
+                    currentID = firstID
+                    await activate(firstID, force: true)
+                }
+            } else {
+                let existingIDs = Set(items.map(\.id))
+                let freshItems = rawBatch.filter { !existingIDs.contains($0.id) }
+                let shuffledMore = orderedShortFeed(freshItems, avoidId: currentID)
+                items.append(contentsOf: shuffledMore)
+                loadingMore = false
+                loading = false
             }
         } catch {
             if !pmlIsCancellation(error) {
                 errorText = error.localizedDescription
             }
+            loading = false
+            loadingMore = false
         }
-        loading = false
     }
 
     @MainActor
     private func loadMoreIfNeeded(current id: String?) async {
+        guard !isBinge else { return }
         guard let id, let index = items.firstIndex(where: { $0.id == id }) else { return }
-        guard nextCursor != nil, index >= items.count - 2, !loading, !loadingMore else { return }
+        guard nextCursor != nil, index >= items.count - 3, !loading, !loadingMore else { return }
         await loadFeed(reset: false)
     }
 
     @MainActor
-    private func activate(_ id: String?) async {
+    private func activate(_ id: String?, force: Bool = false) async {
         guard let id,
               let asset = items.first(where: { $0.id == id }) else { return }
-        if id == currentAsset?.id { return }
+        if !force && id == currentAsset?.id { return }
 
         saveProgress(force: true)
         activateGeneration += 1
@@ -622,21 +879,22 @@ struct ShortVideosView: View {
         }
         guard let client = model.apiClient else { return }
         do {
-            // Fetch before writing: never replace an existing resume position
-            // with zero merely because a clip has just become visible.
             let saved = try await client.playbackProgress(assetId: assetId)
             loadedProgress = true
             guard activateGeneration == generation, currentID == assetId else { return }
             if saved > 2 {
                 try await Task.sleep(nanoseconds: 350_000_000)
                 guard activateGeneration == generation, currentID == assetId else { return }
-                _ = await player.seek(
-                    to: CMTime(seconds: saved, preferredTimescale: 600),
-                    toleranceBefore: .init(seconds: 0.5, preferredTimescale: 600),
-                    toleranceAfter: .init(seconds: 0.5, preferredTimescale: 600)
-                )
-                guard activateGeneration == generation, currentID == assetId else { return }
-                progress = saved
+                let total = player.currentItem?.duration.seconds ?? 0
+                if !(total.isFinite && total > 5 && saved >= total - 2) {
+                    _ = await player.seek(
+                        to: CMTime(seconds: saved, preferredTimescale: 600),
+                        toleranceBefore: .init(seconds: 0.5, preferredTimescale: 600),
+                        toleranceAfter: .init(seconds: 0.5, preferredTimescale: 600)
+                    )
+                    guard activateGeneration == generation, currentID == assetId else { return }
+                    progress = saved
+                }
             }
             let current = player.currentTime().seconds
             let position = max(saved, current.isFinite ? max(0, current) : 0)
@@ -666,7 +924,9 @@ struct ShortVideosView: View {
         }
     }
 
+    @MainActor
     private func resetAndReload() async {
+        let previousID = currentAsset?.id ?? currentID
         saveProgress(force: true)
         activateGeneration += 1
         restoringProgressID = nil
@@ -680,7 +940,8 @@ struct ShortVideosView: View {
         isPlaying = false
         isBinge = false
         bingeName = ""
-        await loadFeed(reset: true)
+        savedRandomQueue = []
+        await loadFeed(reset: true, avoidId: previousID)
     }
 
     private func togglePlayback() {
@@ -739,6 +1000,15 @@ struct ShortVideosView: View {
     }
 
     @MainActor
+    private func toggleBinge() async {
+        if isBinge {
+            exitBingeMode()
+        } else {
+            await startBinge()
+        }
+    }
+
+    @MainActor
     private func startBinge() async {
         guard let client = model.apiClient, let asset = currentAsset,
               let all = try? await client.libraryAssets(filter: "videos", limit: 500) else { return }
@@ -746,18 +1016,42 @@ struct ShortVideosView: View {
             .filter { $0.parentPath == asset.parentPath }
             .sorted { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }
         guard !directory.isEmpty else { return }
+        if !isBinge {
+            savedRandomQueue = items
+            savedRandomID = currentID
+        }
         items = directory
         isBinge = true
         bingeName = String((asset.parentPath as NSString).lastPathComponent)
         authorFilterId = nil
         authorFilterName = nil
         currentID = asset.id
-        await activate(asset.id)
+        await activate(asset.id, force: true)
+        showToast("已进入目录连播（\(directory.count) 条）")
+    }
+
+    @MainActor
+    private func exitBingeMode() {
+        guard isBinge else { return }
+        isBinge = false
+        bingeName = ""
+        if !savedRandomQueue.isEmpty {
+            items = savedRandomQueue
+            let targetID = savedRandomID ?? savedRandomQueue.first?.id
+            savedRandomQueue = []
+            savedRandomID = nil
+            currentID = targetID
+            Task { await activate(targetID, force: true) }
+            showToast("已返回随机队列")
+        } else {
+            Task { await resetAndReload() }
+        }
     }
 
     private func clearContextFilter() {
         isBinge = false
         bingeName = ""
+        savedRandomQueue = []
         authorFilterId = nil
         authorFilterName = nil
         Task { await resetAndReload() }
@@ -794,6 +1088,33 @@ struct ShortVideosView: View {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .moviePlayback, options: [])
         try? session.setActive(true)
+    }
+
+    private func addEndObserver() {
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+        }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: nil,
+            queue: .main
+        ) { [self] note in
+            guard let ended = note.object as? AVPlayerItem,
+                  ended == player.currentItem else { return }
+            Task { @MainActor in
+                if let currentID,
+                   let idx = items.firstIndex(where: { $0.id == currentID }),
+                   items.indices.contains(idx + 1) {
+                    let nextID = items[idx + 1].id
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        self.currentID = nextID
+                    }
+                } else {
+                    await player.seek(to: .zero)
+                    player.play()
+                }
+            }
+        }
     }
 
     private func addTimeObserver() {
@@ -850,38 +1171,45 @@ private struct ShortVideoSlide: View {
     let onLongPress: (Bool) -> Void
 
     var body: some View {
-        ZStack {
-            Color.black
-            if isCurrent {
-                PlayerLayerContainer(player: player, gravity: .resizeAspectFill)
+        GeometryReader { geo in
+            ZStack {
+                Color.black
+                if isCurrent {
+                    PlayerLayerContainer(player: player, gravity: .resizeAspectFill)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
+                if let poster, showPoster || !isCurrent {
+                    Image(uiImage: poster)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                        .opacity(isCurrent && !showPoster ? 0 : 1)
+                        .animation(.easeOut(duration: 0.35), value: showPoster)
+                        .allowsHitTesting(false)
+                }
+                if isCurrent {
+                    HorizontalScrubPad(
+                        enabled: scrubDuration > 1,
+                        duration: scrubDuration,
+                        currentTime: scrubTime,
+                        onBegin: onScrubBegin,
+                        onPreview: onScrubPreview,
+                        onEnd: onScrubEnd
+                    )
+                }
             }
-            if let poster, showPoster || !isCurrent {
-                Image(uiImage: poster)
-                    .resizable()
-                    .scaledToFill()
-                    .opacity(isCurrent && !showPoster ? 0 : 1)
-                    .animation(.easeOut(duration: 0.35), value: showPoster)
-                    .allowsHitTesting(false)
-            }
-            if isCurrent {
-                HorizontalScrubPad(
-                    enabled: scrubDuration > 1,
-                    duration: scrubDuration,
-                    currentTime: scrubTime,
-                    onBegin: onScrubBegin,
-                    onPreview: onScrubPreview,
-                    onEnd: onScrubEnd
-                )
-            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
+            .contentShape(Rectangle())
+            .onTapGesture { onSingleTap() }
+            .simultaneousGesture(
+                SpatialTapGesture(count: 2).onEnded { _ in onDoubleTap() }
+            )
+            .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
+                onLongPress(pressing)
+            }, perform: {})
         }
-        .contentShape(Rectangle())
-        .onTapGesture { onSingleTap() }
-        .simultaneousGesture(
-            SpatialTapGesture(count: 2).onEnded { _ in onDoubleTap() }
-        )
-        .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
-            onLongPress(pressing)
-        }, perform: {})
     }
 }
 

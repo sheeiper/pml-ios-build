@@ -17,6 +17,122 @@ struct DirectoryRoute: Hashable {
     }
 }
 
+/// 目录与收藏内存缓存：
+/// 1. 秒开已访问或已预取的子目录（0ms 渲染，告别每次进入文件夹转圈等待）；
+/// 2. 缓存全局收藏 ID 集合，消除每次打开文件夹前串行等待 `list_favorite_ids` 的网络往返；
+/// 3. 打开父目录后后台静默预热前几个子文件夹，点击子文件夹直接命中内存。
+@MainActor
+final class DirectoryMemoryCache {
+    static let shared = DirectoryMemoryCache()
+
+    struct Snapshot {
+        var entries: [RemoteBrowserEntry]
+        var nextCursor: String?
+        var updatedAt: Date
+    }
+
+    private var pages: [String: Snapshot] = [:]
+    private var order: [String] = []
+    private var prefetchTask: Task<Void, Never>?
+
+    private(set) var favoriteIds: Set<String> = []
+    private var favoritesUpdatedAt: Date?
+
+    private static let maxCachedFolders = 160
+
+    private func makeKey(rootId: String, path: String) -> String {
+        let clean = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(rootId)|\(clean)"
+    }
+
+    func snapshot(rootId: String, path: String) -> Snapshot? {
+        pages[makeKey(rootId: rootId, path: path)]
+    }
+
+    func store(entries: [RemoteBrowserEntry], nextCursor: String?, rootId: String, path: String) {
+        let key = makeKey(rootId: rootId, path: path)
+        if pages[key] == nil {
+            order.append(key)
+            if order.count > Self.maxCachedFolders {
+                let overflow = order.count - Self.maxCachedFolders
+                for old in order.prefix(overflow) {
+                    pages.removeValue(forKey: old)
+                }
+                order.removeFirst(overflow)
+            }
+        }
+        pages[key] = Snapshot(entries: entries, nextCursor: nextCursor, updatedAt: Date())
+    }
+
+    func invalidate(rootId: String, path: String) {
+        pages.removeValue(forKey: makeKey(rootId: rootId, path: path))
+    }
+
+    func updateFavorites(_ ids: Set<String>) {
+        favoriteIds = ids
+        favoritesUpdatedAt = Date()
+    }
+
+    var shouldRefreshFavorites: Bool {
+        guard let favoritesUpdatedAt else { return true }
+        return Date().timeIntervalSince(favoritesUpdatedAt) > 60
+    }
+
+    func scheduleSubfolderPrefetch(
+        subfolders: [RemoteBrowserEntry],
+        root: LibraryRoot,
+        domain: String?,
+        sort: String,
+        client: PMLAPIClient?
+    ) {
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        guard let client, !subfolders.isEmpty else { return }
+        let targets = subfolders.filter { snapshot(rootId: root.id, path: $0.path) == nil }.prefix(6)
+        guard !targets.isEmpty else { return }
+
+        prefetchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            for folder in targets {
+                if Task.isCancelled { break }
+                if snapshot(rootId: root.id, path: folder.path) != nil { continue }
+                do {
+                    if let domain, root.id.hasPrefix("domain-") {
+                        let children = try await client.domainChildren(domain: domain, path: folder.path)
+                        if Task.isCancelled { break }
+                        let mapped = children.map { child in
+                            RemoteBrowserEntry(
+                                path: child.path,
+                                name: child.name,
+                                isDirectory: child.isDirectory,
+                                sizeBytes: child.sizeBytes,
+                                modifiedAt: child.modifiedAt,
+                                etag: nil,
+                                assetId: child.assetId,
+                                mediaType: child.mediaType,
+                                thumbnailSource: nil,
+                                coverAssetId: child.thumbnailAssetId
+                            )
+                        }
+                        store(entries: mapped, nextCursor: nil, rootId: root.id, path: folder.path)
+                    } else {
+                        let page = try await client.remoteChildren(
+                            rootId: root.id,
+                            path: folder.path,
+                            refresh: false,
+                            sort: sort
+                        )
+                        if Task.isCancelled { break }
+                        store(entries: page.items, nextCursor: page.nextCursor, rootId: root.id, path: folder.path)
+                    }
+                } catch {
+                    continue
+                }
+            }
+        }
+    }
+}
+
 /// 目录浏览：列表 / 网格 / 照片墙三视图，排序、搜索、收藏与缩略图按需生成。
 struct DirectoryView: View {
     let root: LibraryRoot
@@ -61,6 +177,8 @@ struct DirectoryView: View {
     @State private var comicTarget: ComicArchiveTarget?
     @State private var folderComic: ComicFolderTarget?
     @State private var showRemoteSearch = false
+    @State private var openTask: Task<Void, Never>?
+    @State private var openingEntryPath: String?
 
     // 预计算与缓存的衍生状态，彻底消除每次视图刷新重复执行 O(N log N) 排序与 DateFormatter 解析
     @State private var cachedSortedEntries: [RemoteBrowserEntry] = []
@@ -101,7 +219,7 @@ struct DirectoryView: View {
             applySearchFilter()
         }
         .refreshable { await reload(force: true) }
-        .task { await bootstrap() }
+        .task(id: "\(root.id)|\(path)") { await bootstrap() }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 HStack(spacing: 14) {
@@ -178,6 +296,7 @@ struct DirectoryView: View {
                 sourceLabel: item.sourceLabel,
                 remotePath: item.remotePath
             )
+            .id(item.id)
             .environmentObject(model)
         }
         .fullScreenCover(item: $imageContext) { context in
@@ -192,7 +311,6 @@ struct DirectoryView: View {
             ComicFolderReaderView(target: target)
                 .environmentObject(model)
         }
-
         .sheet(isPresented: $showRemoteSearch) {
             RemoteSearchView(root: root, parentPath: path)
                 .environmentObject(model)
@@ -211,7 +329,9 @@ struct DirectoryView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button {
-                        Task { await playFolder() }
+                        if let entry = resumeVideo ?? playableVideos.first {
+                            triggerOpen(entry)
+                        }
                     } label: {
                         Label(resumeVideo == nil ? "播放" : "继续播放", systemImage: "play.fill")
                             .font(.subheadline.weight(.semibold))
@@ -255,11 +375,6 @@ struct DirectoryView: View {
 
     private var folderMeta: String {
         cachedFolderMeta
-    }
-
-    private func playFolder() async {
-        guard let entry = resumeVideo ?? playableVideos.first else { return }
-        await open(entry)
     }
 
     private var title: String {
@@ -404,6 +519,7 @@ struct DirectoryView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 7)
+        .clipped()
         .contentShape(Rectangle())
 
         if entry.isDirectory {
@@ -417,10 +533,11 @@ struct DirectoryView: View {
             .contextMenu { contextMenu(for: entry) }
         } else {
             Button {
-                Task { await open(entry) }
+                triggerOpen(entry)
             } label: {
                 content
             }
+            .id("file-\(entry.path)")
             .buttonStyle(.plain)
             .contextMenu { contextMenu(for: entry) }
         }
@@ -439,10 +556,11 @@ struct DirectoryView: View {
             .contextMenu { contextMenu(for: entry) }
         } else {
             Button {
-                Task { await open(entry) }
+                triggerOpen(entry)
             } label: {
                 cellBody(entry)
             }
+            .id("file-\(entry.path)")
             .buttonStyle(.plain)
             .contextMenu { contextMenu(for: entry) }
         }
@@ -490,8 +608,10 @@ struct DirectoryView: View {
                                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                         }
                     }
+                    .allowsHitTesting(false)
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .clipped()
 
             Text(entry.name)
                 .font(.caption2)
@@ -505,8 +625,8 @@ struct DirectoryView: View {
 
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
         .clipped()
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
@@ -524,6 +644,7 @@ struct DirectoryView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
+        .allowsHitTesting(false)
     }
 
     @ViewBuilder
@@ -596,6 +717,8 @@ struct DirectoryView: View {
         }
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipped()
+        .allowsHitTesting(false)
     }
 
     // MARK: - 数据与预计算缓存
@@ -687,18 +810,43 @@ struct DirectoryView: View {
         cachedFolderMeta = parts.joined(separator: " · ")
     }
 
+    @MainActor
     private func bootstrap() async {
         layout = BrowsePreferences.shared.layout(rootId: root.id, path: path)
         sort = BrowsePreferences.shared.sort(rootId: root.id, path: path)
-        await loadFavorites()
-        await reload(force: false)
+
+        // 1. 立即同步读取内存中的收藏集与目录快照（0ms 响应，彻底砍掉串行等待 list_favorite_ids 的耗时）
+        favorites = DirectoryMemoryCache.shared.favoriteIds
+        if DirectoryMemoryCache.shared.shouldRefreshFavorites {
+            Task { @MainActor in
+                await loadFavorites()
+            }
+        }
+
+        if let cached = DirectoryMemoryCache.shared.snapshot(rootId: root.id, path: path) {
+            entries = cached.entries
+            nextCursor = cached.nextCursor
+            recomputeEntries(resetDates: true)
+            loading = false
+            prefetchThumbnails(visibleEntries)
+            scheduleSubfolderPrefetch()
+            // 缓存未超过 45 秒直接复用，超过则后台静默刷新
+            if Date().timeIntervalSince(cached.updatedAt) > 45 {
+                await reload(force: false, silent: true)
+            }
+            return
+        }
+
+        await reload(force: false, silent: false)
     }
 
     @MainActor
     private func loadFavorites() async {
         guard let client = model.apiClient else { return }
         if let ids = try? await client.favoriteIds() {
-            favorites = Set(ids)
+            let set = Set(ids)
+            favorites = set
+            DirectoryMemoryCache.shared.updateFavorites(set)
         }
     }
 
@@ -711,26 +859,65 @@ struct DirectoryView: View {
             } else {
                 favorites.remove(assetId)
             }
+            DirectoryMemoryCache.shared.updateFavorites(favorites)
         }
     }
 
+    private func fetchPage(
+        client: PMLAPIClient,
+        refresh: Bool,
+        cursor: String? = nil
+    ) async throws -> RemoteBrowserPage {
+        if let domain, root.id.hasPrefix("domain-") {
+            if refresh {
+                _ = try? await client.refreshDomainPath(domain: domain, path: path)
+            }
+            let children = try await client.domainChildren(domain: domain, path: path)
+            let items = children.map { child in
+                RemoteBrowserEntry(
+                    path: child.path,
+                    name: child.name,
+                    isDirectory: child.isDirectory,
+                    sizeBytes: child.sizeBytes,
+                    modifiedAt: child.modifiedAt,
+                    etag: nil,
+                    assetId: child.assetId,
+                    mediaType: child.mediaType,
+                    thumbnailSource: nil,
+                    coverAssetId: child.thumbnailAssetId
+                )
+            }
+            return RemoteBrowserPage(items: items, nextCursor: nil, fromLocalCache: !refresh)
+        }
+        return try await client.remoteChildren(
+            rootId: root.id,
+            path: path,
+            cursor: cursor,
+            refresh: refresh,
+            sort: sort.rawValue
+        )
+    }
+
     @MainActor
-    private func reload(force: Bool, retried: Bool = false) async {
+    private func reload(force: Bool, retried: Bool = false, silent: Bool = false) async {
         guard let client = model.apiClient else { return }
-        loading = true
+        if !silent {
+            loading = true
+        }
         errorText = ""
         do {
-            if let domain, force {
+            if let domain, force, !root.id.hasPrefix("domain-") {
                 _ = try await client.refreshDomainPath(domain: domain, path: path)
             }
-            let page = try await client.remoteChildren(
-                rootId: root.id,
-                path: path,
-                refresh: force && domain == nil,
-                sort: sort.rawValue
-            )
+            let page = try await fetchPage(client: client, refresh: force && domain == nil)
             entries = page.items
             nextCursor = page.nextCursor
+            DirectoryMemoryCache.shared.store(
+                entries: page.items,
+                nextCursor: page.nextCursor,
+                rootId: root.id,
+                path: path
+            )
             if force {
                 for id in page.items.compactMap({ $0.assetId ?? $0.coverAssetId }) {
                     ThumbnailService.shared.forget(assetId: id)
@@ -738,18 +925,22 @@ struct DirectoryView: View {
             }
             recomputeEntries(resetDates: true)
             prefetchThumbnails(visibleEntries)
+            scheduleSubfolderPrefetch()
+
             if !force && entries.isEmpty && nextCursor == nil && !autoRefreshed {
                 autoRefreshed = true
-                let fresh = try await client.remoteChildren(
-                    rootId: root.id,
-                    path: path,
-                    refresh: true,
-                    sort: sort.rawValue
-                )
+                let fresh = try await fetchPage(client: client, refresh: true)
                 entries = fresh.items
                 nextCursor = fresh.nextCursor
+                DirectoryMemoryCache.shared.store(
+                    entries: fresh.items,
+                    nextCursor: fresh.nextCursor,
+                    rootId: root.id,
+                    path: path
+                )
                 recomputeEntries(resetDates: true)
                 prefetchThumbnails(visibleEntries)
+                scheduleSubfolderPrefetch()
             }
             loading = false
         } catch {
@@ -761,33 +952,49 @@ struct DirectoryView: View {
             if !retried && (message.contains("尚未连接") || message.contains("未连接")) {
                 _ = try? await client.restoreConnection()
                 loading = false
-                await reload(force: force, retried: true)
+                await reload(force: force, retried: true, silent: silent)
                 return
             }
-            errorText = message
+            if !silent || entries.isEmpty {
+                errorText = message
+            }
             loading = false
         }
     }
 
     @MainActor
     private func prefetchThumbnails(_ items: [RemoteBrowserEntry]) {
-        let ids = items.prefix(12).compactMap { $0.assetId ?? $0.coverAssetId }
+        let ids = items.prefix(8).compactMap { $0.assetId ?? $0.coverAssetId }
         guard !ids.isEmpty else { return }
         ThumbnailService.shared.prefetch(assetIds: Array(ids), client: model.apiClient)
+    }
+
+    @MainActor
+    private func scheduleSubfolderPrefetch() {
+        let subfolders = visibleEntries.filter(\.isDirectory)
+        guard !subfolders.isEmpty else { return }
+        DirectoryMemoryCache.shared.scheduleSubfolderPrefetch(
+            subfolders: subfolders,
+            root: root,
+            domain: domain,
+            sort: sort.rawValue,
+            client: model.apiClient
+        )
     }
 
     private func loadMore(cursor: String) async {
         guard let client = model.apiClient, !loadingMore else { return }
         loadingMore = true
         do {
-            let page = try await client.remoteChildren(
-                rootId: root.id,
-                path: path,
-                cursor: cursor,
-                sort: sort.rawValue
-            )
+            let page = try await fetchPage(client: client, refresh: false, cursor: cursor)
             entries.append(contentsOf: page.items)
             nextCursor = page.nextCursor
+            DirectoryMemoryCache.shared.store(
+                entries: entries,
+                nextCursor: nextCursor,
+                rootId: root.id,
+                path: path
+            )
             recomputeEntries(resetDates: false)
             prefetchThumbnails(page.items)
         } catch {
@@ -798,8 +1005,19 @@ struct DirectoryView: View {
         loadingMore = false
     }
 
+    @MainActor
+    private func triggerOpen(_ entry: RemoteBrowserEntry) {
+        openTask?.cancel()
+        openingEntryPath = entry.path
+        openTask = Task { @MainActor in
+            await open(entry)
+        }
+    }
+
+    @MainActor
     private func open(_ entry: RemoteBrowserEntry) async {
         guard model.apiClient != nil else { return }
+        let requestedPath = entry.path
         guard let assetId = entry.assetId else {
             errorText = "该文件没有可预览的索引资源"
             return
@@ -813,22 +1031,25 @@ struct DirectoryView: View {
             return
         }
         if entry.isImage {
-            if let index = imageEntries.firstIndex(where: { $0.id == entry.id }) {
+            if let index = imageEntries.firstIndex(where: { $0.path == requestedPath }) {
                 imageContext = ImageViewerContext(entries: imageEntries, startIndex: index)
             } else {
                 imageContext = ImageViewerContext(entries: [entry], startIndex: 0)
             }
             return
         }
-        guard let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else {
-            errorText = "无法获取播放地址"
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: requestedPath) else {
+            if openingEntryPath == requestedPath {
+                errorText = "无法获取播放地址"
+            }
             return
         }
+        guard !Task.isCancelled, openingEntryPath == requestedPath else { return }
         let videos = cachedPlayableVideos
         videoPlaylist = videos.map {
-            VideoPlaylistItem(id: $0.id, title: $0.name, assetId: $0.assetId, remotePath: $0.path)
+            VideoPlaylistItem(id: $0.path, title: $0.name, assetId: $0.assetId, remotePath: $0.path)
         }
-        videoPlaylistIndex = videos.firstIndex(where: { $0.id == entry.id })
+        videoPlaylistIndex = videos.firstIndex(where: { $0.path == requestedPath })
         preview = PreviewItem(
             url: source.url,
             isVideo: entry.isVideo,
@@ -836,7 +1057,7 @@ struct DirectoryView: View {
             title: entry.name,
             fallbackURL: source.fallbackURL,
             sourceLabel: source.label,
-            remotePath: entry.path
+            remotePath: requestedPath
         )
     }
 

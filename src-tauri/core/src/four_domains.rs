@@ -1850,20 +1850,20 @@ pub fn children(
         .unwrap_or(&root_path)
         .trim_end_matches('/')
         .to_owned();
-    let prefix = if parent.is_empty() {
-        "%".to_owned()
+    let (prefix_start, prefix_end) = if parent.is_empty() {
+        (String::new(), "\u{10FFFF}".to_owned())
     } else {
-        format!("{parent}/%")
+        (format!("{parent}/"), format!("{parent}0"))
     };
     let mut statement = connection
         .prepare(
             "SELECT id,remote_path,file_name,media_type,size_bytes,modified_at,thumbnail_asset_id
-             FROM assets WHERE domain=?1 AND missing=0 AND remote_path LIKE ?2
-             ORDER BY remote_path COLLATE NOCASE",
+             FROM assets WHERE domain=?1 AND missing=0 AND remote_path >= ?2 AND remote_path < ?3
+             ORDER BY remote_path",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(params![domain, prefix], |row| {
+        .query_map(params![domain, prefix_start, prefix_end], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -2059,10 +2059,10 @@ pub async fn compat_remote_children(
         "SELECT etag FROM provider_directory_entries WHERE domain=?1 AND root_id=?2 AND parent_path=?3 AND remote_path=?4")
         .map_err(|error| error.to_string())?;
     let mut default_cover = connection.prepare(
-        "SELECT id FROM assets WHERE domain=?1 AND missing=0 AND substr(remote_path,1,length(?2))=?2
+        "SELECT id FROM assets WHERE domain=?1 AND missing=0 AND remote_path >= ?2 AND remote_path < ?3
          AND media_type IN ('image','video','comicPage','comicArchive')
          ORDER BY CASE WHEN media_type IN ('image','comicPage') THEN 0 ELSE 1 END,
-            remote_path COLLATE NOCASE,id LIMIT 1")
+            remote_path,id LIMIT 1")
         .map_err(|error| error.to_string())?;
     let mut items = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -2070,7 +2070,7 @@ pub async fn compat_remote_children(
             if let Some(cover) = covers.get(&entry.path).filter(|value| !value.is_empty()) {
                 Some(cover.clone())
             } else {
-                default_cover.query_row(params![domain, format!("{}/", entry.path)], |row| row.get::<_, String>(0))
+                default_cover.query_row(params![domain, format!("{}/", entry.path), format!("{}0", entry.path)], |row| row.get::<_, String>(0))
                     .optional().map_err(|error| error.to_string())?
             }
         } else { None };
@@ -2083,7 +2083,7 @@ pub async fn compat_remote_children(
             .optional().map_err(|error| error.to_string())?.flatten();
         let (asset_etag, duration, progress, thumbnail_id) = asset_metadata.unwrap_or((None,None,None,None));
         let thumbnail_source = if let Some(id) = entry.asset_id.as_ref().or(cover.as_ref()) {
-            media_library::cached_asset_cover_url(&app, id)
+            media_library::cached_asset_cover_url_with_conn(&app, &connection, id)
         } else { None };
         items.push(serde_json::json!({
             "path": entry.path,

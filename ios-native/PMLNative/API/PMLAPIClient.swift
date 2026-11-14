@@ -34,11 +34,13 @@ struct PMLAPIClient {
 
 
     /// App 前后台切换后可能残留失效连接，对可重试错误做退避重试。
-    private static func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+    private static func send(_ request: URLRequest, isThumbnail: Bool = false) async throws -> (Data, URLResponse) {
         var lastError: Error?
-        for attempt in 0..<3 {
+        let maxAttempts = isThumbnail ? 2 : 3
+        for attempt in 0..<maxAttempts {
             do {
-                return try await APISession.shared.session.data(for: request)
+                let targetSession = isThumbnail ? APISession.shared.thumbnailSession : APISession.shared.session
+                return try await targetSession.data(for: request)
             } catch {
                 let ns = error as NSError
                 let retriable = ns.domain == NSURLErrorDomain && [
@@ -47,9 +49,11 @@ struct PMLAPIClient {
                     NSURLErrorTimedOut,
                     NSURLErrorCannotFindHost,
                 ].contains(ns.code)
-                if !retriable || attempt == 2 { throw error }
+                if !retriable || attempt == maxAttempts - 1 { throw error }
                 lastError = error
-                APISession.shared.reset()
+                if !isThumbnail {
+                    APISession.shared.reset()
+                }
                 try? await Task.sleep(nanoseconds: UInt64(250_000_000 * (attempt + 1)))
             }
         }
@@ -92,7 +96,7 @@ struct PMLAPIClient {
         let credential = Data("\(configuration.username):\(configuration.password)".utf8).base64EncodedString()
         request.setValue("Basic \(credential)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await Self.send(request)
+        let (data, response) = try await Self.send(request, isThumbnail: false)
         guard let http = response as? HTTPURLResponse else { throw APIError.malformedResponse }
         guard (200..<300).contains(http.statusCode) else {
             throw APIError.server(String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)")
@@ -124,7 +128,8 @@ struct PMLAPIClient {
         request.setValue("Basic \(credential)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONSerialization.data(withJSONObject: arguments)
 
-        let (data, response) = try await Self.send(request)
+        let isThumbnail = (name == "get_thumbnail_input" || name == "get_asset_thumbnail" || name == "save_asset_thumbnail")
+        let (data, response) = try await Self.send(request, isThumbnail: isThumbnail)
         guard let http = response as? HTTPURLResponse else { throw APIError.malformedResponse }
         if http.statusCode == 401 { throw APIError.unauthorized }
         guard (200..<300).contains(http.statusCode) else {

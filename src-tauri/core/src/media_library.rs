@@ -3200,9 +3200,35 @@ fn get_thumbnail_file_modified(directory: &std::path::Path, file_name: &str) -> 
     map.get(file_name).copied()
 }
 
+fn asset_thumbnail_path_with_conn(app: &AppHandle, connection: &Connection, asset_id: &str) -> Result<PathBuf, String> {
+    if asset_id.starts_with("author_") || asset_id.starts_with("banner_") {
+        let cache_dir = cache_base_path(app)?.join("thumbnails");
+        return Ok(cache_dir.join(format!("{asset_id}.jpg")));
+    }
+    let (remote_path, size_bytes, etag, content_hash): (
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+    ) = connection
+        .query_row(
+            "SELECT remote_path, size_bytes, COALESCE(etag, modified_at), content_hash
+             FROM assets WHERE id = ?1 AND missing = 0",
+            params![asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|_| "找不到要缓存缩略图的媒体文件".to_string())?;
+    thumbnail_path_from_metadata(app, asset_id, &remote_path, size_bytes, etag, content_hash)
+}
+
 /// Resolve only a locally cached cover using canonical V2 asset metadata.
 pub(crate) fn cached_asset_cover_url(app: &AppHandle, asset_id: &str) -> Option<String> {
     let path = asset_thumbnail_path(app, asset_id).ok()?;
+    cached_cover_url(asset_id, &path)
+}
+
+pub(crate) fn cached_asset_cover_url_with_conn(app: &AppHandle, connection: &Connection, asset_id: &str) -> Option<String> {
+    let path = asset_thumbnail_path_with_conn(app, connection, asset_id).ok()?;
     cached_cover_url(asset_id, &path)
 }
 

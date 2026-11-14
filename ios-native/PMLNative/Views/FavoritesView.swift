@@ -45,6 +45,7 @@ struct FavoritesView: View {
                 assetId: item.assetId,
                 startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel, remotePath: item.remotePath
             )
+            .id(item.id)
             .environmentObject(model)
         }
         .fullScreenCover(item: $imageContext) { context in
@@ -58,26 +59,22 @@ struct FavoritesView: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(.quaternary.opacity(0.3))
-                if let image = thumbs.images[asset.id] {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                } else {
+                AssetThumbnailView(assetId: asset.thumbnailAssetId ?? asset.id, contentMode: .fill) {
                     Image(systemName: asset.mediaType == "video" ? "play.rectangle.fill" : "photo.fill")
                         .foregroundStyle(.tint)
                 }
             }
             .frame(height: 104)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .clipped()
 
             Text(asset.fileName)
                 .font(.caption)
                 .lineLimit(2)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task {
-            await thumbs.image(assetId: asset.id, client: model.apiClient)
-        }
+        .clipped()
+        .contentShape(Rectangle())
         .onTapGesture {
             Task { await open(asset) }
         }

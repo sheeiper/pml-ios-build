@@ -97,6 +97,7 @@ struct HomeView: View {
                         assetId: item.assetId,
                         startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel, remotePath: item.remotePath
                     )
+                    .id(item.id)
                     .environmentObject(model)
                 } else {
                     ImageViewerSheet(url: item.url)
@@ -184,6 +185,8 @@ struct HomeView: View {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
+                        .frame(width: 132, height: 96)
+                        .clipped()
                 } else {
                     Image(systemName: asset.mediaType == "video" ? "play.rectangle.fill" : "photo.fill")
                         .font(.system(size: 20))
@@ -192,12 +195,15 @@ struct HomeView: View {
             }
             .frame(width: 132, height: 96)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .clipped()
+            .allowsHitTesting(false)
 
             Text(asset.fileName)
                 .font(.caption)
                 .lineLimit(1)
                 .frame(width: 132, alignment: .leading)
         }
+        .contentShape(Rectangle())
     }
 
     private var scanCard: some View {
