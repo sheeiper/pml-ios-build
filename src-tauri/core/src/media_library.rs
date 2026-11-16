@@ -10652,6 +10652,7 @@ pub async fn find_asset_subtitles(
 pub struct SiblingVideo {
     pub id: String,
     pub title: String,
+    pub remote_path: String,
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
@@ -10681,6 +10682,7 @@ pub fn list_sibling_videos(app: AppHandle, asset_id: String) -> Result<Vec<Sibli
             Ok(SiblingVideo {
                 id: row.get(0)?,
                 title: row.get(1)?,
+                remote_path: row.get(2)?,
             })
         })
         .map_err(database_error)?;

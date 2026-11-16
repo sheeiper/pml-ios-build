@@ -454,7 +454,7 @@ struct GestureVideoPlayerSheet: View {
         addTimeObserver()
         loadCurrent(trackResume: true)
         scheduleHideControls()
-        if playlist.isEmpty, let assetId = currentAssetId {
+        if playlist.count <= 1, let assetId = currentAssetId {
             Task { await loadSiblingPlaylist(assetId) }
         }
         if let existing = backgroundObserver {
@@ -615,7 +615,8 @@ struct GestureVideoPlayerSheet: View {
         }
         let item = AVPlayerItem(asset: asset)
         let isMOV = url.pathExtension.lowercased() == "mov"
-        item.preferredForwardBufferDuration = isMOV ? 1.5 : 3.0
+        // 赋予充足的前向预缓冲时长（MOV 取 6 秒，其余高码率/大视频取 30 秒），提供充足吸震区，根治千兆局域网播放时的间歇性卡顿
+        item.preferredForwardBufferDuration = isMOV ? 6.0 : 30.0
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         return item
     }

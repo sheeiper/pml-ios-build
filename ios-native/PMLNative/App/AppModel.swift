@@ -105,19 +105,27 @@ final class AppModel: ObservableObject {
 
     // MARK: - 播放地址解析
 
-    /// 服务器模式只走 AList `/d`。视频经本地代理转发 Range；图片直接用 `/d`。不回退服务器中转。
+    /// 服务器模式优先走 AList `/d`。视频经本地代理转发 Range；若直链映射失败则回退服务器代理兜底。
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         if settings.mode == .server {
-            guard let remotePath, let direct = alistDirectURL(remotePath: remotePath) else {
-                return nil
+            var direct: URL?
+            if let remotePath {
+                direct = alistDirectURL(remotePath: remotePath)
             }
-            if Self.isVideoPath(remotePath) {
-                guard let proxied = await LocalMediaProxy.shared.register(directURL: direct) else {
-                    return nil
+            if let direct {
+                if let remotePath, Self.isVideoPath(remotePath) {
+                    if let proxied = await LocalMediaProxy.shared.register(directURL: direct) {
+                        return PlaybackSource(url: proxied, fallbackURL: nil, label: "AList 直连")
+                    }
                 }
-                return PlaybackSource(url: proxied, fallbackURL: nil, label: "AList 直连")
+                return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
             }
-            return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
+            // 兜底：如果 remotePath 缺失或 AList 映射失败，向服务端申请中转流地址
+            if let client = apiClient, let assetId,
+               let url = try? await client.mediaSourceURL(assetId: assetId) {
+                return PlaybackSource(url: url, fallbackURL: nil, label: "服务器中转")
+            }
+            return nil
         }
 
         guard let client = localClient, let assetId,

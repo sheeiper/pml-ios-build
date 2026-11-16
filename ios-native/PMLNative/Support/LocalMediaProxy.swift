@@ -37,11 +37,11 @@ final class LocalMediaProxy: NSObject {
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 3600
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.httpMaximumConnectionsPerHost = 8
+        config.httpMaximumConnectionsPerHost = 16
         config.waitsForConnectivity = false
         let delegateQueue = OperationQueue()
         delegateQueue.name = "pml.local-proxy.upstream"
-        delegateQueue.maxConcurrentOperationCount = 8
+        delegateQueue.maxConcurrentOperationCount = 16
         delegateQueue.qualityOfService = .userInitiated
         return URLSession(configuration: config, delegate: demux, delegateQueue: delegateQueue)
     }()
@@ -317,8 +317,9 @@ fileprivate final class ProxyTransfer: NSObject {
     private var suspended = false
     private var queuedBytes = 0
 
-    private static let highWaterMark = 1_572_864 // 1.5 MB
-    private static let lowWaterMark = 524_288    // 512 KB
+    // 支持千兆高速局域网和 4K/原盘高码率视频平滑传输的水位线，彻底避免频繁挂起上游 TCP 导致断崖降速
+    private static let highWaterMark = 24 * 1024 * 1024 // 24 MB
+    private static let lowWaterMark = 8 * 1024 * 1024   // 8 MB
 
     init(
         proxy: LocalMediaProxy,

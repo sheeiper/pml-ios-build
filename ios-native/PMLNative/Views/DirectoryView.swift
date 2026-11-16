@@ -1045,11 +1045,11 @@ struct DirectoryView: View {
             return
         }
         guard !Task.isCancelled, openingEntryPath == requestedPath else { return }
-        let videos = cachedPlayableVideos
+        let videos = cachedPlayableVideos.isEmpty ? [entry] : cachedPlayableVideos
         videoPlaylist = videos.map {
             VideoPlaylistItem(id: $0.path, title: $0.name, assetId: $0.assetId, remotePath: $0.path)
         }
-        videoPlaylistIndex = videos.firstIndex(where: { $0.path == requestedPath })
+        videoPlaylistIndex = videos.firstIndex(where: { $0.path == requestedPath }) ?? 0
         preview = PreviewItem(
             url: source.url,
             isVideo: entry.isVideo,
