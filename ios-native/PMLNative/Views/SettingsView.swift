@@ -24,9 +24,16 @@ struct SettingsView: View {
     @State private var scanText = ""
     @State private var showSetup = false
     @State private var selfCheckMessage = ""
+    @AppStorage("pml.privacy.shield") private var privacyShieldEnabled = true
 
     var body: some View {
         Form {
+            Section("隐私安全") {
+                Toggle("多任务后台防窥遮罩", isOn: $privacyShieldEnabled)
+                Text("开启后，切入系统多任务卡片或锁屏时自动以模糊保护层遮盖敏感画面，防止窥屏。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("运行模式") {
                 NavigationLink {
                     RuntimeModeView(settings: model.settings)

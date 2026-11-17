@@ -353,15 +353,29 @@ struct ShortVideosView: View {
 
     private var rightRail: some View {
         VStack(spacing: 18) {
-            Button { Task { await openAuthor() } } label: {
+            Button {
+                let generator = UIImpactFeedbackGenerator(style: .light)
+                generator.impactOccurred()
+                Task { await openAuthor() }
+            } label: {
                 ZStack {
                     Circle().fill(.ultraThinMaterial)
-                    Text(String((currentAsset?.authorName ?? "?").prefix(1)))
-                        .font(.headline)
-                        .foregroundStyle(.white)
+                    if let authorId = currentAsset?.authorId {
+                        AssetThumbnailView(assetId: authorId, contentMode: .fill) {
+                            Text(String((currentAsset?.authorName ?? "?").prefix(1)))
+                                .font(.headline.weight(.bold))
+                                .foregroundStyle(.white)
+                        }
+                    } else {
+                        Text(String((currentAsset?.authorName ?? "?").prefix(1)))
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(.white)
+                    }
                 }
-                .frame(width: 46, height: 46)
-                .overlay(Circle().stroke(.white.opacity(0.5), lineWidth: 1))
+                .frame(width: 48, height: 48)
+                .clipShape(Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.8), lineWidth: 1.5))
+                .shadow(color: .black.opacity(0.35), radius: 4, x: 0, y: 2)
             }
 
             Button(action: likeCurrent) {
@@ -408,7 +422,21 @@ struct ShortVideosView: View {
             HStack(alignment: .bottom) {
                 VStack(alignment: .leading, spacing: 3) {
                     if let author = currentAsset?.authorName, !author.isEmpty {
-                        Text("@\(author)").font(.subheadline.weight(.semibold))
+                        Button {
+                            let generator = UIImpactFeedbackGenerator(style: .light)
+                            generator.impactOccurred()
+                            Task { await openAuthor() }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text("@\(author)")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.7))
+                            }
+                        }
+                        .buttonStyle(.plain)
                     }
                     Text(currentAsset?.fileName ?? "")
                         .font(.footnote)
@@ -991,12 +1019,28 @@ struct ShortVideosView: View {
 
     @MainActor
     private func openAuthor() async {
-        guard let asset = currentAsset, let authorId = asset.authorId,
-              let client = model.apiClient else { return }
-        if let authors = try? await client.libraryAuthors(filter: "all"),
-           let author = authors.first(where: { $0.id == authorId }) {
-            authorSheet = author
+        guard let asset = currentAsset, let client = model.apiClient else { return }
+        let authorId = asset.authorId
+        let authorName = asset.authorName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if authorId == nil && (authorName == nil || authorName!.isEmpty) {
+            showToast("该视频未关联创作者")
+            return
         }
+        if let authors = try? await client.libraryAuthors(filter: "all") {
+            let matched = authors.first(where: { a in
+                if let authorId, a.id == authorId { return true }
+                if let authorName, !authorName.isEmpty {
+                    if a.name.localizedCaseInsensitiveCompare(authorName) == .orderedSame { return true }
+                    if a.aliases.contains(where: { $0.localizedCaseInsensitiveCompare(authorName) == .orderedSame }) { return true }
+                }
+                return false
+            })
+            if let matched {
+                authorSheet = matched
+                return
+            }
+        }
+        showToast("未找到对应创作者主页")
     }
 
     @MainActor

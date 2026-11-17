@@ -29,10 +29,44 @@ struct PMLNativeApp: App {
         _model = StateObject(wrappedValue: AppModel(corePort: port, coreError: errorText))
     }
 
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("pml.privacy.shield") private var privacyShieldEnabled = true
+
     var body: some Scene {
         WindowGroup {
-            RootTabView()
-                .environmentObject(model)
+            ZStack {
+                RootTabView()
+                    .environmentObject(model)
+
+                if privacyShieldEnabled && scenePhase != .active {
+                    PrivacyShieldOverlayView()
+                        .transition(.opacity)
+                        .zIndex(99999)
+                }
+            }
+        }
+    }
+}
+
+/// 后台多任务防窥遮罩：当 App 切入多任务卡片或锁屏时，拦截系统截图，杜绝敏感内容泄露。
+private struct PrivacyShieldOverlayView: View {
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .ignoresSafeArea()
+            VStack(spacing: 14) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 52, weight: .medium))
+                    .foregroundStyle(.tint)
+                Text("私人媒体中心")
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text("隐私保护已激活")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

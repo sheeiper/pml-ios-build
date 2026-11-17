@@ -890,7 +890,275 @@ struct PendingProjectDetailView: View {
     @State private var summary = ""
     @State private var preview: DomainPreview?
 
+    private enum TriageViewMode { case pipeline, list }
+    @State private var viewMode: TriageViewMode = .pipeline
+    @State private var authorSearch = ""
+
     var body: some View {
+        Group {
+            if viewMode == .pipeline {
+                pipelineView
+            } else {
+                listView
+            }
+        }
+        .navigationTitle(project.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        viewMode = (viewMode == .pipeline ? .list : .pipeline)
+                    }
+                } label: {
+                    Label(
+                        viewMode == .pipeline ? "列表模式" : "流水线归档",
+                        systemImage: viewMode == .pipeline ? "list.bullet" : "sparkles.rectangle.stack"
+                    )
+                }
+            }
+        }
+        .refreshable { await load() }
+        .task { await load() }
+        .fullScreenCover(item: $preview) { item in
+            GestureVideoPlayerSheet(
+                url: item.url,
+                title: item.title,
+                assetId: item.assetId,
+                fallbackURL: item.fallbackURL,
+                sourceLabel: item.sourceLabel,
+                remotePath: item.remotePath
+            )
+            .environmentObject(model)
+        }
+    }
+
+    // MARK: - Slidebox 流水线极速物理归档模式
+    private var pipelineView: some View {
+        VStack(spacing: 0) {
+            if loading && items.isEmpty {
+                Spacer()
+                ProgressView("正在装载待整理文件…")
+                Spacer()
+            } else if items.isEmpty {
+                Spacer()
+                VStack(spacing: 16) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 64))
+                        .foregroundStyle(.green)
+                    Text("批次整理完毕！")
+                        .font(.title2.weight(.bold))
+                    Text("当前项目下所有文件已全部物理移入目标创作者目录。")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+                Spacer()
+            } else if let current = items.first {
+                VStack(spacing: 12) {
+                    // 顶部状态提示
+                    HStack {
+                        Label("还剩 \(items.count) 个待整理", systemImage: "clock.arrow.circlepath")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if moving {
+                            HStack(spacing: 4) {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                                Text("正在物理移动…")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else if !summary.isEmpty {
+                            Text(summary)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.green)
+                                .transition(.opacity)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+
+                    // 核心卡片预览区
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color(uiColor: .secondarySystemBackground))
+
+                        VStack(spacing: 0) {
+                            // 媒体预览大图
+                            Button {
+                                Task { await openPreview(current) }
+                            } label: {
+                                ZStack {
+                                    Color.black.opacity(0.85)
+                                    AssetThumbnailView(assetId: current.assetId, contentMode: .fit) {
+                                        Image(systemName: current.mediaType == "video" ? "film" : "photo")
+                                            .font(.system(size: 40))
+                                            .foregroundStyle(.white.opacity(0.6))
+                                    }
+                                    if current.mediaType == "video" {
+                                        Circle()
+                                            .fill(.ultraThinMaterial)
+                                            .frame(width: 48, height: 48)
+                                            .overlay(Image(systemName: "play.fill").foregroundStyle(.white))
+                                            .shadow(radius: 6)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 220)
+                                .clipped()
+                            }
+                            .buttonStyle(.plain)
+
+                            // 文件元数据
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(current.fileName)
+                                    .font(.subheadline.weight(.semibold))
+                                    .lineLimit(2)
+                                HStack(spacing: 8) {
+                                    Text(ByteCountFormatter.string(fromByteCount: current.sizeBytes, countStyle: .file))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    if let rec = current.recommendedAuthorName {
+                                        Text("推荐作者：\(rec)")
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundStyle(.tint)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.accentColor.opacity(0.12), in: Capsule())
+                                    }
+                                }
+                            }
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .shadow(color: .black.opacity(0.08), radius: 8, x: 0, y: 3)
+
+                    // 底部创作者直选物理移动托盘
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("点击直移至创作者目录：")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("跳过当前") {
+                                skipCurrent()
+                            }
+                            .font(.caption.weight(.medium))
+                        }
+                        .padding(.horizontal, 16)
+
+                        // 搜索过滤
+                        HStack {
+                            Image(systemName: "magnifyingglass")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            TextField("搜索创作者文件夹…", text: $authorSearch)
+                                .font(.subheadline)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(Color(uiColor: .tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .padding(.horizontal, 16)
+
+                        // 创作者快捷选择列表
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            LazyHStack(spacing: 10) {
+                                ForEach(filteredAuthors) { author in
+                                    Button {
+                                        Task { await quickMoveToAuthor(item: current, author: author) }
+                                    } label: {
+                                        HStack(spacing: 8) {
+                                            ZStack {
+                                                Circle().fill(Color.accentColor.opacity(0.15))
+                                                Text(String(author.name.prefix(1)))
+                                                    .font(.caption.weight(.bold))
+                                                    .foregroundStyle(.tint)
+                                            }
+                                            .frame(width: 28, height: 28)
+
+                                            Text(author.name)
+                                                .font(.subheadline.weight(.medium))
+                                                .foregroundStyle(.primary)
+                                        }
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 8)
+                                        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                                .stroke(current.recommendedAuthorName == author.name ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                                        )
+                                    }
+                                    .disabled(moving)
+                                }
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 4)
+                        }
+                        .frame(height: 52)
+                    }
+                    .padding(.top, 4)
+
+                    Spacer(minLength: 8)
+                }
+            }
+        }
+    }
+
+    private var filteredAuthors: [DomainAuthor] {
+        guard let all = meta?.authors else { return [] }
+        let trimmed = authorSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return all }
+        return all.filter { $0.name.localizedCaseInsensitiveContains(trimmed) }
+    }
+
+    private func skipCurrent() {
+        guard let first = items.first else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            items.removeFirst()
+            items.append(first)
+        }
+        let feedback = UIImpactFeedbackGenerator(style: .light)
+        feedback.impactOccurred()
+    }
+
+    @MainActor
+    private func quickMoveToAuthor(item: PendingDomainItem, author: DomainAuthor) async {
+        guard let client = model.apiClient, !moving else { return }
+        moving = true
+        errorText = ""
+        let feedback = UIImpactFeedbackGenerator(style: .medium)
+        feedback.impactOccurred()
+        do {
+            // 1. 指定创作者
+            try await client.assignPending(assetId: item.assetId, categoryId: item.manualCategoryId, authorId: author.id)
+            // 2. 直接触发物理移动！移至该创作者文件夹中！
+            let result = try await client.movePendingDomainItem(assetId: item.assetId)
+            if result.success {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    items.removeAll(where: { $0.assetId == item.assetId })
+                }
+                let successFeed = UINotificationFeedbackGenerator()
+                successFeed.notificationOccurred(.success)
+                summary = "已移入「\(author.name)」目录"
+            } else if result.status == "SKIPPED_EXIST" {
+                errorText = "目标目录已存在同名文件，跳过移动"
+            } else {
+                errorText = result.status ?? "移动失败"
+            }
+        } catch {
+            errorText = error.localizedDescription
+        }
+        moving = false
+    }
+
+    // MARK: - 传统列表模式
+    private var listView: some View {
         List {
             Section {
                 HStack {
@@ -939,21 +1207,6 @@ struct PendingProjectDetailView: View {
             } footer: {
                 Text("同名目标会报警并跳过，不覆盖、不改名。")
             }
-        }
-        .navigationTitle(project.name)
-        .navigationBarTitleDisplayMode(.inline)
-        .refreshable { await load() }
-        .task { await load() }
-        .fullScreenCover(item: $preview) { item in
-            GestureVideoPlayerSheet(
-                url: item.url,
-                title: item.title,
-                assetId: item.assetId,
-                fallbackURL: item.fallbackURL,
-                sourceLabel: item.sourceLabel,
-                remotePath: item.remotePath
-            )
-            .environmentObject(model)
         }
     }
 

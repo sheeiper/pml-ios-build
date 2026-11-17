@@ -208,6 +208,12 @@ struct GestureVideoPlayerSheet: View {
                                 .background(.ultraThinMaterial, in: Capsule())
                         }
                         Menu {
+                            Button {
+                                Task { await captureCurrentFrameAsCover() }
+                            } label: {
+                                Label("设当前画面为封面", systemImage: "camera.fill")
+                            }
+                            Divider()
                             Button { showPlaylist = true } label: {
                                 Label("播放列表", systemImage: "list.bullet")
                             }
@@ -409,6 +415,11 @@ struct GestureVideoPlayerSheet: View {
                         showPlaylist = true
                     } label: {
                         Image(systemName: "list.bullet")
+                    }
+                    Button {
+                        Task { await captureCurrentFrameAsCover() }
+                    } label: {
+                        Image(systemName: "camera")
                     }
                     Button {
                         toggleOrientation()
@@ -855,6 +866,55 @@ struct GestureVideoPlayerSheet: View {
             scheduleHideControls()
         } else {
             controlsTask?.cancel()
+        }
+    }
+
+    /// 截取当前播放时间戳的画面并设为该视频/条目的封面
+    @MainActor
+    private func captureCurrentFrameAsCover() async {
+        guard let item = player.currentItem, let assetId = currentAssetId, let client = model.apiClient else {
+            showHUD("无法截取当前画面")
+            return
+        }
+        showHUD("正在生成封面...")
+        let currentCMTime = player.currentTime()
+        let asset = item.asset
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        generator.maximumSize = CGSize(width: 1280, height: 720)
+
+        do {
+            let cgImage = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CGImage, Error>) in
+                generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: currentCMTime)]) { _, image, _, result, error in
+                    if let image, result == .succeeded {
+                        continuation.resume(returning: image)
+                    } else {
+                        let err = error ?? NSError(domain: "PMLCapture", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法解析视频当前帧"])
+                        continuation.resume(throwing: err)
+                    }
+                }
+            }
+            let uiImage = UIImage(cgImage: cgImage)
+            guard let jpegData = uiImage.jpegData(compressionQuality: 0.85) else {
+                showHUD("封面图片编码失败")
+                return
+            }
+            let base64 = jpegData.base64EncodedString()
+            try await client.saveAssetThumbnail(
+                assetId: assetId,
+                mimeType: "image/jpeg",
+                dataBase64: base64,
+                expectedVersion: nil
+            )
+            ThumbnailService.shared.forget(assetId: assetId)
+            ThumbnailService.shared.store(image: uiImage, for: assetId)
+            let feedback = UINotificationFeedbackGenerator()
+            feedback.notificationOccurred(.success)
+            showHUD("已设为该视频封面", seconds: 2)
+        } catch {
+            showHUD("截取封面失败: \(error.localizedDescription)", seconds: 2)
         }
     }
 

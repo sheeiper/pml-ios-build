@@ -101,6 +101,13 @@ final class ThumbnailService: ObservableObject {
         images[assetId] = image
     }
 
+    /// 显式将新生成的封面写入内存并通知订阅视图刷新
+    func store(image: UIImage, for assetId: String) {
+        storeImage(image, for: assetId)
+        failedAt.removeValue(forKey: assetId)
+        objectWillChange.send()
+    }
+
     /// 节流通知旧的 @ObservedObject 订阅者，避免短时间几十张封面解码引发主线程重绘风暴。
     private func scheduleNotify() {
         guard notifyTask == nil else { return }
