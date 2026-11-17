@@ -1110,7 +1110,7 @@ struct PendingProjectDetailView: View {
         }
     }
 
-    private var filteredAuthors: [DomainAuthor] {
+    private var filteredAuthors: [DomainMetaAuthor] {
         guard let all = meta?.authors else { return [] }
         let trimmed = authorSearch.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return all }
@@ -1128,7 +1128,7 @@ struct PendingProjectDetailView: View {
     }
 
     @MainActor
-    private func quickMoveToAuthor(item: PendingDomainItem, author: DomainAuthor) async {
+    private func quickMoveToAuthor(item: PendingDomainItem, author: DomainMetaAuthor) async {
         guard let client = model.apiClient, !moving else { return }
         moving = true
         errorText = ""
