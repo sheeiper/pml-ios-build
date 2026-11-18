@@ -9,22 +9,24 @@ permissions:
 jobs:
   build-native:
     name: Build Native SwiftUI App (.ipa)
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select Xcode 26
+      - name: Select Xcode
         run: |
           for candidate in \
+            /Applications/Xcode_16.2.app \
+            /Applications/Xcode_16.1.app \
+            /Applications/Xcode_16.0.app \
             /Applications/Xcode_26.3.app \
             /Applications/Xcode_26.2.app \
-            /Applications/Xcode_26.1.1.app \
             /Applications/Xcode_26.1.app \
-            /Applications/Xcode_26.0.1.app \
-            /Applications/Xcode_26.0.app; do
+            /Applications/Xcode_26.0.app \
+            /Applications/Xcode.app; do
             if [ -d "$candidate" ]; then
               sudo xcode-select -s "$candidate/Contents/Developer"
               echo "Selected $candidate"
