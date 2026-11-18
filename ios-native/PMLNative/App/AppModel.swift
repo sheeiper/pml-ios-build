@@ -113,12 +113,16 @@ final class AppModel: ObservableObject {
                 direct = alistDirectURL(remotePath: remotePath)
             }
             if let direct {
+                var fallback: URL? = nil
+                if let client = apiClient, let assetId {
+                    fallback = try? await client.mediaSourceURL(assetId: assetId)
+                }
                 if let remotePath, Self.isVideoPath(remotePath) {
                     if let proxied = await LocalMediaProxy.shared.register(directURL: direct) {
-                        return PlaybackSource(url: proxied, fallbackURL: nil, label: "AList 直连")
+                        return PlaybackSource(url: proxied, fallbackURL: fallback, label: "AList 直连")
                     }
                 }
-                return PlaybackSource(url: direct, fallbackURL: nil, label: "AList 直连")
+                return PlaybackSource(url: direct, fallbackURL: fallback, label: "AList 直连")
             }
             // 兜底：如果 remotePath 缺失或 AList 映射失败，向服务端申请中转流地址
             if let client = apiClient, let assetId,
@@ -153,10 +157,10 @@ final class AppModel: ObservableObject {
         let token = Data(raw.utf8).base64EncodedString()
         return ["Authorization": "Basic \(token)"]
     }
-    /// 媒体字节不再走服务器。保留空实现，避免旧调用点改回中转。
+    /// 媒体在直连失效时回退到服务器 CD2 WebDAV 中转流
     func fallbackMediaURL(assetId: String?) async -> URL? {
-        _ = assetId
-        return nil
+        guard let client = apiClient, let assetId else { return nil }
+        return try? await client.mediaSourceURL(assetId: assetId)
     }
 
     /// 把 CD2 路径按前缀映射到 AList，并拼出 `/d` 直链。

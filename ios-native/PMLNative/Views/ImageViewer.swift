@@ -19,6 +19,7 @@ struct ImageViewer: View {
     @State private var urls: [String: URL] = [:]
     @State private var favorites: Set<String> = []
     @State private var webtoonMode = false
+    @State private var alistExpiredWarning: String? = nil
 
     init(context: ImageViewerContext) {
         self.context = context
@@ -37,6 +38,32 @@ struct ImageViewer: View {
                 }
             }
             .background(Color.black.ignoresSafeArea())
+            .overlay(alignment: .top) {
+                if let warning = alistExpiredWarning {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.yellow)
+                        Text(warning)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(2)
+                        Spacer()
+                        Button {
+                            withAnimation { alistExpiredWarning = nil }
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(Color.red.opacity(0.88), in: RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
             .navigationTitle(currentTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbarColorScheme(.dark, for: .navigationBar)
@@ -67,6 +94,12 @@ struct ImageViewer: View {
                 guard let newValue, let idx = context.entries.firstIndex(where: { $0.id == newValue }) else { return }
                 if index != idx { index = idx }
                 Task { await prefetch(around: idx) }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .pmlAlistSessionExpired)) { notif in
+                let msg = notif.userInfo?["message"] as? String ?? "AList 账号登录已过期，请在后台重新登录 115"
+                withAnimation {
+                    alistExpiredWarning = "⚠️ \(msg)"
+                }
             }
         }
     }
@@ -196,6 +229,7 @@ private struct ZoomableImagePage: View {
     var posterAssetId: String? = nil
 
     @State private var image: UIImage?
+    @State private var loadFailed = false
 
     private var displayImage: UIImage? {
         if let image { return image }
@@ -208,6 +242,20 @@ private struct ZoomableImagePage: View {
             Color.black
             if let current = displayImage {
                 ZoomScrollRepresentable(image: current)
+            } else if loadFailed {
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 38))
+                        .foregroundStyle(.yellow)
+                    Text("图片加载失败")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Text("若使用 AList 直链，请检查 115 网盘登录状态")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
             } else if let posterAssetId, let poster = ThumbnailService.shared.cachedImage(assetId: posterAssetId) {
                 Image(uiImage: poster)
                     .resizable()
@@ -219,11 +267,16 @@ private struct ZoomableImagePage: View {
         }
         .task(id: url) {
             guard let url else { return }
+            loadFailed = false
             if let hit = ImageCache.shared.cached(url, maxPixel: 2400) {
                 image = hit
                 return
             }
-            image = await ImageCache.shared.cachedOrLoad(url, maxPixel: 2400)
+            if let loaded = await ImageCache.shared.cachedOrLoad(url, maxPixel: 2400) {
+                image = loaded
+            } else {
+                loadFailed = true
+            }
         }
     }
 }

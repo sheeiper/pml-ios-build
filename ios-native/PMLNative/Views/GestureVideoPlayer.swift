@@ -47,6 +47,7 @@ struct GestureVideoPlayerSheet: View {
     @State private var timeObserver: Any?
     @State private var lastSavedAt: Double = 0
 
+    @State private var alistExpiredWarning: String? = nil
     @State private var dragMode: DragMode?
     @State private var pressTask: Task<Void, Never>?
     @State private var isBoosting = false
@@ -292,13 +293,45 @@ struct GestureVideoPlayerSheet: View {
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(.bottom, 130)
                 }
-            }            .statusBarHidden(true)
+            .overlay(alignment: .top) {
+                if let warning = alistExpiredWarning {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.yellow)
+                        Text(warning)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(2)
+                        Spacer()
+                        Button {
+                            withAnimation { alistExpiredWarning = nil }
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(Color.red.opacity(0.88), in: RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 16)
+                    .padding(.top, 46)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .statusBarHidden(true)
         }
         .onAppear(perform: setup)
         .onAppear {
             OrientationController.shared.lock(.allButUpsideDown)
             if currentIndex == nil {
                 currentIndex = resolvedIndex
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .pmlAlistSessionExpired)) { notif in
+            let msg = notif.userInfo?["message"] as? String ?? "AList 账号登录已过期，请在后台重新登录 115"
+            withAnimation {
+                alistExpiredWarning = "⚠️ \(msg)"
             }
         }
         .onDisappear {
@@ -1075,6 +1108,9 @@ struct GestureVideoPlayerSheet: View {
                 usedFallback = true
                 let target = currentTime
                 let wasPlaying = isPlaying
+                withAnimation {
+                    alistExpiredWarning = "⚠️ AList 登录已失效，正在切换服务器中转流..."
+                }
                 Task { @MainActor in
                     var fallback = currentFallbackURL
                     if fallback == nil, let assetId = currentAssetId {
@@ -1082,12 +1118,18 @@ struct GestureVideoPlayerSheet: View {
                     }
                     guard let fallback else {
                         usedFallback = false
+                        withAnimation {
+                            alistExpiredWarning = "⚠️ AList 登录已过期且无服务器备用流，请在 AList 重新登录 115"
+                        }
                         return
                     }
                     player.replaceCurrentItem(with: makePlayerItem(fallback))
                     accelLabel = "服务器中转"
                     if await waitUntilReady() {
                         requestSeek(to: target, resume: wasPlaying, debounce: false)
+                        withAnimation {
+                            alistExpiredWarning = "⚠️ AList 登录已过期，已切换为服务器中转播放"
+                        }
                     }
                 }
             }

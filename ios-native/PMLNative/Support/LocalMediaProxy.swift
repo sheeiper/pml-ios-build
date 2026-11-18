@@ -418,6 +418,14 @@ fileprivate final class ProxyTransfer: NSObject {
 
         guard let http = response as? HTTPURLResponse else {
             completionHandler(.cancel)
+            if http.statusCode == 500 || http.statusCode == 401 || http.statusCode == 403 {
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: .pmlAlistSessionExpired,
+                        object: "AList 网盘账号登录已过期，请在 AList 后台重新登录 115"
+                    )
+                }
+            }
             fail()
             return
         }
@@ -434,6 +442,14 @@ fileprivate final class ProxyTransfer: NSObject {
                 return
             }
             completionHandler(.cancel)
+            if http.statusCode == 500 || http.statusCode == 401 || http.statusCode == 403 {
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: .pmlAlistSessionExpired,
+                        object: "AList 网盘账号登录已过期，请在 AList 后台重新登录 115"
+                    )
+                }
+            }
             fail()
             return
         }

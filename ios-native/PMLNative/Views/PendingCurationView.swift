@@ -10,9 +10,20 @@ private struct PlayableVideoTarget: Identifiable {
     let id = UUID()
     let url: URL
     let title: String
+    let fallbackURL: URL?
 }
 
-/// 待收纳整理：支持 Slidebox 风格单件卡片极速流水线归档与清单批量归档
+struct PendingProjectCard: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let path: String
+    let projectId: String?
+    var totalCount: Int
+    var readyCount: Int
+    var isLoose: Bool
+}
+
+/// 待收纳整理：两级架构（第一级：待整理项目大厅；第二级：点击进入具体项目流水线按需匹配与物理移动）
 struct PendingCurationView: View {
     @EnvironmentObject private var model: AppModel
 
@@ -20,16 +31,21 @@ struct PendingCurationView: View {
     @State private var vaultRoot = ""
 
     @State private var roots: [LibraryRoot] = []
-    @State private var batches: [RemoteBrowserEntry] = []
-    @State private var selectedBatch: RemoteBrowserEntry?
-    @State private var items: [PendingItem] = []
-    @State private var currentIndex = 0
-
     @State private var authors: [LibraryAuthor] = []
     @State private var categories: [LibraryCategory] = []
     @State private var authorDirectoryMap: [String: String] = [:]
 
-    @State private var loading = false
+    // Level 1: 项目大厅
+    @State private var projects: [PendingProjectCard] = []
+    @State private var projectSearchText = ""
+    @State private var loadingProjects = false
+
+    // Level 2: 选中的项目流水线
+    @State private var selectedProject: PendingProjectCard? = nil
+    @State private var items: [PendingItem] = []
+    @State private var currentIndex = 0
+    @State private var loadingItems = false
+
     @State private var busy = false
     @State private var message = ""
     @State private var errorText = ""
@@ -39,9 +55,6 @@ struct PendingCurationView: View {
     @State private var pickerCategoryId = ""
     @State private var pickerAuthorId = ""
     @State private var pickerPath = ""
-    @State private var inboxPath = ""
-    @State private var inboxBatchName = ""
-    @State private var packing = false
     @State private var processedCount = 0
     @State private var moveSummary: [String] = []
 
@@ -52,6 +65,12 @@ struct PendingCurationView: View {
     @State private var showNewAuthorDialog = false
     @State private var newAuthorName = ""
     @State private var hudToast: String?
+
+    private var filteredProjects: [PendingProjectCard] {
+        let query = projectSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty { return projects }
+        return projects.filter { $0.name.localizedCaseInsensitiveContains(query) || $0.path.localizedCaseInsensitiveContains(query) }
+    }
 
     private var currentItem: PendingItem? {
         items.indices.contains(currentIndex) ? items[currentIndex] : nil
@@ -83,22 +102,10 @@ struct PendingCurationView: View {
 
     var body: some View {
         ZStack {
-            Group {
-                if loading && items.isEmpty {
-                    VStack(spacing: 14) {
-                        ProgressView()
-                        Text("正在扫描待整理目录…")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if items.isEmpty {
-                    emptyCelebrationView
-                } else if viewMode == .pipeline {
-                    pipelineView
-                } else {
-                    listView
-                }
+            if selectedProject == nil {
+                projectsHallView
+            } else {
+                projectTriageView
             }
 
             if let hudToast {
@@ -120,53 +127,45 @@ struct PendingCurationView: View {
                 .animation(.spring(response: 0.35, dampingFraction: 0.75), value: hudToast)
             }
         }
-        .navigationTitle("待整理")
+        .navigationTitle(selectedProject?.name ?? "待整理项目")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                if batches.count > 1 {
-                    Menu {
-                        ForEach(batches) { batch in
-                            Button {
-                                Task { await select(batch) }
-                            } label: {
-                                HStack {
-                                    Text(batch.name)
-                                    if selectedBatch?.id == batch.id {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
+            if let selected = selectedProject {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        selectedProject = nil
                     } label: {
                         HStack(spacing: 4) {
-                            Text(selectedBatch?.name ?? "批次")
-                                .font(.caption.weight(.semibold))
-                                .lineLimit(1)
-                            Image(systemName: "chevron.down")
-                                .font(.caption2)
+                            Image(systemName: "chevron.left")
+                            Text("项目列表")
                         }
                     }
                 }
-            }
-
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button {
-                    viewMode = (viewMode == .pipeline ? .list : .pipeline)
-                } label: {
-                    Label(
-                        viewMode == .pipeline ? "列表模式" : "流水线",
-                        systemImage: viewMode == .pipeline ? "list.bullet" : "sparkles.rectangle.stack"
-                    )
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        viewMode = (viewMode == .pipeline ? .list : .pipeline)
+                    } label: {
+                        Label(
+                            viewMode == .pipeline ? "列表模式" : "流水线",
+                            systemImage: viewMode == .pipeline ? "list.bullet" : "sparkles.rectangle.stack"
+                        )
+                    }
+                    Button {
+                        Task { await loadProjectItems(selected) }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(loadingItems || busy)
                 }
-                .accessibilityLabel("切换整理视图")
-
-                Button {
-                    Task { await reloadAll() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+            } else {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        Task { await reloadAll() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(loadingProjects || busy)
                 }
-                .disabled(loading || busy)
             }
         }
         .task { await reloadAll() }
@@ -177,8 +176,13 @@ struct PendingCurationView: View {
             targetPicker
         }
         .fullScreenCover(item: $activeVideoTarget) { target in
-            GestureVideoPlayerSheet(url: target.url, title: target.title)
-                .ignoresSafeArea()
+            GestureVideoPlayerSheet(
+                url: target.url,
+                title: target.title,
+                fallbackURL: target.fallbackURL,
+                sourceLabel: "待整理试看"
+            )
+            .ignoresSafeArea()
         }
         .alert("新建创作者文件夹", isPresented: $showNewAuthorDialog) {
             TextField("创作者姓名（例如：三上悠亚）", text: $newAuthorName)
@@ -196,49 +200,204 @@ struct PendingCurationView: View {
         }
     }
 
-    // MARK: - 空状态庆祝视图
+    // MARK: - 第一级：待整理项目大厅
 
-    private var emptyCelebrationView: some View {
+    private var projectsHallView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // 搜索栏
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("搜索待整理批次项目…", text: $projectSearchText)
+                    if !projectSearchText.isEmpty {
+                        Button { projectSearchText = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(10)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+
+                // 统计卡片
+                let totalFiles = projects.reduce(0) { $0 + $1.totalCount }
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("待整理项目大厅")
+                            .font(.headline.weight(.bold))
+                        Text("\(projects.count) 个批次项目 · 共 \(totalFiles) 个待分类文件")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "tray.2.fill")
+                        .font(.system(size: 32))
+                        .foregroundStyle(Color.accentColor.opacity(0.8))
+                }
+                .padding(16)
+                .pmlGlassCard(cornerRadius: 18)
+                .padding(.horizontal, 16)
+
+                if !errorText.isEmpty {
+                    Text(errorText)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .padding(.horizontal, 16)
+                }
+
+                if loadingProjects && projects.isEmpty {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("正在扫描待整理项目…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 40)
+                } else if filteredProjects.isEmpty {
+                    VStack(spacing: 14) {
+                        Image(systemName: "tray")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.secondary)
+                        Text(projectSearchText.isEmpty ? "没有待整理项目" : "未找到匹配的项目")
+                            .font(.headline)
+                        Text(projectSearchText.isEmpty ? "所有待整理文件均已分类完毕" : "请尝试其他关键词")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 60)
+                } else {
+                    LazyVStack(spacing: 10) {
+                        ForEach(filteredProjects) { project in
+                            Button {
+                                selectProject(project)
+                            } label: {
+                                projectCard(project)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 24)
+                }
+            }
+        }
+        .refreshable {
+            await reloadAll()
+        }
+    }
+
+    private func projectCard(_ project: PendingProjectCard) -> some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.12))
+                Image(systemName: project.isLoose ? "tray.fill" : "folder.fill")
+                    .font(.system(size: 22))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .frame(width: 48, height: 48)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .center, spacing: 6) {
+                    Text(project.name)
+                        .font(.headline)
+                        .lineLimit(1)
+                    if project.isLoose {
+                        Text("散装")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.orange)
+                    }
+                }
+                Text(project.path)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                if project.totalCount > 0 {
+                    Text("\(project.totalCount) 项")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .pmlGlassCard(cornerRadius: 16)
+    }
+
+    private func selectProject(_ project: PendingProjectCard) {
+        selectedProject = project
+        Task {
+            await loadProjectItems(project)
+        }
+    }
+
+    // MARK: - 第二级：项目流水线归档
+
+    private var projectTriageView: some View {
+        Group {
+            if loadingItems && items.isEmpty {
+                VStack(spacing: 14) {
+                    ProgressView()
+                    Text("正在加载项目文件…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if items.isEmpty {
+                projectEmptyCelebrationView
+            } else if viewMode == .pipeline {
+                pipelineView
+            } else {
+                listView
+            }
+        }
+    }
+
+    private var projectEmptyCelebrationView: some View {
         ScrollView {
             VStack(spacing: 20) {
                 Spacer().frame(height: 50)
                 ZStack {
                     Circle()
                         .fill(Color.accentColor.opacity(0.12))
-                        .frame(width: 100, height: 100)
+                        .frame(width: 90, height: 90)
                     Image(systemName: "checkmark.seal.fill")
-                        .font(.system(size: 52))
+                        .font(.system(size: 48))
                         .foregroundStyle(Color.accentColor)
                 }
 
-                Text("待整理库已全部清空！")
+                Text("【\(selectedProject?.name ?? "该项目")】已全部归档！")
                     .font(.title3.weight(.bold))
 
-                Text("当前待整理目录（\(pendingPath.isEmpty ? "未配置" : pendingPath)）下暂无需要收纳的新文件。")
+                Text("本批次所有文件均已归类至对应创作者或分类文件夹。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 32)
 
-                if !pendingPath.isEmpty {
-                    Button {
-                        Task { await reloadAll() }
-                    } label: {
-                        Label("重新检查新文件", systemImage: "arrow.clockwise")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .padding(.top, 10)
-                } else {
-                    NavigationLink {
-                        MediaSourcesView()
-                    } label: {
-                        Label("前往配置媒体源待整理目录", systemImage: "gearshape")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .padding(.top, 10)
+                Button {
+                    selectedProject = nil
+                } label: {
+                    Label("返回待整理项目大厅", systemImage: "arrow.left")
+                        .font(.subheadline.weight(.semibold))
                 }
+                .buttonStyle(.borderedProminent)
+                .padding(.top, 10)
 
                 if !moveSummary.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
@@ -724,6 +883,12 @@ struct PendingCurationView: View {
                         }
                     }
                 }
+
+                // 同步扣减第一级项目数量
+                if let idx = projects.firstIndex(where: { $0.id == selectedProject?.id }) {
+                    projects[idx].totalCount = max(0, projects[idx].totalCount - 1)
+                    selectedProject?.totalCount = projects[idx].totalCount
+                }
             } else {
                 errorText = result.message
             }
@@ -752,6 +917,11 @@ struct PendingCurationView: View {
                 processedCount += 1
                 items.remove(at: index)
                 if currentIndex >= items.count { currentIndex = max(0, items.count - 1) }
+
+                if let idx = projects.firstIndex(where: { $0.id == selectedProject?.id }) {
+                    projects[idx].totalCount = max(0, projects[idx].totalCount - 1)
+                    selectedProject?.totalCount = projects[idx].totalCount
+                }
             } else {
                 errorText = result.message
             }
@@ -776,6 +946,12 @@ struct PendingCurationView: View {
             let movedSources = Set(result.results.filter { $0.success || $0.status == "SKIPPED_EXIST" }.map(\.sourcePath))
             items.removeAll { movedSources.contains($0.entry.path) }
             if currentIndex >= items.count { currentIndex = max(0, items.count - 1) }
+
+            if let idx = projects.firstIndex(where: { $0.id == selectedProject?.id }) {
+                projects[idx].totalCount = max(0, projects[idx].totalCount - result.successCount)
+                selectedProject?.totalCount = projects[idx].totalCount
+            }
+
             showHUD("已批量归档 \(result.successCount) 项")
         } catch {
             errorText = error.localizedDescription
@@ -793,14 +969,29 @@ struct PendingCurationView: View {
     }
 
     private func playCurrentItem() async {
-        guard let client = model.apiClient, let item = currentItem, item.entry.isVideo else { return }
-        do {
-            let streamURL = try await client.rawMediaURL(remotePath: item.entry.path)
+        guard let item = currentItem, item.entry.isVideo else { return }
+        if let source = await model.playbackSource(assetId: item.entry.assetId, remotePath: item.entry.path) {
             await MainActor.run {
-                activeVideoTarget = PlayableVideoTarget(url: streamURL, title: item.entry.name)
+                activeVideoTarget = PlayableVideoTarget(
+                    url: source.url,
+                    title: item.entry.name,
+                    fallbackURL: source.fallbackURL
+                )
             }
-        } catch {
-            errorText = "获取播放地址失败: \(error.localizedDescription)"
+        } else if let client = model.apiClient {
+            do {
+                let streamURL = try await client.rawMediaURL(remotePath: item.entry.path)
+                let fallback = item.entry.assetId != nil ? await model.fallbackMediaURL(assetId: item.entry.assetId) : nil
+                await MainActor.run {
+                    activeVideoTarget = PlayableVideoTarget(
+                        url: streamURL,
+                        title: item.entry.name,
+                        fallbackURL: fallback
+                    )
+                }
+            } catch {
+                errorText = "获取播放地址失败: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -860,7 +1051,7 @@ struct PendingCurationView: View {
 
     private func reloadAll() async {
         guard let client = model.apiClient else { return }
-        loading = true
+        loadingProjects = true
         errorText = ""
         do {
             let config = try await client.directoryConfig()
@@ -884,85 +1075,101 @@ struct PendingCurationView: View {
             }
             authorDirectoryMap = folderMap
 
-            await discoverBatches()
+            await discoverProjects()
         } catch {
             errorText = error.localizedDescription
         }
-        loading = false
+        loadingProjects = false
     }
 
-    private func discoverBatches() async {
-        guard let client = model.apiClient, !pendingPath.isEmpty else { return }
-        guard let root = root(for: pendingPath) else {
-            batches = []
-            items = []
-            return
-        }
+    private func discoverProjects() async {
+        guard let client = model.apiClient else { return }
         do {
-            let page = try await client.remoteChildren(rootId: root.id, path: pendingPath, refresh: true)
-            let visible = page.items.filter {
-                !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@") && $0.name != "desktop.ini" && $0.name != "Thumbs.db"
-            }
+            var cardMap: [String: PendingProjectCard] = [:]
 
-            let batchDirs = visible.filter { $0.isDirectory && pmlIsPendingFolder($0.name) }
-                .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
-            let directEntries = visible.filter { !$0.isDirectory || !pmlIsPendingFolder($0.name) }
-                .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
-
-            var allBatches: [RemoteBrowserEntry] = []
-            if !directEntries.isEmpty {
-                allBatches.append(
-                    RemoteBrowserEntry(
-                        path: pendingPath,
-                        name: "散装文件 (\(directEntries.count))",
-                        isDirectory: true,
-                        sizeBytes: 0,
-                        modifiedAt: nil,
-                        etag: nil,
-                        assetId: nil,
-                        mediaType: nil,
-                        thumbnailSource: nil,
-                        coverAssetId: nil
+            // 1. 从 API 获取 pendingProjects
+            if let domainProjects = try? await client.pendingProjects(), !domainProjects.isEmpty {
+                for dp in domainProjects {
+                    cardMap[dp.sourcePath] = PendingProjectCard(
+                        id: dp.id,
+                        name: dp.name,
+                        path: dp.sourcePath,
+                        projectId: dp.id,
+                        totalCount: Int(dp.totalCount),
+                        readyCount: Int(dp.readyCount),
+                        isLoose: dp.isLoose
                     )
-                )
+                }
             }
-            allBatches.append(contentsOf: batchDirs)
-            batches = allBatches
 
-            if let first = batches.first {
-                await select(first, directEntries: directEntries)
-            } else {
-                selectedBatch = nil
-                items = []
+            // 2. 扫描 pendingPath 物理目录补全文件夹批次
+            if !pendingPath.isEmpty, let root = root(for: pendingPath) {
+                if let page = try? await client.remoteChildren(rootId: root.id, path: pendingPath, refresh: true) {
+                    for entry in page.items where entry.isDirectory && pmlIsPendingFolder(entry.name) {
+                        if cardMap[entry.path] == nil {
+                            cardMap[entry.path] = PendingProjectCard(
+                                id: entry.path,
+                                name: entry.name,
+                                path: entry.path,
+                                projectId: nil,
+                                totalCount: 0,
+                                readyCount: 0,
+                                isLoose: false
+                            )
+                        }
+                    }
+                }
             }
+
+            projects = cardMap.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         } catch {
             if !pmlIsCancellation(error) { errorText = error.localizedDescription }
         }
     }
 
-    private func select(_ batch: RemoteBrowserEntry, directEntries: [RemoteBrowserEntry]? = nil) async {
-        guard let client = model.apiClient, let root = root(for: batch.path) else { return }
-        selectedBatch = batch
-        message = ""
+    private func loadProjectItems(_ project: PendingProjectCard) async {
+        loadingItems = true
+        errorText = ""
+        items = []
+        currentIndex = 0
+        guard let client = model.apiClient else {
+            loadingItems = false
+            return
+        }
+
         do {
-            let rawList: [RemoteBrowserEntry]
-            if batch.path == pendingPath {
-                if let directEntries {
-                    rawList = directEntries
-                } else {
-                    let page = try await client.remoteChildren(rootId: root.id, path: pendingPath, refresh: true)
-                    rawList = page.items.filter {
-                        !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@") && (!$0.isDirectory || !pmlIsPendingFolder($0.name))
+            var loadedEntries: [RemoteBrowserEntry] = []
+
+            // 1. 如果有 projectId，优先从 pendingProjectItems 获取（含资产 ID）
+            if let pid = project.projectId, !pid.isEmpty {
+                if let domainItems = try? await client.pendingProjectItems(projectId: pid), !domainItems.isEmpty {
+                    loadedEntries = domainItems.map { d in
+                        RemoteBrowserEntry(
+                            path: d.remotePath,
+                            name: d.fileName,
+                            isDirectory: false,
+                            sizeBytes: d.sizeBytes,
+                            modifiedAt: nil,
+                            etag: nil,
+                            assetId: d.assetId,
+                            mediaType: d.mediaType,
+                            thumbnailSource: nil,
+                            coverAssetId: nil
+                        )
                     }
-                }
-            } else {
-                let page = try await client.remoteChildren(rootId: root.id, path: batch.path, refresh: true)
-                rawList = page.items.filter {
-                    !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@")
                 }
             }
 
-            items = rawList.map { entry in
+            // 2. 若 API 未返回，则直读该项目的第一层直接子文件（不用往里面深入探查）
+            if loadedEntries.isEmpty, let root = root(for: project.path) {
+                let page = try await client.remoteChildren(rootId: root.id, path: project.path, refresh: true)
+                loadedEntries = page.items.filter {
+                    !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@") && $0.name != "desktop.ini" && $0.name != "Thumbs.db"
+                }
+            }
+
+            // 3. 仅在进入具体项目后，对该项目的文件进行作者与分类智能匹配
+            items = loadedEntries.map { entry in
                 var item = PendingItem(entry: entry, targetDir: nil, suggestedAuthor: nil)
                 let suggestion = suggest(for: entry.name)
                 item.targetDir = suggestion.dir
@@ -970,10 +1177,20 @@ struct PendingCurationView: View {
                 return item
             }
             currentIndex = 0
+
+            // 同步更新项目总数
+            if let idx = projects.firstIndex(where: { $0.id == project.id }) {
+                projects[idx].totalCount = items.count
+                selectedProject?.totalCount = items.count
+            }
+
             await loadPreview()
         } catch {
-            errorText = error.localizedDescription
+            if !pmlIsCancellation(error) {
+                errorText = "加载项目文件失败: \(error.localizedDescription)"
+            }
         }
+        loadingItems = false
     }
 
     private func loadPreview() async {
@@ -981,7 +1198,15 @@ struct PendingCurationView: View {
             previewURL = nil
             return
         }
-        previewURL = try? await client.rawMediaURL(remotePath: item.entry.path)
+        if let hit = model.alistDirectURL(remotePath: item.entry.path) {
+            previewURL = hit
+            return
+        }
+        if let assetId = item.entry.assetId {
+            previewURL = try? await client.mediaSourceURL(assetId: assetId)
+        } else {
+            previewURL = try? await client.rawMediaURL(remotePath: item.entry.path)
+        }
     }
 
     private func root(for path: String) -> LibraryRoot? {
@@ -1025,7 +1250,6 @@ struct PendingCurationView: View {
         return (vaultRoot, nil)
     }
 }
-
 
 // MARK: - 命名与括号提取工具
 

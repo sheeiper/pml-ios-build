@@ -104,3 +104,7 @@ struct ShortVideoFeedPage: Decodable {
     let items: [LibraryAsset]
     let nextCursor: String?
 }
+
+extension Notification.Name {
+    static let pmlAlistSessionExpired = Notification.Name("pml.alist.session.expired")
+}
