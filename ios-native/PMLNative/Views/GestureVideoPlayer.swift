@@ -293,6 +293,7 @@ struct GestureVideoPlayerSheet: View {
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(.bottom, 130)
                 }
+            }
             .overlay(alignment: .top) {
                 if let warning = alistExpiredWarning {
                     HStack(spacing: 8) {
