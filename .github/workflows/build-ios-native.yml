@@ -9,7 +9,7 @@ permissions:
 jobs:
   build-native:
     name: Build Native SwiftUI App (.ipa)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
 
     steps:
