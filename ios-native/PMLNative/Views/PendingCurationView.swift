@@ -1026,21 +1026,6 @@ struct PendingCurationView: View {
     }
 }
 
-// MARK: - 文件属性扩展
-
-extension RemoteBrowserEntry {
-    var isVideo: Bool {
-        if mediaType == "video" { return true }
-        let ext = (name as NSString).pathExtension.lowercased()
-        return ["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts"].contains(ext)
-    }
-
-    var isImage: Bool {
-        if mediaType == "image" { return true }
-        let ext = (name as NSString).pathExtension.lowercased()
-        return ["jpg", "jpeg", "png", "webp", "gif", "heic", "bmp"].contains(ext)
-    }
-}
 
 // MARK: - 命名与括号提取工具
 

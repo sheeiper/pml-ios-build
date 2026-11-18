@@ -51,11 +51,16 @@ struct RemoteBrowserEntry: Decodable, Identifiable, Hashable {
     var id: String { path }
 
     var isImage: Bool {
-        guard let mediaType else { return false }
-        return mediaType == "image" || mediaType == "comicPage"
+        if mediaType == "image" || mediaType == "comicPage" { return true }
+        let ext = (name as NSString).pathExtension.lowercased()
+        return ["jpg", "jpeg", "png", "webp", "gif", "heic", "bmp"].contains(ext)
     }
 
-    var isVideo: Bool { mediaType == "video" }
+    var isVideo: Bool {
+        if mediaType == "video" { return true }
+        let ext = (name as NSString).pathExtension.lowercased()
+        return ["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts"].contains(ext)
+    }
     var isComicArchive: Bool { mediaType == "comicArchive" || mediaType == "pdf" }
 }
 
