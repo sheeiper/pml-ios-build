@@ -62,6 +62,14 @@ struct RemoteBrowserEntry: Decodable, Identifiable, Hashable {
         return ["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts"].contains(ext)
     }
     var isComicArchive: Bool { mediaType == "comicArchive" || mediaType == "pdf" }
+
+    var symbol: String {
+        if isDirectory { return "folder.fill" }
+        if isVideo { return "play.rectangle.fill" }
+        if isComicArchive { return "book.closed.fill" }
+        if isImage { return "photo.fill" }
+        return "doc.fill"
+    }
 }
 
 struct RemoteBrowserPage: Decodable {

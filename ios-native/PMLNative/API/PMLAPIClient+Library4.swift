@@ -15,12 +15,12 @@ extension PMLAPIClient {
         var encoded: [String: Any] = [:]
         for (path, value) in assignments {
             if let value {
-                encoded[path] = [
-                    "targetVaultPath": value.targetVaultPath ?? NSNull(),
-                    "author": value.author ?? NSNull(),
-                    "categoryPath": value.categoryPath ?? NSNull(),
-                    "categoryName": value.categoryName ?? NSNull(),
-                ]
+                var dict: [String: Any] = [:]
+                dict["targetVaultPath"] = value.targetVaultPath.map { $0 as Any } ?? NSNull()
+                dict["author"] = value.author.map { $0 as Any } ?? NSNull()
+                dict["categoryPath"] = value.categoryPath.map { $0 as Any } ?? NSNull()
+                dict["categoryName"] = value.categoryName.map { $0 as Any } ?? NSNull()
+                encoded[path] = dict
             } else {
                 encoded[path] = NSNull()
             }
