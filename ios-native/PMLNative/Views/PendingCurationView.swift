@@ -1,8 +1,13 @@
 import SwiftUI
 import UIKit
 
-private enum TriageViewMode {
-    case pipeline
+private enum PendingWorkspaceTab: String, CaseIterable {
+    case triage = "待归纳"
+    case assigned = "已归纳"
+}
+
+private enum PendingTriageLayout {
+    case deck
     case list
 }
 
@@ -11,6 +16,13 @@ private struct PlayableVideoTarget: Identifiable {
     let url: URL
     let title: String
     let fallbackURL: URL?
+}
+
+private struct FolderPreviewTarget: Identifiable {
+    let id = UUID()
+    let rootId: String
+    let path: String
+    let name: String
 }
 
 struct PendingProjectCard: Identifiable, Hashable {
@@ -23,17 +35,19 @@ struct PendingProjectCard: Identifiable, Hashable {
     var isLoose: Bool
 }
 
-/// 待收纳整理：两级架构（第一级：待整理项目大厅；第二级：点击进入具体项目流水线按需匹配与物理移动）
+/// 待收纳整理：两级项目制工作台（大厅 + 项目内「待归纳/已归纳」双分区 + 服务端后台防风控移动与项目锁）
 struct PendingCurationView: View {
     @EnvironmentObject private var model: AppModel
 
+    // 目录与元数据
     @State private var pendingPath = ""
     @State private var vaultRoot = ""
-
+    @State private var inboxPath = ""
     @State private var roots: [LibraryRoot] = []
-    @State private var authors: [DomainMetaAuthor] = []
-    @State private var categories: [DomainMetaCategory] = []
-    @State private var authorDirectoryMap: [String: String] = [:]
+    @State private var vaultAuthors: [VaultAuthorEntry] = []
+    @State private var categoryTree: [VaultCategoryNode] = []
+    @State private var filterWords: [String] = []
+    @State private var savedAssignments: [String: CuratorItemAssignment?] = [:]
     @State private var metaLoaded = false
 
     // Level 1: 项目大厅
@@ -41,71 +55,107 @@ struct PendingCurationView: View {
     @State private var projectSearchText = ""
     @State private var loadingProjects = false
 
-    // Level 2: 选中的项目流水线
+    // 服务端后台移动任务与项目锁
+    @State private var moveJobs: [CurateMoveJobSnapshot] = []
+    @State private var showJobsMonitor = false
+    @State private var showFilterWordsSheet = false
+    @State private var showInboxPackSheet = false
+
+    // Level 2: 选中的项目双分区工作台
     @State private var selectedProject: PendingProjectCard? = nil
-    @State private var items: [PendingItem] = []
-    @State private var currentIndex = 0
+    @State private var allItems: [PendingCurationItem] = []
     @State private var loadingItems = false
+    @State private var activeTab: PendingWorkspaceTab = .triage
+    @State private var triageLayout: PendingTriageLayout = .deck
 
-    @State private var busy = false
-    @State private var message = ""
-    @State private var errorText = ""
+    // 刷卡台状态（待归纳）
+    @State private var deckAuthorInput = ""
+    @State private var deckCategoryPath = ""
+    @State private var deckCategoryName = ""
+    @State private var deckDirectCategoryMode = false
+    @State private var stickyCategoryPath = ""
+    @State private var stickyCategoryName = ""
+    @State private var dragOffset: CGSize = .zero
+    @State private var folderCoverAssetIds: [String: String] = [:]
 
-    @State private var previewURL: URL?
-    @State private var editingIndex: Int?
-    @State private var pickerCategoryId = ""
-    @State private var pickerAuthorId = ""
-    @State private var pickerPath = ""
-    @State private var processedCount = 0
-    @State private var moveSummary: [String] = []
-
-    // 交互与呈现模式
-    @State private var viewMode: TriageViewMode = .pipeline
-    @State private var authorSearchText = ""
+    // 弹窗与交互
+    @State private var advancedPickerItem: PendingCurationItem?
+    @State private var showMoveVerifySheet = false
     @State private var activeVideoTarget: PlayableVideoTarget?
-    @State private var showNewAuthorDialog = false
-    @State private var newAuthorName = ""
+    @State private var activeImageContext: ImageViewerContext?
+    @State private var activeFolderPreview: FolderPreviewTarget?
+    @State private var busy = false
+    @State private var errorText = ""
     @State private var hudToast: String?
 
+    // MARK: - 计算属性
+
     private var filteredProjects: [PendingProjectCard] {
-        let query = projectSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if query.isEmpty { return projects }
-        return projects.filter { $0.name.localizedCaseInsensitiveContains(query) || $0.path.localizedCaseInsensitiveContains(query) }
-    }
-
-    private var currentItem: PendingItem? {
-        items.indices.contains(currentIndex) ? items[currentIndex] : nil
-    }
-
-    private var filteredAuthors: [DomainMetaAuthor] {
-        let list: [DomainMetaAuthor]
-        let query = authorSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if query.isEmpty {
-            list = authors
-        } else {
-            list = authors.filter { author in
-                author.name.localizedCaseInsensitiveContains(query)
-            }
+        let q = projectSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if q.isEmpty { return projects }
+        return projects.filter {
+            $0.name.localizedCaseInsensitiveContains(q) || $0.path.localizedCaseInsensitiveContains(q)
         }
-
-        // 若当前项有智能建议作者，将建议作者置顶
-        if let suggested = currentItem?.suggestedAuthor?.lowercased() {
-            return list.sorted { a, b in
-                let aMatch = (a.name.lowercased() == suggested)
-                let bMatch = (b.name.lowercased() == suggested)
-                if aMatch != bMatch { return aMatch }
-                return a.name.localizedStandardCompare(b.name) == .orderedAscending
-            }
-        }
-        return list.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
+
+    private var triageItems: [PendingCurationItem] {
+        allItems.filter { !$0.isAssigned }
+    }
+
+    private var assignedItems: [PendingCurationItem] {
+        allItems.filter { $0.isAssigned }
+    }
+
+    private var currentDeckItem: PendingCurationItem? {
+        triageItems.first
+    }
+
+    private var runningJobs: [CurateMoveJobSnapshot] {
+        moveJobs.filter { $0.isRunning }
+    }
+
+    private func runningJob(for projectPath: String) -> CurateMoveJobSnapshot? {
+        moveJobs.first { $0.isRunning && $0.projectPath == projectPath }
+    }
+
+    private var selectedProjectRunningJob: CurateMoveJobSnapshot? {
+        guard let project = selectedProject else { return nil }
+        return runningJob(for: project.path)
+    }
+
+    private var deckFinalDestination: String? {
+        let catPath = deckCategoryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if deckDirectCategoryMode {
+            return catPath.isEmpty ? nil : catPath
+        }
+        let authorClean = deckAuthorInput.trimmingCharacters(in: CharacterSet(charactersIn: "【】[] "))
+        if authorClean.isEmpty { return nil }
+        if !catPath.isEmpty {
+            return "\(catPath)/【\(authorClean)】"
+        }
+        if let hit = vaultAuthors.first(where: { $0.canonicalName.lowercased() == authorClean.lowercased() }),
+           let vp = hit.vaultPath, !vp.isEmpty {
+            return vp
+        }
+        return vaultRoot.isEmpty ? nil : "\(vaultRoot)/【\(authorClean)】"
+    }
+
+    private var quickCategories: [VaultCategoryNode] {
+        // 优先展示一级分类与常用二级分类
+        let flat = MediaOrganizer.flattenCategories(categoryTree)
+        let l1 = categoryTree
+        if !l1.isEmpty { return l1 }
+        return Array(flat.prefix(12))
+    }
+
+    // MARK: - 主视图
 
     var body: some View {
         ZStack {
             if selectedProject == nil {
                 projectsHallView
             } else {
-                projectTriageView
+                projectWorkspaceView
             }
 
             if let hudToast {
@@ -120,11 +170,12 @@ struct PendingCurationView: View {
                     .padding(.vertical, 10)
                     .background(.ultraThinMaterial, in: Capsule())
                     .shadow(color: .black.opacity(0.18), radius: 10, y: 5)
-                    .padding(.top, 16)
+                    .padding(.top, 14)
                     Spacer()
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
-                .animation(.spring(response: 0.35, dampingFraction: 0.75), value: hudToast)
+                .animation(.spring(response: 0.32, dampingFraction: 0.8), value: hudToast)
+                .allowsHitTesting(false)
             }
         }
         .navigationTitle(selectedProject?.name ?? "待整理项目")
@@ -137,43 +188,105 @@ struct PendingCurationView: View {
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "chevron.left")
-                            Text("项目列表")
+                            Text("项目大厅")
                         }
                     }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button {
-                        viewMode = (viewMode == .pipeline ? .list : .pipeline)
-                    } label: {
-                        Label(
-                            viewMode == .pipeline ? "列表模式" : "流水线",
-                            systemImage: viewMode == .pipeline ? "list.bullet" : "sparkles.rectangle.stack"
-                        )
+                    if selectedProjectRunningJob == nil && activeTab == .triage {
+                        Button {
+                            triageLayout = (triageLayout == .deck ? .list : .deck)
+                        } label: {
+                            Image(systemName: triageLayout == .deck ? "list.bullet" : "rectangle.stack")
+                        }
+                        .accessibilityLabel("切换刷卡或清单视图")
                     }
                     Button {
                         Task { await loadProjectItems(selected, forceRefresh: true) }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
-                    .disabled(loadingItems || busy)
+                    .disabled(loadingItems || busy || selectedProjectRunningJob != nil)
                 }
             } else {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
-                        Task { await reloadAll(forceRefresh: true) }
+                        showInboxPackSheet = true
                     } label: {
-                        Image(systemName: "arrow.clockwise")
+                        Image(systemName: "plus.rectangle.on.folder")
                     }
-                    .disabled(loadingProjects || busy)
+                    .accessibilityLabel("打包新项目")
+
+                    Menu {
+                        Button {
+                            showJobsMonitor = true
+                        } label: {
+                            Label("后台移动任务 (\(runningJobs.count))", systemImage: "tray.and.arrow.up")
+                        }
+                        Button {
+                            showFilterWordsSheet = true
+                        } label: {
+                            Label("过滤词设置 (\(filterWords.count))", systemImage: "line.3.horizontal.decrease.circle")
+                        }
+                        Button {
+                            Task { await reloadAll(forceRefresh: true) }
+                        } label: {
+                            Label("强制刷新目录", systemImage: "arrow.clockwise")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
                 }
             }
         }
-        .task { await reloadAll() }
-        .sheet(isPresented: Binding(
-            get: { editingIndex != nil },
-            set: { if !$0 { editingIndex = nil } }
-        )) {
-            targetPicker
+        .task {
+            await reloadAll(forceRefresh: false)
+        }
+        .task {
+            await pollMoveJobsLoop()
+        }
+        .sheet(isPresented: $showJobsMonitor) {
+            PendingJobsMonitorSheet(
+                jobs: moveJobs,
+                onRefresh: { await refreshMoveJobs() },
+                onCancelJob: { jobId in await cancelMoveJob(jobId) }
+            )
+        }
+        .sheet(isPresented: $showFilterWordsSheet) {
+            PendingFilterWordsSheet(filterWords: $filterWords) { updated in
+                await saveFilterWordsToServer(updated)
+            }
+        }
+        .sheet(isPresented: $showInboxPackSheet) {
+            PendingInboxPackSheet(
+                inboxPath: inboxPath,
+                inboxRootId: root(for: inboxPath)?.id
+            ) {
+                await reloadAll(forceRefresh: true)
+                showHUD("已打包新待整理项目")
+            }
+            .environmentObject(model)
+        }
+        .sheet(item: $advancedPickerItem) { item in
+            PendingAdvancedPickerSheet(
+                item: item,
+                vaultRoot: vaultRoot,
+                categoryTree: categoryTree,
+                authors: vaultAuthors
+            ) { result in
+                applyAdvancedPickerResult(result, for: item)
+            }
+        }
+        .sheet(isPresented: $showMoveVerifySheet) {
+            moveVerifySheet
+        }
+        .sheet(item: $activeFolderPreview) { target in
+            PendingFolderPreviewSheet(
+                rootId: target.rootId,
+                folderPath: target.path,
+                folderName: target.name
+            )
+            .environmentObject(model)
         }
         .fullScreenCover(item: $activeVideoTarget) { target in
             GestureVideoPlayerSheet(
@@ -184,19 +297,9 @@ struct PendingCurationView: View {
             )
             .ignoresSafeArea()
         }
-        .alert("新建创作者文件夹", isPresented: $showNewAuthorDialog) {
-            TextField("创作者姓名（例如：三上悠亚）", text: $newAuthorName)
-            Button("创建并移入") {
-                let name = newAuthorName.trimmingCharacters(in: .whitespacesAndNewlines)
-                newAuthorName = ""
-                guard !name.isEmpty else { return }
-                Task { await moveCurrentToCustomAuthor(name) }
-            }
-            Button("取消", role: .cancel) {
-                newAuthorName = ""
-            }
-        } message: {
-            Text("将在已整理库建立【创作者】文件夹，并将当前文件直接移入。")
+        .fullScreenCover(item: $activeImageContext) { ctx in
+            ImageViewer(context: ctx)
+                .environmentObject(model)
         }
     }
 
@@ -204,12 +307,44 @@ struct PendingCurationView: View {
 
     private var projectsHallView: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 14) {
+                // 顶部后台移动任务状态条（有运行中任务时自动浮现）
+                if !runningJobs.isEmpty {
+                    Button {
+                        showJobsMonitor = true
+                    } label: {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
+                            VStack(alignment: .leading, spacing: 2) {
+                                if let first = runningJobs.first {
+                                    Text("后台正在移动【\(first.projectName)】(\(first.processed)/\(first.total))")
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(.white)
+                                    Text("服务端串行防风控执行中 · 点击查看详情或停止")
+                                        .font(.caption2)
+                                        .foregroundStyle(.white.opacity(0.85))
+                                }
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                        .padding(12)
+                        .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                }
+
                 // 搜索栏
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
-                    TextField("搜索待整理批次项目…", text: $projectSearchText)
+                    TextField("搜索待整理项目…", text: $projectSearchText)
                     if !projectSearchText.isEmpty {
                         Button { projectSearchText = "" } label: {
                             Image(systemName: "xmark.circle.fill")
@@ -220,24 +355,39 @@ struct PendingCurationView: View {
                 .padding(10)
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
                 .padding(.horizontal, 16)
-                .padding(.top, 8)
+                .padding(.top, runningJobs.isEmpty ? 8 : 0)
 
-                // 统计卡片
-                let totalFiles = projects.reduce(0) { $0 + $1.totalCount }
-                HStack(spacing: 16) {
+                // 服务器目录与汇总卡片
+                HStack(spacing: 14) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("待整理项目大厅")
                             .font(.headline.weight(.bold))
-                        Text("\(projects.count) 个批次项目 · 共 \(totalFiles) 个待分类文件")
+                        Text("目录：\(pendingPath.isEmpty ? "未配置" : pendingPath)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text("\(projects.count) 个待整理项目 · 任意子文件夹自动识别")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Image(systemName: "tray.2.fill")
-                        .font(.system(size: 32))
-                        .foregroundStyle(Color.accentColor.opacity(0.8))
+                    Button {
+                        showJobsMonitor = true
+                    } label: {
+                        VStack(spacing: 2) {
+                            Image(systemName: runningJobs.isEmpty ? "tray.2.fill" : "bolt.horizontal.circle.fill")
+                                .font(.title2)
+                                .foregroundStyle(Color.accentColor)
+                            if !moveJobs.isEmpty {
+                                Text("任务(\(moveJobs.count))")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
                 }
-                .padding(16)
+                .padding(14)
                 .pmlGlassCard(cornerRadius: 18)
                 .padding(.horizontal, 16)
 
@@ -251,20 +401,20 @@ struct PendingCurationView: View {
                 if loadingProjects && projects.isEmpty {
                     VStack(spacing: 12) {
                         ProgressView()
-                        Text("正在扫描待整理项目…")
+                        Text("正在读取待整理项目…")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 40)
+                    .padding(.vertical, 44)
                 } else if filteredProjects.isEmpty {
                     VStack(spacing: 14) {
                         Image(systemName: "tray")
                             .font(.system(size: 44))
                             .foregroundStyle(.secondary)
-                        Text(projectSearchText.isEmpty ? "没有待整理项目" : "未找到匹配的项目")
+                        Text(projectSearchText.isEmpty ? "当前目录下暂无待整理项目" : "未找到匹配项目")
                             .font(.headline)
-                        Text(projectSearchText.isEmpty ? "所有待整理文件均已分类完毕" : "请尝试其他关键词")
+                        Text("可点击右上角从云下载打包新项目")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -273,12 +423,7 @@ struct PendingCurationView: View {
                 } else {
                     LazyVStack(spacing: 10) {
                         ForEach(filteredProjects) { project in
-                            Button {
-                                selectProject(project)
-                            } label: {
-                                projectCard(project)
-                            }
-                            .buttonStyle(.plain)
+                            projectCardRow(project)
                         }
                     }
                     .padding(.horizontal, 16)
@@ -291,765 +436,1084 @@ struct PendingCurationView: View {
         }
     }
 
-    private func projectCard(_ project: PendingProjectCard) -> some View {
-        HStack(spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.accentColor.opacity(0.12))
-                Image(systemName: project.isLoose ? "tray.fill" : "folder.fill")
-                    .font(.system(size: 22))
-                    .foregroundStyle(Color.accentColor)
+    private func projectCardRow(_ project: PendingProjectCard) -> some View {
+        let activeJob = runningJob(for: project.path)
+        return Button {
+            if activeJob != nil {
+                selectedProject = project
+            } else {
+                enterProject(project)
             }
-            .frame(width: 48, height: 48)
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(activeJob != nil ? Color.orange.opacity(0.16) : Color.accentColor.opacity(0.12))
+                    Image(systemName: activeJob != nil ? "lock.fill" : (project.isLoose ? "tray.fill" : "folder.fill"))
+                        .font(.system(size: 20))
+                        .foregroundStyle(activeJob != nil ? Color.orange : Color.accentColor)
+                }
+                .frame(width: 46, height: 46)
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .center, spacing: 6) {
-                    Text(project.name)
-                        .font(.headline)
-                        .lineLimit(1)
-                    if project.isLoose {
-                        Text("散装")
-                            .font(.caption2)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.orange.opacity(0.15), in: Capsule())
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(project.name)
+                            .font(.subheadline.weight(.bold))
+                            .lineLimit(1)
+                        if project.isLoose {
+                            Text("散装")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.15), in: Capsule())
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    if let job = activeJob {
+                        Text("🔒 后台移动中 \(job.processed)/\(job.total) · 锁定不可编辑")
+                            .font(.caption2.weight(.semibold))
                             .foregroundStyle(.orange)
+                    } else {
+                        Text(project.path)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
-                Text(project.path)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
 
-            Spacer()
+                Spacer()
 
-            HStack(spacing: 6) {
-                if project.totalCount > 0 {
-                    Text("\(project.totalCount) 项")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                if activeJob == nil && !project.isLoose && project.totalCount == 0 {
+                    Button {
+                        Task { await deleteEmptyProject(project) }
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .padding(6)
+                            .background(Color.red.opacity(0.1), in: Circle())
+                    }
+                    .buttonStyle(.plain)
                 }
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.tertiary)
+
+                HStack(spacing: 4) {
+                    if project.totalCount > 0 {
+                        Text("\(project.totalCount)")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.tertiary)
+                }
             }
+            .padding(13)
+            .pmlGlassCard(cornerRadius: 16)
         }
-        .padding(14)
-        .pmlGlassCard(cornerRadius: 16)
+        .buttonStyle(.plain)
     }
 
-    private func selectProject(_ project: PendingProjectCard) {
-        selectedProject = project
-        Task {
-            await loadProjectItems(project)
-        }
-    }
+    // MARK: - 第二级：项目内「待归纳 / 已归纳」双分区工作台
 
-    // MARK: - 第二级：项目流水线归档
-
-    private var projectTriageView: some View {
+    private var projectWorkspaceView: some View {
         Group {
-            if loadingItems && items.isEmpty {
+            if let job = selectedProjectRunningJob {
+                projectLockedMovingView(job)
+            } else if loadingItems && allItems.isEmpty {
                 VStack(spacing: 14) {
                     ProgressView()
-                    Text("正在加载项目文件…")
+                    Text("正在扫描一级子项并匹配作者与分类…")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if items.isEmpty {
+            } else if allItems.isEmpty {
                 projectEmptyCelebrationView
-            } else if viewMode == .pipeline {
-                pipelineView
             } else {
-                listView
+                VStack(spacing: 0) {
+                    // 顶部双分区切换器：待归纳 / 已归纳
+                    Picker("分区", selection: $activeTab) {
+                        Text("待归纳 (\(triageItems.count))").tag(PendingWorkspaceTab.triage)
+                        Text("已归纳 (\(assignedItems.count))").tag(PendingWorkspaceTab.assigned)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+
+                    if !errorText.isEmpty {
+                        Text(errorText)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 6)
+                    }
+
+                    if activeTab == .triage {
+                        triageZoneView
+                    } else {
+                        assignedZoneView
+                    }
+                }
             }
         }
     }
 
-    private var projectEmptyCelebrationView: some View {
+    // MARK: - 项目锁定态（后台移动中）
+
+    private func projectLockedMovingView(_ job: CurateMoveJobSnapshot) -> some View {
         ScrollView {
-            VStack(spacing: 20) {
-                Spacer().frame(height: 50)
+            VStack(spacing: 18) {
+                Spacer().frame(height: 36)
                 ZStack {
                     Circle()
-                        .fill(Color.accentColor.opacity(0.12))
-                        .frame(width: 90, height: 90)
-                    Image(systemName: "checkmark.seal.fill")
-                        .font(.system(size: 48))
-                        .foregroundStyle(Color.accentColor)
+                        .fill(Color.orange.opacity(0.15))
+                        .frame(width: 88, height: 88)
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 42))
+                        .foregroundStyle(.orange)
                 }
 
-                Text("【\(selectedProject?.name ?? "该项目")】已全部归档！")
+                Text("项目已锁定 · 后台移动中")
                     .font(.title3.weight(.bold))
 
-                Text("本批次所有文件均已归类至对应创作者或分类文件夹。")
+                Text("服务器正在单线程串行移动【\(job.projectName)】的已归纳项（每项间隔 1.3~2.0s 防 115/CD2 风控），移动完成前暂不可继续编辑该项目。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                    .padding(.horizontal, 32)
+                    .padding(.horizontal, 28)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("执行进度")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("\(job.processed) / \(job.total)")
+                            .font(.subheadline.weight(.bold))
+                            .monospacedDigit()
+                    }
+                    ProgressView(value: Double(job.processed), total: Double(max(1, job.total)))
+                        .tint(.accentColor)
+
+                    HStack(spacing: 14) {
+                        Label("成功 \(job.successCount)", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        if job.skippedCount > 0 {
+                            Label("跳过 \(job.skippedCount)", systemImage: "arrow.uturn.right.circle.fill")
+                                .foregroundStyle(.orange)
+                        }
+                        if job.failedCount > 0 {
+                            Label("失败 \(job.failedCount)", systemImage: "xmark.circle.fill")
+                                .foregroundStyle(.red)
+                        }
+                    }
+                    .font(.caption)
+
+                    if let current = job.currentItem {
+                        Text("正在移动：\(current)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                .padding(16)
+                .pmlGlassCard(cornerRadius: 18)
+                .padding(.horizontal, 20)
+
+                HStack(spacing: 12) {
+                    Button {
+                        selectedProject = nil
+                    } label: {
+                        Label("先去整理其他项目", systemImage: "arrow.left")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button(role: .destructive) {
+                        Task { await cancelMoveJob(job.id) }
+                    } label: {
+                        Label("紧急停止", systemImage: "stop.circle.fill")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.horizontal, 20)
+            }
+        }
+    }
+
+    // MARK: - 分区 1：待归纳（沉浸刷卡台 + 清单模式）
+
+    private var triageZoneView: some View {
+        Group {
+            if triageItems.isEmpty {
+                VStack(spacing: 16) {
+                    Spacer()
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 52))
+                        .foregroundStyle(.green)
+                    Text("所有待归纳项已分类完毕！")
+                        .font(.headline)
+                    Text("请切换到「已归纳 (\(assignedItems.count))」核验并触发后台移动。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button {
+                        activeTab = .assigned
+                    } label: {
+                        Label("前往已归纳清单 (\(assignedItems.count))", systemImage: "paperplane.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Spacer()
+                }
+                .padding(24)
+            } else if triageLayout == .deck {
+                triageDeckView
+            } else {
+                triageListView
+            }
+        }
+    }
+
+    private var triageDeckView: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                if let item = currentDeckItem {
+                    ZStack {
+                        // 背后第 2 张预备卡片（拖动时浮现）
+                        if triageItems.count > 1 {
+                            let nextItem = triageItems[1]
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("下一项预览")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(nextItem.entry.name)
+                                    .font(.subheadline.weight(.medium))
+                                    .lineLimit(2)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(18)
+                            .pmlGlassCard(cornerRadius: 20)
+                            .scaleEffect(0.95)
+                            .opacity(min(0.85, abs(dragOffset.width) / 110.0))
+                            .padding(.horizontal, 16)
+                        }
+
+                        // 主互动卡片（支持左右拖拽刷卡）
+                        deckFocusCard(for: item)
+                            .padding(.horizontal, 16)
+                            .offset(x: dragOffset.width, y: dragOffset.height * 0.12)
+                            .rotationEffect(.degrees(Double(dragOffset.width / 26.0)))
+                            .overlay(alignment: .topLeading) {
+                                if dragOffset.width > 24 {
+                                    Text("归纳 READY")
+                                        .font(.caption.weight(.black))
+                                        .foregroundStyle(.green)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.green, lineWidth: 2))
+                                        .rotationEffect(.degrees(-12))
+                                        .padding(.leading, 32)
+                                        .padding(.top, 22)
+                                        .opacity(min(1, Double(dragOffset.width - 24) / 70.0))
+                                }
+                            }
+                            .overlay(alignment: .topTrailing) {
+                                if dragOffset.width < -24 {
+                                    Text("跳过 SKIP")
+                                        .font(.caption.weight(.black))
+                                        .foregroundStyle(.orange)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.orange, lineWidth: 2))
+                                        .rotationEffect(.degrees(12))
+                                        .padding(.trailing, 32)
+                                        .padding(.top, 22)
+                                        .opacity(min(1, Double(-dragOffset.width - 24) / 70.0))
+                                }
+                            }
+                            .gesture(
+                                DragGesture(minimumDistance: 18)
+                                    .onChanged { value in
+                                        if abs(value.translation.width) > abs(value.translation.height) {
+                                            dragOffset = value.translation
+                                        }
+                                    }
+                                    .onEnded { value in
+                                        if value.translation.width > 95, deckFinalDestination != nil {
+                                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                            withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
+                                                dragOffset = .zero
+                                                confirmCurrentDeckItemToAssigned()
+                                            }
+                                        } else if value.translation.width < -95 {
+                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                            withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
+                                                dragOffset = .zero
+                                                skipCurrentDeckItem()
+                                            }
+                                        } else {
+                                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                                                dragOffset = .zero
+                                            }
+                                        }
+                                    }
+                            )
+                    }
+                    .task(id: item.entry.path) {
+                        syncDeckSlots(for: item)
+                        await loadCoverIfNeeded(for: item)
+                    }
+                }
+            }
+            .padding(.bottom, 24)
+        }
+    }
+
+    private func deckFocusCard(for item: PendingCurationItem) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // 封面大窗（文件夹穿透首张媒体封面 + 点击打开受控浏览器）
+            Button {
+                openItemMediaOrFolder(item)
+            } label: {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color(.secondarySystemFill))
+
+                    let thumbId = item.entry.assetId ?? item.entry.coverAssetId ?? folderCoverAssetIds[item.entry.path]
+                    if let thumbId {
+                        AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
+                            fallbackMediaBanner(for: item)
+                        }
+                    } else {
+                        fallbackMediaBanner(for: item)
+                    }
+
+                    // 居中提示胶囊
+                    HStack(spacing: 6) {
+                        Image(systemName: item.entry.isDirectory ? "folder.fill" : (item.entry.isVideo ? "play.fill" : "photo.fill"))
+                            .font(.caption.weight(.bold))
+                        Text(item.entry.isDirectory ? "点击浏览文件夹内视频/图片" : (item.entry.isVideo ? "点击全屏试看" : "点击查看大图"))
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(.ultraThinMaterial, in: Capsule())
+
+                    // 右上角类型与体积标签
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Text(item.entry.isDirectory ? "文件夹" : pmlFormatBytes(UInt64(max(0, item.entry.sizeBytes))))
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(.black.opacity(0.55), in: Capsule())
+                                .padding(8)
+                        }
+                        Spacer()
+                    }
+                }
+                .frame(height: 175)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .buttonStyle(.plain)
+
+            // 文件/文件夹名称
+            Text(item.entry.name)
+                .font(.subheadline.weight(.bold))
+                .lineLimit(3)
+
+            // 紫色作者槽位：文件名推荐候选词 + 无作者/仅分类 + 手动微调
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("作者槽位（文件名推荐）", systemImage: "person.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.purple)
+                    Spacer()
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 7) {
+                        ForEach(item.candidateAuthorChips, id: \.self) { chip in
+                            let selected = !deckDirectCategoryMode && deckAuthorInput.lowercased() == chip.lowercased()
+                            Button {
+                                deckDirectCategoryMode = false
+                                deckAuthorInput = chip
+                            } label: {
+                                Text(chip)
+                                    .font(.caption.weight(selected ? .bold : .medium))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(selected ? Color.purple : Color.purple.opacity(0.14), in: Capsule())
+                                    .foregroundStyle(selected ? .white : .purple)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        Button {
+                            deckDirectCategoryMode = true
+                            deckAuthorInput = ""
+                        } label: {
+                            Text("无作者/仅分类")
+                                .font(.caption.weight(deckDirectCategoryMode ? .bold : .medium))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(deckDirectCategoryMode ? Color.gray : Color(.secondarySystemBackground), in: Capsule())
+                                .foregroundStyle(deckDirectCategoryMode ? .white : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "pencil")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    TextField("手动输入或微调作者姓名（选填）…", text: $deckAuthorInput)
+                        .font(.caption)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .onChange(of: deckAuthorInput) { _, val in
+                            if !val.trimmingCharacters(in: .whitespaces).isEmpty {
+                                deckDirectCategoryMode = false
+                            }
+                        }
+                    if !deckAuthorInput.isEmpty {
+                        Button { deckAuthorInput = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            // 绿色分类槽位：自动带出匹配分类 / 记忆上次分类 + 一级快速切换
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Label("分类槽位", systemImage: "folder.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                    if !deckCategoryName.isEmpty {
+                        Text("已选：\(deckCategoryName)")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.green)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 7) {
+                        ForEach(quickCategories) { cat in
+                            let selected = deckCategoryPath == cat.path || deckCategoryPath.hasPrefix(cat.path + "/")
+                            Button {
+                                deckCategoryPath = cat.path
+                                deckCategoryName = cat.fullDisplayName
+                                stickyCategoryPath = cat.path
+                                stickyCategoryName = cat.fullDisplayName
+                            } label: {
+                                Text(cat.cleanName)
+                                    .font(.caption.weight(selected ? .bold : .medium))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(selected ? Color.green : Color.green.opacity(0.14), in: Capsule())
+                                    .foregroundStyle(selected ? .white : .green)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            // 实时预定归宿预览条
+            VStack(alignment: .leading, spacing: 3) {
+                Text("预定归宿")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(deckFinalDestination ?? "请点选分类或输入作者（或点「高级」选多级子分类）")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(deckFinalDestination != nil ? Color.accentColor : Color.secondary)
+                    .lineLimit(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+
+            // 底部大拇指操作栏
+            HStack(spacing: 8) {
+                Button {
+                    deckAuthorInput = ""
+                    deckCategoryPath = ""
+                    deckCategoryName = ""
+                    deckDirectCategoryMode = false
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.caption.weight(.semibold))
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 10)
+                }
+                .buttonStyle(.bordered)
 
                 Button {
-                    selectedProject = nil
+                    advancedPickerItem = item
                 } label: {
-                    Label("返回待整理项目大厅", systemImage: "arrow.left")
-                        .font(.subheadline.weight(.semibold))
+                    Label("高级", systemImage: "slider.horizontal.3")
+                        .font(.caption.weight(.semibold))
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 8)
+                }
+                .buttonStyle(.bordered)
+
+                Button {
+                    skipCurrentDeckItem()
+                } label: {
+                    Label("跳过", systemImage: "forward.fill")
+                        .font(.caption.weight(.semibold))
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 8)
+                }
+                .buttonStyle(.bordered)
+                .disabled(triageItems.count <= 1)
+
+                Button {
+                    confirmCurrentDeckItemToAssigned()
+                } label: {
+                    Label("加入已归纳", systemImage: "checkmark")
+                        .font(.caption.weight(.bold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
                 }
                 .buttonStyle(.borderedProminent)
-                .padding(.top, 10)
+                .disabled(deckFinalDestination == nil)
+            }
+        }
+        .padding(14)
+        .pmlGlassCard(cornerRadius: 20)
+    }
 
-                if !moveSummary.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("本次已归档记录 (\(moveSummary.count))")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
+    private func fallbackMediaBanner(for item: PendingCurationItem) -> some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color.accentColor.opacity(0.25), Color.purple.opacity(0.2)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Image(systemName: item.entry.isDirectory ? "folder.fill" : (item.entry.isVideo ? "video.fill" : "photo.fill"))
+                .font(.system(size: 42))
+                .foregroundStyle(.white.opacity(0.45))
+        }
+    }
 
-                        ForEach(moveSummary.prefix(10), id: \.self) { item in
-                            Text(item)
+    private var triageListView: some View {
+        List(triageItems) { item in
+            HStack(spacing: 12) {
+                Button {
+                    openItemMediaOrFolder(item)
+                } label: {
+                    Image(systemName: item.entry.symbol)
+                        .font(.title3)
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 36, height: 36)
+                        .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.entry.name)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(2)
+                    HStack(spacing: 6) {
+                        if let catName = item.matchedCategoryName {
+                            Text("预记分类：\(catName)")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.green)
+                        }
+                        if !item.candidateAuthorChips.isEmpty {
+                            Text("候选：\(item.candidateAuthorChips.prefix(2).joined(separator: " / "))")
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.purple)
                                 .lineLimit(1)
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(14)
-                    .pmlGlassCard(cornerRadius: 16)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 20)
                 }
 
-                Spacer().frame(height: 50)
+                Spacer()
+
+                Button("指定") {
+                    advancedPickerItem = item
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
+            .padding(.vertical, 4)
         }
+        .listStyle(.plain)
     }
 
-    // MARK: - 流水线 Slidebox 归档视图
+    // MARK: - 分区 2：已归纳（核验、改动、退回待归纳、一键后台移动）
 
-    private var pipelineView: some View {
-        ScrollView {
-            VStack(spacing: 14) {
-                // 顶部状态指示栏
-                HStack {
-                    Label("还剩 \(items.count) 个待整理", systemImage: "tray.full.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+    private var assignedZoneView: some View {
+        ZStack(alignment: .bottom) {
+            if assignedItems.isEmpty {
+                VStack(spacing: 14) {
                     Spacer()
-                    if processedCount > 0 {
-                        Text("已收纳 \(processedCount) 个")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.top, 8)
-
-                if let item = currentItem {
-                    // 主卡片：媒体信息与全屏点播预览
-                    pipelineCard(for: item)
-                        .padding(.horizontal, 16)
-
-                    // 快速归档抽屉：创作者胶囊与搜索
-                    authorDrawer(for: item)
-                        .padding(.horizontal, 16)
-
-                    // 底部辅助动作：跳过、自选、新建
-                    auxiliaryActions(for: item)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 24)
-                }
-            }
-        }
-    }
-
-    private func pipelineCard(for item: PendingItem) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // 标题与标签
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .top) {
-                    Text(item.entry.name)
+                    Image(systemName: "tray.and.arrow.down")
+                        .font(.system(size: 46))
+                        .foregroundStyle(.secondary)
+                    Text("已归纳清单为空")
                         .font(.headline)
-                        .lineLimit(3)
+                    Text("命中已有作者的项会自动出现在这里，也可在「待归纳」选定分类与作者后加入。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                    Button("前往待归纳 (\(triageItems.count))") {
+                        activeTab = .triage
+                    }
+                    .buttonStyle(.borderedProminent)
                     Spacer()
-                    Text("\(currentIndex + 1)/\(items.count)")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Color(.systemFill), in: Capsule())
                 }
+            } else {
+                List {
+                    ForEach(assignedItems) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: item.entry.symbol)
+                                    .foregroundStyle(Color.accentColor)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(item.entry.name)
+                                        .font(.subheadline.weight(.semibold))
+                                        .lineLimit(2)
+                                    HStack(spacing: 6) {
+                                        Text(item.assignmentSource.badgeText)
+                                            .font(.caption2.weight(.bold))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.accentColor.opacity(0.12), in: Capsule())
+                                            .foregroundStyle(Color.accentColor)
+                                        if let author = item.matchedAuthor, !author.isEmpty {
+                                            Text("【\(author)】")
+                                                .font(.caption2.weight(.bold))
+                                                .foregroundStyle(.purple)
+                                        }
+                                    }
+                                    if let dest = item.targetVaultPath {
+                                        Text("→ \(dest)")
+                                            .font(.system(.caption2, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                    }
+                                }
+                                Spacer()
+                            }
 
-                HStack(spacing: 8) {
-                    Label(item.entry.isDirectory ? "文件夹" : (item.entry.isVideo ? "视频" : "文件"),
-                          systemImage: item.entry.isDirectory ? "folder.fill" : (item.entry.isVideo ? "video.fill" : "doc.fill"))
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
+                            HStack(spacing: 10) {
+                                Button {
+                                    advancedPickerItem = item
+                                } label: {
+                                    Label("改分类/作者", systemImage: "pencil")
+                                        .font(.caption2.weight(.semibold))
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
 
-                    Text("·")
-                        .foregroundStyle(.secondary)
+                                Button(role: .destructive) {
+                                    revertItemToTriage(item)
+                                } label: {
+                                    Label("退回待归纳", systemImage: "arrow.uturn.backward")
+                                        .font(.caption2.weight(.semibold))
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
 
-                    Text(pmlFormatBytes(UInt64(max(0, item.entry.sizeBytes))))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                        }
+                        .padding(.vertical, 4)
+                        .swipeActions(edge: .trailing) {
+                            Button("退回", role: .destructive) {
+                                revertItemToTriage(item)
+                            }
+                        }
+                    }
+                    // 底部留白避免被悬浮按钮遮挡
+                    Color.clear.frame(height: 74).listRowSeparator(.hidden)
+                }
+                .listStyle(.plain)
+
+                // 底部悬浮：一键后台移动主按钮
+                VStack(spacing: 0) {
+                    Button {
+                        showMoveVerifySheet = true
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "paperplane.fill")
+                            Text("一键后台移动（\(assignedItems.count) 项）")
+                                .fontWeight(.bold)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
+                    .background(.ultraThinMaterial)
                 }
             }
+        }
+    }
 
-            // 预览大窗（支持点击视频直调手势播放器试看）
-            ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color(.secondarySystemFill))
+    // MARK: - 批量后台移动核验确认 Sheet
 
-                if item.entry.isVideo {
-                    videoPreviewBox(for: item)
-                } else if item.entry.isImage, let previewURL {
-                    CachedImageView(url: previewURL, contentMode: .fill, minHeight: 200)
-                } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: item.entry.isDirectory ? "folder.fill" : "doc.fill")
-                            .font(.system(size: 46))
-                            .foregroundStyle(.tint)
-                        Text(item.entry.isDirectory ? "文件夹（包含子资源）" : "常规文件")
+    private var moveVerifySheet: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Image(systemName: "shield.checkered")
+                        .font(.title2)
+                        .foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("服务端后台串行防风控移动")
+                            .font(.subheadline.weight(.bold))
+                        Text("共 \(assignedItems.count) 项，每项随机延迟 1.3~2.0s，同名自动跳过不覆盖。移动期间本项目自动锁定，可锁屏或切去整理其他项目。")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
-            }
-            .frame(height: 210)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.green.opacity(0.1))
 
-            // 智能推荐条幅（若识别到创作者）
-            if let suggested = item.suggestedAuthor, !suggested.isEmpty {
-                HStack {
-                    Image(systemName: "sparkles")
-                        .foregroundStyle(.yellow)
-                    Text("智能识别推荐：")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("【\(suggested)】")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(Color.accentColor)
-                    Spacer()
-                    Button("一键移入") {
-                        Task { await moveCurrentToCustomAuthor(suggested) }
-                    }
-                    .font(.caption.weight(.semibold))
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(busy)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-            }
-        }
-        .padding(16)
-        .pmlGlassCard(cornerRadius: 20)
-        .task(id: item.entry.path) {
-            await loadPreview()
-        }
-    }
-
-    private func videoPreviewBox(for item: PendingItem) -> some View {
-        Button {
-            Task { await playCurrentItem() }
-        } label: {
-            ZStack {
-                let thumbId = item.entry.assetId ?? item.entry.coverAssetId
-                AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
-                    ZStack {
-                        Color.black.opacity(0.6)
-                        Image(systemName: "video.fill")
-                            .font(.system(size: 40))
-                            .foregroundStyle(.white.opacity(0.4))
+                List(assignedItems) { item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.entry.name)
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(2)
+                        Text("→ \(item.targetVaultPath ?? "")")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(Color.accentColor)
+                            .lineLimit(2)
                     }
                 }
-
-                // 悬浮居中试看胶囊
-                HStack(spacing: 6) {
-                    Image(systemName: "play.fill")
-                        .font(.caption.weight(.bold))
-                    Text("点击全屏试看")
-                        .font(.caption.weight(.semibold))
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(.ultraThinMaterial, in: Capsule())
-                .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+                .listStyle(.plain)
             }
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func authorDrawer(for item: PendingItem) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("快速归档至创作者")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                Text("点击直接物理移动")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            // 创作者快捷搜索栏
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                TextField("搜索创作者名称或别名…", text: $authorSearchText)
-                    .font(.caption)
-                    .textFieldStyle(.plain)
-                if !authorSearchText.isEmpty {
-                    Button { authorSearchText = "" } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
-
-            // 创作者按钮流式布局
-            ScrollView(.vertical, showsIndicators: false) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 95), spacing: 8)], spacing: 8) {
-                    ForEach(filteredAuthors.prefix(24)) { author in
-                        authorChipButton(author: author, for: item)
-                    }
-                }
-                .padding(.vertical, 4)
-            }
-            .frame(maxHeight: 180)
-        }
-        .padding(16)
-        .pmlGlassCard(cornerRadius: 20)
-    }
-
-    private func authorChipButton(author: DomainMetaAuthor, for item: PendingItem) -> some View {
-        let isSuggested = (item.suggestedAuthor?.lowercased() == author.name.lowercased())
-        return Button {
-            Task { await quickMoveCurrent(to: author) }
-        } label: {
-            HStack(spacing: 4) {
-                if isSuggested {
-                    Image(systemName: "sparkles")
-                        .font(.caption2)
-                        .foregroundStyle(.yellow)
-                }
-                Text(author.name)
-                    .font(.caption.weight(isSuggested ? .bold : .medium))
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
-            .background(
-                isSuggested ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground),
-                in: RoundedRectangle(cornerRadius: 8)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isSuggested ? Color.accentColor : Color.clear, lineWidth: 1)
-            )
-            .foregroundStyle(isSuggested ? Color.accentColor : Color.primary)
-        }
-        .buttonStyle(.plain)
-        .disabled(busy)
-    }
-
-    private func auxiliaryActions(for item: PendingItem) -> some View {
-        HStack(spacing: 12) {
-            Button {
-                skipCurrent()
-            } label: {
-                Label("跳过稍后", systemImage: "forward.fill")
-                    .font(.caption.weight(.medium))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-            }
-            .buttonStyle(.bordered)
-            .disabled(items.count <= 1 || busy)
-
-            Button {
-                showNewAuthorDialog = true
-            } label: {
-                Label("＋ 新建创作者", systemImage: "folder.badge.plus")
-                    .font(.caption.weight(.medium))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-            }
-            .buttonStyle(.bordered)
-            .disabled(busy)
-
-            Button {
-                openPicker()
-            } label: {
-                Label("自选目录", systemImage: "folder")
-                    .font(.caption.weight(.medium))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-            }
-            .buttonStyle(.bordered)
-            .disabled(busy)
-        }
-    }
-
-    // MARK: - 清单列表模式
-
-    private var listView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                configSummaryCard
-                actionsCard
-
-                if !errorText.isEmpty {
-                    Text(errorText).font(.footnote).foregroundStyle(.red).padding(.horizontal, 16)
-                }
-                if !message.isEmpty {
-                    Text(message).font(.footnote).foregroundStyle(.secondary).padding(.horizontal, 16)
-                }
-
-                LazyVStack(spacing: 10) {
-                    ForEach(items.indices, id: \.self) { idx in
-                        let item = items[idx]
-                        HStack(spacing: 12) {
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(Color(.secondarySystemFill))
-                                let thumbId = item.entry.assetId ?? item.entry.coverAssetId
-                                AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
-                                    Image(systemName: item.entry.isDirectory ? "folder.fill" : "doc.fill")
-                                        .font(.system(size: 20))
-                                        .foregroundStyle(.tint)
-                                }
-                            }
-                            .frame(width: 50, height: 50)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(item.entry.name)
-                                    .font(.subheadline.weight(.medium))
-                                    .lineLimit(1)
-                                HStack(spacing: 6) {
-                                    Text(pmlFormatBytes(UInt64(max(0, item.entry.sizeBytes))))
-                                    if let author = item.suggestedAuthor {
-                                        Text("·")
-                                        Text("【\(author)】").foregroundStyle(.tint)
-                                    }
-                                }
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                            }
-
-                            Spacer()
-
-                            if let target = item.targetDir {
-                                Button("移入") {
-                                    Task { await moveItemAtIndex(idx) }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-                            } else {
-                                Button("选目标") {
-                                    editingIndex = idx
-                                    openPicker()
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                            }
-                        }
-                        .padding(12)
-                        .pmlGlassCard(cornerRadius: 14)
-                    }
-                }
-                .padding(.horizontal, 16)
-            }
-            .padding(.vertical, 12)
-        }
-    }
-
-    private var configSummaryCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("待收纳目录：\(pendingPath)")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Text("已整理目标：\(vaultRoot)")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .pmlGlassCard(cornerRadius: 14)
-        .padding(.horizontal, 16)
-    }
-
-    private var actionsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            let ready = items.filter { $0.targetDir != nil }.count
-            Text("待处理 \(items.count) 项 · 已匹配建议 \(ready) 项")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Button("一键收纳所有已匹配建议（\(ready) 项）") {
-                Task { await moveAll() }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(busy || ready == 0)
-        }
-        .padding(14)
-        .pmlGlassCard(cornerRadius: 18)
-        .padding(.horizontal, 16)
-    }
-
-    // MARK: - 目标选择弹窗
-
-    private var targetPicker: some View {
-        NavigationStack {
-            Form {
-                Section("选择分类与创作者") {
-                    Picker("分类", selection: $pickerCategoryId) {
-                        Text("不指定分类").tag("")
-                        ForEach(categories) { category in
-                            Text(category.name).tag(category.id)
-                        }
-                    }
-                    Picker("创作者", selection: $pickerAuthorId) {
-                        Text("不指定作者").tag("")
-                        ForEach(authors) { author in
-                            Text(author.name).tag(author.id)
-                        }
-                    }
-                    TextField("完整目标目录", text: $pickerPath)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                }
-                Section {
-                    Button("确认保存目标并移动") {
-                        applyPickerAndMove()
-                    }
-                }
-            }
-            .navigationTitle("自选归档目标")
+            .navigationTitle("核验并启动后台移动")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("取消") { editingIndex = nil }
+                    Button("取消") { showMoveVerifySheet = false }
                 }
-            }
-        }
-    }
-
-    // MARK: - 业务逻辑与物理移动
-
-    private func quickMoveCurrent(to author: DomainMetaAuthor) async {
-        guard let item = currentItem else { return }
-        let targetDir = resolveAuthorDirectory(for: author.name)
-        let targetPath = "\(targetDir)/\(item.entry.name)"
-        await performMove(item: item, targetPath: targetPath, label: author.name)
-    }
-
-    private func moveCurrentToCustomAuthor(_ authorName: String) async {
-        guard let item = currentItem else { return }
-        let targetDir = resolveAuthorDirectory(for: authorName)
-        let targetPath = "\(targetDir)/\(item.entry.name)"
-        await performMove(item: item, targetPath: targetPath, label: authorName)
-    }
-
-    private func performMove(item: PendingItem, targetPath: String, label: String) async {
-        guard let client = model.apiClient else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let result = try await client.curateMoveItem(
-                sourcePath: item.entry.path,
-                targetPath: targetPath,
-                isDirectory: item.entry.isDirectory
-            )
-            if result.success || result.status == "SKIPPED_EXIST" {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                showHUD("✓ 已移入【\(label)】")
-                processedCount += 1
-                moveSummary.insert("【\(item.entry.name)】已移入【\(label)】", at: 0)
-
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    if items.indices.contains(currentIndex) {
-                        items.remove(at: currentIndex)
-                        if currentIndex >= items.count {
-                            currentIndex = max(0, items.count - 1)
-                        }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(busy ? "提交中…" : "开始后台移动") {
+                        Task { await triggerServerBackgroundMove() }
                     }
+                    .fontWeight(.bold)
+                    .disabled(busy || assignedItems.isEmpty)
                 }
-
-                // 同步扣减第一级项目数量
-                if let idx = projects.firstIndex(where: { $0.id == selectedProject?.id }) {
-                    projects[idx].totalCount = max(0, projects[idx].totalCount - 1)
-                    selectedProject?.totalCount = projects[idx].totalCount
-                }
-            } else {
-                errorText = result.message
             }
-        } catch {
-            errorText = "移动失败: \(error.localizedDescription)"
         }
     }
 
-    private func moveItemAtIndex(_ index: Int) async {
-        guard items.indices.contains(index) else { return }
-        let item = items[index]
-        guard let dir = item.targetDir else { return }
-        let targetPath = "\(dir)/\(item.entry.name)"
-        guard let client = model.apiClient else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let result = try await client.curateMoveItem(
-                sourcePath: item.entry.path,
-                targetPath: targetPath,
-                isDirectory: item.entry.isDirectory
+    // MARK: - 空项目庆祝视图
+
+    private var projectEmptyCelebrationView: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            ZStack {
+                Circle()
+                    .fill(Color.green.opacity(0.14))
+                    .frame(width: 86, height: 86)
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 46))
+                    .foregroundStyle(.green)
+            }
+            Text("【\(selectedProject?.name ?? "该项目")】已全部清空！")
+                .font(.title3.weight(.bold))
+            Text("该项目下已无待整理子项，您可以安全清理此空目录或返回大厅。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+
+            HStack(spacing: 12) {
+                if let project = selectedProject, !project.isLoose {
+                    Button(role: .destructive) {
+                        Task {
+                            await deleteEmptyProject(project)
+                            selectedProject = nil
+                        }
+                    } label: {
+                        Label("清理空项目", systemImage: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button {
+                    selectedProject = nil
+                } label: {
+                    Label("返回项目大厅", systemImage: "arrow.left")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            Spacer()
+        }
+    }
+
+    // MARK: - 交互逻辑：刷卡、传播、退回、高级选择、持久化
+
+    private func syncDeckSlots(for item: PendingCurationItem) {
+        deckAuthorInput = item.matchedAuthor ?? ""
+        deckDirectCategoryMode = false
+        if let cp = item.matchedCategoryPath, !cp.isEmpty {
+            deckCategoryPath = cp
+            deckCategoryName = item.matchedCategoryName ?? MediaOrganizer.cleanCategoryName(cp)
+        } else if !stickyCategoryPath.isEmpty {
+            deckCategoryPath = stickyCategoryPath
+            deckCategoryName = stickyCategoryName
+        } else {
+            deckCategoryPath = ""
+            deckCategoryName = ""
+        }
+    }
+
+    private func confirmCurrentDeckItemToAssigned() {
+        guard let item = currentDeckItem, let dest = deckFinalDestination else { return }
+        let authorClean: String? = deckDirectCategoryMode ? nil : {
+            let s = deckAuthorInput.trimmingCharacters(in: CharacterSet(charactersIn: "【】[] "))
+            return s.isEmpty ? nil : s
+        }()
+        let catPath = deckCategoryPath.isEmpty ? nil : deckCategoryPath
+        let catName = deckCategoryName.isEmpty ? nil : deckCategoryName
+
+        assignItem(
+            item,
+            targetVaultPath: dest,
+            author: authorClean,
+            categoryPath: catPath,
+            categoryName: catName,
+            source: .manual
+        )
+    }
+
+    private func applyAdvancedPickerResult(_ result: PendingAdvancedPickerResult, for item: PendingCurationItem) {
+        if let newCat = result.newCategoryCreated {
+            categoryTree.append(newCat)
+        }
+        if let aliasUpdate = result.updatedAliases, let client = model.apiClient {
+            Task { try? await client.updateAuthorAliases(authorId: aliasUpdate.authorId, aliases: aliasUpdate.aliases) }
+        }
+        if let cp = result.categoryPath, !cp.isEmpty {
+            stickyCategoryPath = cp
+            stickyCategoryName = result.categoryName ?? MediaOrganizer.cleanCategoryName(cp)
+        }
+        assignItem(
+            item,
+            targetVaultPath: result.targetVaultPath,
+            author: result.author,
+            categoryPath: result.categoryPath,
+            categoryName: result.categoryName,
+            source: .manual
+        )
+    }
+
+    private func assignItem(
+        _ item: PendingCurationItem,
+        targetVaultPath: String,
+        author: String?,
+        categoryPath: String?,
+        categoryName: String?,
+        source: PendingAssignmentSource
+    ) {
+        guard let idx = allItems.firstIndex(where: { $0.id == item.id }) else { return }
+        allItems[idx].targetVaultPath = targetVaultPath
+        allItems[idx].matchedAuthor = author
+        allItems[idx].matchedCategoryPath = categoryPath
+        allItems[idx].matchedCategoryName = categoryName
+        allItems[idx].assignmentSource = source
+
+        var toPersist: [String: CuratorItemAssignment?] = [
+            item.entry.path: CuratorItemAssignment(
+                targetVaultPath: targetVaultPath,
+                author: author,
+                categoryPath: categoryPath,
+                categoryName: categoryName
             )
-            if result.success || result.status == "SKIPPED_EXIST" {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                showHUD("✓ 已移入【\(item.suggestedAuthor ?? "目标目录")】")
-                processedCount += 1
-                items.remove(at: index)
-                if currentIndex >= items.count { currentIndex = max(0, items.count - 1) }
+        ]
 
-                if let idx = projects.firstIndex(where: { $0.id == selectedProject?.id }) {
-                    projects[idx].totalCount = max(0, projects[idx].totalCount - 1)
-                    selectedProject?.totalCount = projects[idx].totalCount
-                }
-            } else {
-                errorText = result.message
-            }
-        } catch {
-            errorText = error.localizedDescription
-        }
-    }
-
-    private func moveAll() async {
-        guard let client = model.apiClient else { return }
-        let ready = items.filter { $0.targetDir != nil }
-        guard !ready.isEmpty else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let payload = ready.map { item in
-                (source: item.entry.path, target: "\(item.targetDir!)/\(item.entry.name)", isDirectory: item.entry.isDirectory)
-            }
-            let result = try await client.curateBatchMove(payload)
-            message = "成功 \(result.successCount)，跳过 \(result.skippedCount)，失败 \(result.failedCount)"
-            processedCount += result.successCount + result.skippedCount
-            let movedSources = Set(result.results.filter { $0.success || $0.status == "SKIPPED_EXIST" }.map(\.sourcePath))
-            items.removeAll { movedSources.contains($0.entry.path) }
-            if currentIndex >= items.count { currentIndex = max(0, items.count - 1) }
-
-            if let idx = projects.firstIndex(where: { $0.id == selectedProject?.id }) {
-                projects[idx].totalCount = max(0, projects[idx].totalCount - result.successCount)
-                selectedProject?.totalCount = projects[idx].totalCount
-            }
-
-            showHUD("已批量归档 \(result.successCount) 项")
-        } catch {
-            errorText = error.localizedDescription
-        }
-    }
-
-    private func skipCurrent() {
-        guard !items.isEmpty else { return }
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        withAnimation {
-            let item = items.remove(at: currentIndex)
-            items.append(item)
-            if currentIndex >= items.count { currentIndex = 0 }
-        }
-    }
-
-    private func playCurrentItem() async {
-        guard let item = currentItem, item.entry.isVideo else { return }
-        if let source = await model.playbackSource(assetId: item.entry.assetId, remotePath: item.entry.path) {
-            await MainActor.run {
-                activeVideoTarget = PlayableVideoTarget(
-                    url: source.url,
-                    title: item.entry.name,
-                    fallbackURL: source.fallbackURL
-                )
-            }
-        } else if let client = model.apiClient {
-            do {
-                let streamURL = try await client.rawMediaURL(remotePath: item.entry.path)
-                let fallback = item.entry.assetId != nil ? await model.fallbackMediaURL(assetId: item.entry.assetId) : nil
-                await MainActor.run {
-                    activeVideoTarget = PlayableVideoTarget(
-                        url: streamURL,
-                        title: item.entry.name,
-                        fallbackURL: fallback
+        // 同作者智能传播：自动把本批次其余包含同一作者名的未归纳项一并带入已归纳
+        var propagatedCount = 0
+        if let author, author.count >= 2 {
+            let lowerAuth = author.lowercased()
+            for i in allItems.indices where !allItems[i].isAssigned {
+                if allItems[i].entry.name.lowercased().contains(lowerAuth) {
+                    allItems[i].targetVaultPath = targetVaultPath
+                    allItems[i].matchedAuthor = author
+                    allItems[i].matchedCategoryPath = categoryPath
+                    allItems[i].matchedCategoryName = categoryName
+                    allItems[i].assignmentSource = .propagated
+                    toPersist[allItems[i].entry.path] = CuratorItemAssignment(
+                        targetVaultPath: targetVaultPath,
+                        author: author,
+                        categoryPath: categoryPath,
+                        categoryName: categoryName
                     )
+                    propagatedCount += 1
                 }
-            } catch {
-                errorText = "获取播放地址失败: \(error.localizedDescription)"
             }
+        }
+
+        // 同步持久化到服务端 curator_config.manualAssignments
+        for (k, v) in toPersist {
+            savedAssignments[k] = v
+        }
+        if let client = model.apiClient {
+            let payload = toPersist
+            Task { try? await client.saveCuratorAssignments(payload) }
+        }
+
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        if propagatedCount > 0 {
+            showHUD("已归入已归纳（同作者自动联动 +\(propagatedCount) 项）")
+        } else {
+            showHUD("✓ 已加入已归纳清单")
         }
     }
 
-    private func showHUD(_ text: String) {
-        hudToast = text
-        Task {
-            try? await Task.sleep(nanoseconds: 1_600_000_000)
-            await MainActor.run {
-                if hudToast == text { hudToast = nil }
-            }
+    private func revertItemToTriage(_ item: PendingCurationItem) {
+        guard let idx = allItems.firstIndex(where: { $0.id == item.id }) else { return }
+        allItems[idx].targetVaultPath = nil
+        allItems[idx].matchedAuthor = nil
+        allItems[idx].matchedAlias = nil
+        allItems[idx].assignmentSource = .none
+        savedAssignments.removeValue(forKey: item.entry.path)
+        if let client = model.apiClient {
+            let path = item.entry.path
+            Task { try? await client.saveCuratorAssignments([path: nil]) }
         }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        showHUD("已退回待归纳")
     }
 
-    private func openPicker() {
-        guard let item = currentItem else { return }
-        editingIndex = currentIndex
-        pickerPath = item.targetDir ?? vaultRoot
-        pickerCategoryId = ""
-        pickerAuthorId = ""
+    private func skipCurrentDeckItem() {
+        guard let first = currentDeckItem,
+              let idx = allItems.firstIndex(where: { $0.id == first.id }),
+              triageItems.count > 1 else { return }
+        let removed = allItems.remove(at: idx)
+        allItems.append(removed)
     }
 
-    private func applyPickerAndMove() {
-        guard let index = editingIndex, items.indices.contains(index) else {
-            editingIndex = nil
+    private func openItemMediaOrFolder(_ item: PendingCurationItem) {
+        if item.entry.isDirectory {
+            guard let rootId = root(for: item.entry.path)?.id else { return }
+            activeFolderPreview = FolderPreviewTarget(rootId: rootId, path: item.entry.path, name: item.entry.name)
             return
         }
-        let author = authors.first { $0.id == pickerAuthorId }
-        let category = categories.first { $0.id == pickerCategoryId }
-        var path = pickerPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        if path.isEmpty, !vaultRoot.isEmpty {
-            path = vaultRoot
-            if let category { path += "/\(category.name)" }
-            if let author { path += "/【\(author.name)】" }
+        if item.entry.isVideo {
+            Task {
+                if let source = await model.playbackSource(assetId: item.entry.assetId, remotePath: item.entry.path) {
+                    activeVideoTarget = PlayableVideoTarget(url: source.url, title: item.entry.name, fallbackURL: source.fallbackURL)
+                } else if let client = model.apiClient,
+                          let raw = try? await client.rawMediaURL(remotePath: item.entry.path) {
+                    let fb = await model.fallbackMediaURL(assetId: item.entry.assetId)
+                    activeVideoTarget = PlayableVideoTarget(url: raw, title: item.entry.name, fallbackURL: fb)
+                }
+            }
+            return
         }
-        items[index].targetDir = path.isEmpty ? nil : path
-        if let author { items[index].suggestedAuthor = author.name }
-        let targetPath = "\(path)/\(items[index].entry.name)"
-        let targetItem = items[index]
-        editingIndex = nil
-        Task {
-            await performMove(item: targetItem, targetPath: targetPath, label: author?.name ?? "自定义目录")
+        if item.entry.isImage {
+            activeImageContext = ImageViewerContext(entries: [item.entry], startIndex: 0)
         }
     }
 
-    private func resolveAuthorDirectory(for authorName: String) -> String {
-        let clean = authorName.trimmingCharacters(in: CharacterSet(charactersIn: "【】[]()（） ")).lowercased()
-        if let existing = authorDirectoryMap[clean] {
-            return existing
+    /// 文件夹封面穿透：仅异步探测文件夹内第一个有缩略图的媒体（不作为任务项展开）
+    private func loadCoverIfNeeded(for item: PendingCurationItem) async {
+        guard item.entry.isDirectory,
+              folderCoverAssetIds[item.entry.path] == nil,
+              let client = model.apiClient,
+              let rootObj = root(for: item.entry.path) else { return }
+        if let page = try? await client.remoteChildren(rootId: rootObj.id, path: item.entry.path, refresh: false) {
+            if let firstMedia = page.items.first(where: { ($0.assetId != nil || $0.coverAssetId != nil) }) {
+                if let id = firstMedia.coverAssetId ?? firstMedia.assetId {
+                    folderCoverAssetIds[item.entry.path] = id
+                }
+            }
         }
-        if let existing = authorDirectoryMap[authorName.lowercased()] {
-            return existing
-        }
-        return "\(vaultRoot)/【\(authorName)】"
     }
 
-    // MARK: - 数据扫描与发现
+    // MARK: - 服务端后台移动任务与轮询
 
-    private func reloadAll(forceRefresh: Bool = false) async {
+    private func triggerServerBackgroundMove() async {
+        guard let client = model.apiClient, let project = selectedProject else { return }
+        let payload: [(source: String, target: String, isDirectory: Bool)] = assignedItems.compactMap { item in
+            guard let target = item.finalMoveTargetPath else { return nil }
+            return (source: item.entry.path, target: target, isDirectory: item.entry.isDirectory)
+        }
+        guard !payload.isEmpty else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            let job = try await client.startCurateMoveJob(
+                projectPath: project.path,
+                projectName: project.name,
+                items: payload,
+                delayMs: 1300
+            )
+            moveJobs.removeAll { $0.id == job.id }
+            moveJobs.insert(job, at: 0)
+            showMoveVerifySheet = false
+            showHUD("已启动服务器后台移动，该项目已锁定")
+        } catch {
+            errorText = "启动后台移动失败：\(error.localizedDescription)"
+            showMoveVerifySheet = false
+        }
+    }
+
+    private func cancelMoveJob(_ jobId: String) async {
+        guard let client = model.apiClient else { return }
+        if let updated = try? await client.cancelCurateMoveJob(jobId: jobId) {
+            if let idx = moveJobs.firstIndex(where: { $0.id == updated.id }) {
+                moveJobs[idx] = updated
+            }
+            showHUD("已发送紧急停止指令")
+        }
+    }
+
+    private func refreshMoveJobs() async {
+        guard let client = model.apiClient else { return }
+        let hadRunning = !runningJobs.isEmpty
+        let runningProjectPaths = Set(runningJobs.map(\.projectPath))
+        if let latest = try? await client.listCurateMoveJobs() {
+            moveJobs = latest
+            // 如果之前正在移动的某个项目刚刚完成了，自动刷新该项目/大厅
+            let stillRunningPaths = Set(latest.filter(\.isRunning).map(\.projectPath))
+            let justFinished = runningProjectPaths.subtracting(stillRunningPaths)
+            if hadRunning && !justFinished.isEmpty {
+                if let selected = selectedProject, justFinished.contains(selected.path) {
+                    await loadProjectItems(selected, forceRefresh: true)
+                    showHUD("【\(selected.name)】后台移动任务已结束")
+                } else {
+                    await discoverProjects(forceRefresh: true)
+                }
+            }
+        }
+    }
+
+    private func pollMoveJobsLoop() async {
+        while !Task.isCancelled {
+            let interval: UInt64 = runningJobs.isEmpty ? 8_000_000_000 : 2_000_000_000
+            try? await Task.sleep(nanoseconds: interval)
+            if Task.isCancelled { break }
+            await refreshMoveJobs()
+        }
+    }
+
+    // MARK: - 数据加载与配置持久化
+
+    private func reloadAll(forceRefresh: Bool) async {
         guard let client = model.apiClient else { return }
         loadingProjects = true
         errorText = ""
@@ -1058,9 +1522,15 @@ struct PendingCurationView: View {
             let config = try await client.directoryConfig()
             pendingPath = config.pendingPath ?? ""
             vaultRoot = config.vaultPath ?? ""
+            inboxPath = config.recentPath ?? ""
             roots = try await client.libraryRoots()
 
-            // 第一级仅极速发现项目列表，不在进入待整理时拉取全量作者或执行匹配
+            if let curator = try? await client.curatorConfig() {
+                filterWords = curator.filterWords ?? []
+                savedAssignments = curator.manualAssignments ?? [:]
+            }
+
+            await refreshMoveJobs()
             await discoverProjects(forceRefresh: forceRefresh)
         } catch {
             if !pmlIsCancellation(error) {
@@ -1071,126 +1541,112 @@ struct PendingCurationView: View {
 
     private func ensureMetaLoaded() async {
         guard !metaLoaded, let client = model.apiClient else { return }
+        let customSet = Set(filterWords.map { $0.lowercased() })
         if let meta = try? await client.domainMeta() {
-            authors = meta.authors
-            categories = meta.categories
+            categoryTree = MediaOrganizer.buildCategoryTree(from: meta.categories)
+            vaultAuthors = MediaOrganizer.buildAuthorEntries(from: meta.authors, customWords: customSet)
         }
-
-        // 预探测已整理根目录下已存在的创作者文件夹（方便精准匹配物理路径）
-        var folderMap: [String: String] = [:]
-        if let vaultRootObj = root(for: vaultRoot), !vaultRoot.isEmpty {
-            if let vaultListing = try? await client.remoteChildren(rootId: vaultRootObj.id, path: vaultRoot, refresh: false) {
-                for entry in vaultListing.items where entry.isDirectory {
-                    let rawName = entry.name
-                    let cleanName = rawName.trimmingCharacters(in: CharacterSet(charactersIn: "【】[]()（）# ")).lowercased()
-                    folderMap[cleanName] = entry.path
-                    folderMap[rawName.lowercased()] = entry.path
-                }
-            }
-        }
-        authorDirectoryMap = folderMap
         metaLoaded = true
     }
 
-    private func discoverProjects(forceRefresh: Bool = false) async {
+    /// 取消 Pending 命名限制：待整理根目录下的任意可见子文件夹均为待整理项目；散装直属文件自动聚合为「散装文件」
+    private func discoverProjects(forceRefresh: Bool) async {
         guard let client = model.apiClient else { return }
-        do {
-            var cardMap: [String: PendingProjectCard] = [:]
+        var cardMap: [String: PendingProjectCard] = [:]
 
-            // 1. 优先直读待整理根目录下的物理 pending 文件夹（缓存模式仅需 ~60ms）
-            if !pendingPath.isEmpty, let pendingRoot = root(for: pendingPath) {
-                var page = try? await client.remoteChildren(rootId: pendingRoot.id, path: pendingPath, refresh: forceRefresh)
-                if !forceRefresh, (page?.items.isEmpty ?? true) {
-                    page = try? await client.remoteChildren(rootId: pendingRoot.id, path: pendingPath, refresh: true)
-                }
-                let visible = (page?.items ?? []).filter {
-                    !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@") && $0.name != "desktop.ini" && $0.name != "Thumbs.db"
-                }
-                let batchDirs = visible.filter { $0.isDirectory && pmlIsPendingFolder($0.name) }
-                let directEntries = visible.filter { !$0.isDirectory || !pmlIsPendingFolder($0.name) }
+        if !pendingPath.isEmpty, let pendingRoot = root(for: pendingPath) {
+            var page = try? await client.remoteChildren(rootId: pendingRoot.id, path: pendingPath, refresh: forceRefresh)
+            if !forceRefresh, (page?.items.isEmpty ?? true) {
+                page = try? await client.remoteChildren(rootId: pendingRoot.id, path: pendingPath, refresh: true)
+            }
+            let visible = (page?.items ?? []).filter {
+                !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@") && $0.name != "desktop.ini" && $0.name != "Thumbs.db"
+            }
 
-                for entry in batchDirs {
-                    cardMap[entry.path] = PendingProjectCard(
-                        id: entry.path,
-                        name: entry.name,
-                        path: entry.path,
-                        projectId: nil,
-                        totalCount: 0,
-                        readyCount: 0,
-                        isLoose: false
-                    )
-                }
+            let folderProjects = visible.filter { $0.isDirectory }
+            let looseFiles = visible.filter { !$0.isDirectory }
 
-                if !directEntries.isEmpty {
-                    cardMap[pendingPath] = PendingProjectCard(
-                        id: pendingPath,
-                        name: "散装文件",
-                        path: pendingPath,
-                        projectId: nil,
-                        totalCount: directEntries.count,
-                        readyCount: 0,
-                        isLoose: true
+            for entry in folderProjects {
+                cardMap[entry.path] = PendingProjectCard(
+                    id: entry.path,
+                    name: entry.name,
+                    path: entry.path,
+                    projectId: nil,
+                    totalCount: 0,
+                    readyCount: 0,
+                    isLoose: false
+                )
+            }
+
+            if !looseFiles.isEmpty {
+                cardMap[pendingPath] = PendingProjectCard(
+                    id: pendingPath,
+                    name: "散装文件",
+                    path: pendingPath,
+                    projectId: nil,
+                    totalCount: looseFiles.count,
+                    readyCount: 0,
+                    isLoose: true
+                )
+            }
+        }
+
+        // 合并数据库 pending_projects 的统计数（仅用于展示徽章，不再过滤目录名）
+        if let domainProjects = try? await client.pendingProjects() {
+            for dp in domainProjects {
+                if let existing = cardMap[dp.sourcePath] {
+                    cardMap[dp.sourcePath] = PendingProjectCard(
+                        id: existing.id,
+                        name: existing.name,
+                        path: existing.path,
+                        projectId: dp.id,
+                        totalCount: existing.totalCount > 0 ? existing.totalCount : Int(dp.totalCount),
+                        readyCount: Int(dp.readyCount),
+                        isLoose: existing.isLoose || dp.isLoose
                     )
                 }
             }
+        }
 
-            // 2. 合并数据库中的 pendingProjects（0.00s），补全 projectId 与数量信息
-            if let domainProjects = try? await client.pendingProjects(), !domainProjects.isEmpty {
-                for dp in domainProjects {
-                    if let existing = cardMap[dp.sourcePath] {
-                        cardMap[dp.sourcePath] = PendingProjectCard(
-                            id: existing.id,
-                            name: existing.name,
-                            path: existing.path,
-                            projectId: dp.id,
-                            totalCount: existing.totalCount > 0 ? existing.totalCount : Int(dp.totalCount),
-                            readyCount: Int(dp.readyCount),
-                            isLoose: existing.isLoose || dp.isLoose
-                        )
-                    } else {
-                        cardMap[dp.sourcePath] = PendingProjectCard(
-                            id: dp.id,
-                            name: dp.name,
-                            path: dp.sourcePath,
-                            projectId: dp.id,
-                            totalCount: Int(dp.totalCount),
-                            readyCount: Int(dp.readyCount),
-                            isLoose: dp.isLoose
-                        )
-                    }
-                }
-            }
-
-            projects = cardMap.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        } catch {
-            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
+        projects = cardMap.values.sorted { a, b in
+            if a.isLoose != b.isLoose { return !a.isLoose }
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
         }
     }
 
-    private func loadProjectItems(_ project: PendingProjectCard, forceRefresh: Bool = false) async {
+    private func enterProject(_ project: PendingProjectCard) {
+        selectedProject = project
+        activeTab = .triage
+        Task { await loadProjectItems(project, forceRefresh: false) }
+    }
+
+    private func loadProjectItems(_ project: PendingProjectCard, forceRefresh: Bool) async {
         loadingItems = true
         errorText = ""
-        items = []
-        currentIndex = 0
+        allItems = []
         defer { loadingItems = false }
         guard let client = model.apiClient else { return }
 
         do {
-            // 点击进入具体项目时，按需极速拉取作者与分类元数据（list_domain_meta 仅 ~10ms）
+            // 按需加载极速元数据（0.01s）与最新过滤词/草稿
             await ensureMetaLoaded()
+            if let curator = try? await client.curatorConfig() {
+                filterWords = curator.filterWords ?? []
+                savedAssignments = curator.manualAssignments ?? [:]
+            }
 
+            // 仅探测项目下第一层直接子项（绝不再往下探测）
             var loadedEntries: [RemoteBrowserEntry] = []
-
-            // 仅读取该 pending 文件夹的第一层直接子项（不用往子文件夹内部探查）
             if let pendingRoot = root(for: project.path) {
                 var page = try await client.remoteChildren(rootId: pendingRoot.id, path: project.path, refresh: forceRefresh)
-                if !forceRefresh, page.items.isEmpty {
+                if !forceRefresh && page.items.isEmpty {
                     page = try await client.remoteChildren(rootId: pendingRoot.id, path: project.path, refresh: true)
                 }
                 loadedEntries = page.items.filter { entry in
                     guard !entry.name.hasPrefix("."), !entry.name.hasPrefix("@"),
                           entry.name != "desktop.ini", entry.name != "Thumbs.db" else { return false }
-                    if project.path == pendingPath && entry.isDirectory && pmlIsPendingFolder(entry.name) {
+                    // 如果是「散装文件」虚拟项目，只取根目录下的直属文件，不取子项目文件夹
+                    if project.isLoose && project.path == pendingPath && entry.isDirectory {
                         return false
                     }
                     return true
@@ -1198,43 +1654,54 @@ struct PendingCurationView: View {
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             }
 
-            // 仅在进入具体项目后，对该项目的直接子项执行作者与分类匹配
-            items = loadedEntries.map { entry in
-                var item = PendingItem(entry: entry, targetDir: nil, suggestedAuthor: nil)
-                let suggestion = suggest(for: entry.name)
-                item.targetDir = suggestion.dir
-                item.suggestedAuthor = suggestion.author
-                return item
+            // 逐项过滤停用词/服务器过滤词 -> 优先命中作者(直接入已归纳) -> 未命中入待归纳(预记分类 + 推荐作者词)
+            allItems = loadedEntries.map { entry in
+                MediaOrganizer.analyzePendingEntry(
+                    entry,
+                    authors: vaultAuthors,
+                    categoryTree: categoryTree,
+                    vaultRoot: vaultRoot,
+                    customFilterWords: filterWords,
+                    savedAssignments: savedAssignments
+                )
             }
-            currentIndex = 0
 
-            // 同步更新该项目的直接待整理项数
             if let idx = projects.firstIndex(where: { $0.id == project.id }) {
-                projects[idx].totalCount = items.count
-                selectedProject?.totalCount = items.count
+                projects[idx].totalCount = allItems.count
+                projects[idx].readyCount = assignedItems.count
+                selectedProject?.totalCount = allItems.count
+                selectedProject?.readyCount = assignedItems.count
             }
 
-            await loadPreview()
+            // 如果所有项都已经直接命中作者进入了「已归纳」，自动切到已归纳标签方便一键移动
+            if triageItems.isEmpty && !assignedItems.isEmpty {
+                activeTab = .assigned
+            }
         } catch {
             if !pmlIsCancellation(error) {
-                errorText = "加载项目文件失败: \(error.localizedDescription)"
+                errorText = "加载项目子项失败：\(error.localizedDescription)"
             }
         }
     }
 
-    private func loadPreview() async {
-        guard let client = model.apiClient, let item = currentItem, !item.entry.isDirectory else {
-            previewURL = nil
-            return
+    private func saveFilterWordsToServer(_ words: [String]) async {
+        guard let client = model.apiClient else { return }
+        try? await client.saveCuratorFilterWords(words)
+        metaLoaded = false
+        showHUD("已保存过滤词配置")
+        if let selected = selectedProject {
+            await loadProjectItems(selected, forceRefresh: false)
         }
-        if let hit = model.alistDirectURL(remotePath: item.entry.path) {
-            previewURL = hit
-            return
-        }
-        if let assetId = item.entry.assetId {
-            previewURL = try? await client.mediaSourceURL(assetId: assetId)
-        } else {
-            previewURL = try? await client.rawMediaURL(remotePath: item.entry.path)
+    }
+
+    private func deleteEmptyProject(_ project: PendingProjectCard) async {
+        guard let client = model.apiClient, !project.isLoose else { return }
+        do {
+            try await client.deleteEmptyPendingBatch(batchPath: project.path)
+            projects.removeAll { $0.id == project.id }
+            showHUD("已清理空项目【\(project.name)】")
+        } catch {
+            errorText = "清理失败：\(error.localizedDescription)"
         }
     }
 
@@ -1245,74 +1712,13 @@ struct PendingCurationView: View {
             .first
     }
 
-    private var authorIndex: [String: DomainMetaAuthor] {
-        var index: [String: DomainMetaAuthor] = [:]
-        for author in authors {
-            let key = author.name.trimmingCharacters(in: CharacterSet(charactersIn: "【】[]()（）# ")).lowercased()
-            if !key.isEmpty { index[key] = author }
-            index[author.name.lowercased()] = author
-        }
-        return index
-    }
-
-    private func suggest(for name: String) -> (dir: String?, author: String?) {
-        guard !vaultRoot.isEmpty else { return (nil, nil) }
-        let index = authorIndex
-        for rawToken in pmlBracketTokens(name) {
-            let cleanToken = rawToken.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).lowercased()
-            if let author = index[cleanToken] ?? index[rawToken.lowercased()] {
-                return (resolveAuthorDirectory(for: author.name), author.name)
-            }
-        }
-        let lower = name.lowercased()
-        for author in authors.sorted(by: { $0.name.count > $1.name.count }) where author.name.count >= 2 {
-            if lower.contains(author.name.lowercased()) {
-                return (resolveAuthorDirectory(for: author.name), author.name)
-            }
-        }
-        for category in categories.sorted(by: { $0.name.count > $1.name.count }) where category.name.count >= 2 {
-            if lower.contains(category.name.lowercased()) {
-                return ("\(vaultRoot)/\(category.name)", nil)
-            }
-        }
-        return (vaultRoot, nil)
-    }
-}
-
-// MARK: - 命名与括号提取工具
-
-func pmlIsPendingFolder(_ name: String) -> Bool {
-    let trimmed = name.trimmingCharacters(in: .whitespaces)
-    guard !trimmed.isEmpty else { return false }
-    let patterns = [
-        "^【Pending[^【】]*】$",
-        "^\\[Pending[^\\[\\]]*\\]$",
-        "^Pending[0-9A-Za-z_\\-.]*$",
-        "^【待收纳[^【】]*】$",
-        "^待收纳.*$",
-    ]
-    return patterns.contains {
-        trimmed.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil
-    }
-}
-
-func pmlBracketTokens(_ name: String) -> [String] {
-    let patterns = [
-        "【([^】]+)】",
-        "\\[([^\\]]+)\\]",
-        "（([^）]+)）",
-        "\\(([^)]+)\\)",
-    ]
-    let ns = name as NSString
-    var tokens: [String] = []
-    for pattern in patterns {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-        for match in regex.matches(in: name, range: NSRange(location: 0, length: ns.length)) {
-            if match.numberOfRanges > 1 {
-                let token = ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespaces)
-                if !token.isEmpty { tokens.append(token) }
+    private func showHUD(_ text: String) {
+        hudToast = text
+        Task {
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            await MainActor.run {
+                if hudToast == text { hudToast = nil }
             }
         }
     }
-    return tokens
 }

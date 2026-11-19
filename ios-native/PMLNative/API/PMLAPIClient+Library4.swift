@@ -7,6 +7,59 @@ extension PMLAPIClient {
         try await command("get_curator_config")
     }
 
+    func saveCuratorFilterWords(_ filterWords: [String]) async throws {
+        try await perform("save_curator_config", arguments: ["filterWords": filterWords])
+    }
+
+    func saveCuratorAssignments(_ assignments: [String: CuratorItemAssignment?]) async throws {
+        var encoded: [String: Any] = [:]
+        for (path, value) in assignments {
+            if let value {
+                encoded[path] = [
+                    "targetVaultPath": value.targetVaultPath ?? NSNull(),
+                    "author": value.author ?? NSNull(),
+                    "categoryPath": value.categoryPath ?? NSNull(),
+                    "categoryName": value.categoryName ?? NSNull(),
+                ]
+            } else {
+                encoded[path] = NSNull()
+            }
+        }
+        try await perform("save_curator_config", arguments: ["manualAssignments": encoded])
+    }
+
+    func startCurateMoveJob(
+        projectPath: String,
+        projectName: String,
+        items: [(source: String, target: String, isDirectory: Bool)],
+        delayMs: Int = 1300
+    ) async throws -> CurateMoveJobSnapshot {
+        let payload = items.map { item -> [String: Any] in
+            [
+                "sourcePath": item.source,
+                "targetPath": item.target,
+                "isDirectory": item.isDirectory,
+            ]
+        }
+        return try await command(
+            "start_curate_move_job",
+            arguments: [
+                "projectPath": projectPath,
+                "projectName": projectName,
+                "items": payload,
+                "delayMs": delayMs,
+            ]
+        )
+    }
+
+    func listCurateMoveJobs() async throws -> [CurateMoveJobSnapshot] {
+        try await command("list_curate_move_jobs")
+    }
+
+    func cancelCurateMoveJob(jobId: String) async throws -> CurateMoveJobSnapshot {
+        try await command("cancel_curate_move_job", arguments: ["jobId": jobId])
+    }
+
     func saveCuratorConfig(pendingPath: String?, targetVaultRoot: String?) async throws {
         // Root paths are owned by the canonical V2 directory configuration.
         // Preserve the other two domains while updating curation destinations.

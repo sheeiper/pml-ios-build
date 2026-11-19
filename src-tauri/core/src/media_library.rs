@@ -9281,6 +9281,286 @@ pub async fn curate_batch_move(
     })
 }
 
+// ============================================================================
+// 服务端后台异步移动任务队列 + 项目锁（防 iOS 切后台中断 & 防 115/CD2 风控）
+// ============================================================================
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartCurateMoveJobRequest {
+    pub project_path: String,
+    pub project_name: String,
+    pub items: Vec<CurateMoveItemRequest>,
+    pub delay_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurateMoveJobSnapshot {
+    pub id: String,
+    pub project_path: String,
+    pub project_name: String,
+    pub status: String, // "running" | "completed" | "cancelled" | "aborted"
+    pub total: usize,
+    pub processed: usize,
+    pub success_count: usize,
+    pub skipped_count: usize,
+    pub failed_count: usize,
+    pub current_item: Option<String>,
+    pub abort_reason: Option<String>,
+    pub errors: Vec<String>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+struct CurateJobRecord {
+    snapshot: CurateMoveJobSnapshot,
+    cancel_requested: bool,
+}
+
+#[derive(Default)]
+struct CurateJobStore {
+    jobs: Vec<CurateJobRecord>,
+    locked_projects: std::collections::HashSet<String>,
+}
+
+fn curate_job_store() -> &'static std::sync::Mutex<CurateJobStore> {
+    static STORE: std::sync::OnceLock<std::sync::Mutex<CurateJobStore>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(CurateJobStore::default()))
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg_attr(feature = "tauri", tauri::command)]
+pub fn list_curate_move_jobs() -> Result<Vec<CurateMoveJobSnapshot>, String> {
+    let store = curate_job_store()
+        .lock()
+        .map_err(|_| "后台移动任务锁异常".to_owned())?;
+    let mut out: Vec<CurateMoveJobSnapshot> =
+        store.jobs.iter().map(|r| r.snapshot.clone()).collect();
+    out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    Ok(out)
+}
+
+#[cfg_attr(feature = "tauri", tauri::command)]
+pub fn cancel_curate_move_job(job_id: String) -> Result<CurateMoveJobSnapshot, String> {
+    let mut store = curate_job_store()
+        .lock()
+        .map_err(|_| "后台移动任务锁异常".to_owned())?;
+    let record = store
+        .jobs
+        .iter_mut()
+        .find(|r| r.snapshot.id == job_id)
+        .ok_or_else(|| "未找到对应的后台移动任务".to_owned())?;
+    record.cancel_requested = true;
+    Ok(record.snapshot.clone())
+}
+
+#[cfg_attr(feature = "tauri", tauri::command)]
+pub async fn start_curate_move_job(
+    app: AppHandle,
+    request: StartCurateMoveJobRequest,
+) -> Result<CurateMoveJobSnapshot, String> {
+    let project_path = normalize_remote_path(&request.project_path)?;
+    if request.items.is_empty() {
+        return Err("待移动清单为空".into());
+    }
+    let job_id = format!("movejob-{}-{:08x}", now_unix_secs(), OsRng.next_u32());
+    let started_at = now_unix_secs();
+    let total = request.items.len();
+
+    let initial_snapshot = CurateMoveJobSnapshot {
+        id: job_id.clone(),
+        project_path: project_path.clone(),
+        project_name: request.project_name.clone(),
+        status: "running".into(),
+        total,
+        processed: 0,
+        success_count: 0,
+        skipped_count: 0,
+        failed_count: 0,
+        current_item: None,
+        abort_reason: None,
+        errors: Vec::new(),
+        started_at,
+        finished_at: None,
+    };
+
+    {
+        let mut store = curate_job_store()
+            .lock()
+            .map_err(|_| "后台移动任务锁异常".to_owned())?;
+        if store.locked_projects.contains(&project_path) {
+            return Err("该项目正在后台移动中，已锁定，请等待完成后再操作".into());
+        }
+        store.locked_projects.insert(project_path.clone());
+        store.jobs.push(CurateJobRecord {
+            snapshot: initial_snapshot.clone(),
+            cancel_requested: false,
+        });
+        // 只保留最近 20 条记录（不会删除正在运行中的任务）
+        if store.jobs.len() > 20 {
+            if let Some(pos) = store.jobs.iter().position(|r| r.snapshot.status != "running") {
+                store.jobs.remove(pos);
+            }
+        }
+    }
+
+    let base_delay = request.delay_ms.unwrap_or(1300).max(800);
+    let items = request.items;
+    let locked_key = project_path.clone();
+    let bg_job_id = job_id.clone();
+
+    tokio::spawn(async move {
+        let mut consecutive_failures: usize = 0;
+
+        for (i, item) in items.into_iter().enumerate() {
+            // 检查是否已请求紧急停止
+            let cancelled = {
+                curate_job_store()
+                    .lock()
+                    .ok()
+                    .and_then(|s| {
+                        s.jobs
+                            .iter()
+                            .find(|r| r.snapshot.id == bg_job_id)
+                            .map(|r| r.cancel_requested)
+                    })
+                    .unwrap_or(false)
+            };
+            if cancelled {
+                if let Ok(mut store) = curate_job_store().lock() {
+                    if let Some(rec) = store.jobs.iter_mut().find(|r| r.snapshot.id == bg_job_id) {
+                        rec.snapshot.status = "cancelled".into();
+                        rec.snapshot.current_item = None;
+                        rec.snapshot.finished_at = Some(now_unix_secs());
+                    }
+                    store.locked_projects.remove(&locked_key);
+                }
+                return;
+            }
+
+            // 115 & CD2 专用防风控串行节拍器：1.3s ~ 2.0s 随机延迟防 QPS 突发
+            if i > 0 {
+                let jitter = (OsRng.next_u32() % 700) as u64;
+                tokio::time::sleep(Duration::from_millis(base_delay + jitter)).await;
+            }
+
+            let display_name = item
+                .source_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&item.source_path)
+                .to_owned();
+            let source_path_for_cleanup = item.source_path.clone();
+
+            if let Ok(mut store) = curate_job_store().lock() {
+                if let Some(rec) = store.jobs.iter_mut().find(|r| r.snapshot.id == bg_job_id) {
+                    rec.snapshot.current_item = Some(display_name.clone());
+                }
+            }
+
+            let move_res =
+                curate_move_item(app.clone(), app.state::<MediaLibraryState>(), item).await;
+
+            let mut should_abort = false;
+            match move_res {
+                Ok(res) => {
+                    consecutive_failures = 0;
+                    let moved_or_skipped =
+                        res.status == "MOVED" || res.status == "SKIPPED_EXIST";
+                    if moved_or_skipped {
+                        // 自动清理该项在 curator_config 中的已归纳草稿记录
+                        let mut remove_map = std::collections::HashMap::new();
+                        remove_map.insert(source_path_for_cleanup, None);
+                        let _ = save_curator_config(
+                            app.clone(),
+                            CuratorConfigUpdate {
+                                manual_assignments: Some(remove_map),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    if let Ok(mut store) = curate_job_store().lock() {
+                        if let Some(rec) =
+                            store.jobs.iter_mut().find(|r| r.snapshot.id == bg_job_id)
+                        {
+                            rec.snapshot.processed += 1;
+                            match res.status.as_str() {
+                                "MOVED" => rec.snapshot.success_count += 1,
+                                "SKIPPED_EXIST" => rec.snapshot.skipped_count += 1,
+                                _ => {
+                                    rec.snapshot.failed_count += 1;
+                                    rec.snapshot
+                                        .errors
+                                        .push(format!("{}: {}", display_name, res.message));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    consecutive_failures += 1;
+                    let is_rate_limit = err.contains("429")
+                        || err.contains("风控")
+                        || err.contains("频繁")
+                        || err.contains("401")
+                        || err.contains("403");
+                    if is_rate_limit || consecutive_failures >= 3 {
+                        should_abort = true;
+                    }
+                    if let Ok(mut store) = curate_job_store().lock() {
+                        if let Some(rec) =
+                            store.jobs.iter_mut().find(|r| r.snapshot.id == bg_job_id)
+                        {
+                            rec.snapshot.processed += 1;
+                            rec.snapshot.failed_count += 1;
+                            rec.snapshot
+                                .errors
+                                .push(format!("{}: {}", display_name, err));
+                            if should_abort {
+                                rec.snapshot.status = "aborted".into();
+                                rec.snapshot.abort_reason = Some(format!(
+                                    "触发防风控/异常熔断保护已自动终止：{}",
+                                    err
+                                ));
+                                rec.snapshot.current_item = None;
+                                rec.snapshot.finished_at = Some(now_unix_secs());
+                            }
+                        }
+                        if should_abort {
+                            store.locked_projects.remove(&locked_key);
+                        }
+                    }
+                }
+            }
+
+            if should_abort {
+                return;
+            }
+        }
+
+        if let Ok(mut store) = curate_job_store().lock() {
+            if let Some(rec) = store.jobs.iter_mut().find(|r| r.snapshot.id == bg_job_id) {
+                if rec.snapshot.status == "running" {
+                    rec.snapshot.status = "completed".into();
+                    rec.snapshot.current_item = None;
+                    rec.snapshot.finished_at = Some(now_unix_secs());
+                }
+            }
+            store.locked_projects.remove(&locked_key);
+        }
+    });
+
+    Ok(initial_snapshot)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackInboxRequest {

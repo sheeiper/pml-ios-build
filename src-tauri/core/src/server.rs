@@ -1130,6 +1130,23 @@ async fn dispatch_command(
                 .await,
             )
         }
+        "start_curate_move_job" => {
+            let args: media_library::StartCurateMoveJobRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            result_response(media_library::start_curate_move_job(app.clone(), args).await)
+        }
+        "list_curate_move_jobs" => {
+            blocking_result_response(media_library::list_curate_move_jobs).await
+        }
+        "cancel_curate_move_job" => {
+            let job_id: String = match payload.get("jobId").and_then(Value::as_str) {
+                Some(value) => value.to_owned(),
+                None => return error_response("缺少 jobId 参数"),
+            };
+            blocking_result_response(move || media_library::cancel_curate_move_job(job_id)).await
+        }
         "open_raw_media_source" => {
             let remote_path: String = match payload.get("remotePath").and_then(Value::as_str) {
                 Some(value) => value.to_owned(),

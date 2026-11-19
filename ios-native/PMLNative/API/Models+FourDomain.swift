@@ -118,17 +118,39 @@ struct DomainChild: Decodable, Identifiable, Hashable {
 struct DomainMetaAuthor: Decodable, Identifiable, Hashable {
     let id: String
     let name: String
+    let aliases: [String]?
+    let vaultPath: String?
 }
 
 struct DomainMetaCategory: Decodable, Identifiable, Hashable {
     let id: String
     let name: String
     let parentId: String?
+    let remotePath: String?
 }
 
 struct DomainMeta: Decodable {
     let authors: [DomainMetaAuthor]
     let categories: [DomainMetaCategory]
+}
+
+struct CurateMoveJobSnapshot: Decodable, Identifiable, Hashable {
+    let id: String
+    let projectPath: String
+    let projectName: String
+    let status: String // "running" | "completed" | "cancelled" | "aborted"
+    let total: Int
+    let processed: Int
+    let successCount: Int
+    let skippedCount: Int
+    let failedCount: Int
+    let currentItem: String?
+    let abortReason: String?
+    let errors: [String]
+    let startedAt: Int64
+    let finishedAt: Int64?
+
+    var isRunning: Bool { status == "running" }
 }
 
 struct DomainScanResult: Decodable {

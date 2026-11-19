@@ -1619,28 +1619,140 @@ pub async fn move_pending_item(
 }
 
 
+fn extract_author_vault_path(sample_path: &str, author_name: &str) -> Option<String> {
+    let target = author_name
+        .trim()
+        .trim_matches(|c| matches!(c, '【' | '】' | '[' | ']' | ' '))
+        .to_lowercase();
+    if target.is_empty() {
+        return None;
+    }
+    let trimmed = sample_path.trim_end_matches('/');
+    let mut built = String::new();
+    for seg in trimmed.split('/').filter(|s| !s.is_empty()) {
+        built.push('/');
+        built.push_str(seg);
+        let seg_clean = seg
+            .trim()
+            .trim_matches(|c| matches!(c, '【' | '】' | '[' | ']' | ' '))
+            .to_lowercase();
+        if seg_clean == target {
+            return Some(built);
+        }
+    }
+    None
+}
+
+fn extract_category_remote_path(
+    vault_root: &str,
+    category_name: &str,
+    sample_path: Option<&str>,
+) -> Option<String> {
+    let root = vault_root.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    let depth = category_name
+        .split('/')
+        .filter(|s| !s.trim().is_empty())
+        .count();
+    if depth == 0 {
+        return None;
+    }
+    if let Some(sample) = sample_path {
+        if let Some(rest) = sample.strip_prefix(root) {
+            let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+            if segs.len() >= depth {
+                return Some(format!("{}/{}", root, segs[..depth].join("/")));
+            }
+        }
+    }
+    let fallback_segs: Vec<String> = category_name
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.starts_with('{') && s.ends_with('}') {
+                s.to_owned()
+            } else {
+                format!("{{{s}}}")
+            }
+        })
+        .collect();
+    Some(format!("{}/{}", root, fallback_segs.join("/")))
+}
+
 pub fn metadata(app: &AppHandle) -> Result<Value, String> {
     ensure_v2(app)?;
     let connection = open_v2(app)?;
+    let vault_root: String = connection
+        .query_row(
+            "SELECT remote_path FROM domain_roots WHERE domain='vault'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+
     let mut authors_stmt = connection
-        .prepare("SELECT id,name FROM authors ORDER BY name COLLATE NOCASE")
+        .prepare(
+            "SELECT a.id, a.name, a.aliases_json,
+                    (SELECT asst.parent_path
+                     FROM vault_items vi
+                     JOIN assets asst ON asst.id = vi.asset_id
+                     WHERE vi.author_id = a.id AND asst.missing = 0
+                     LIMIT 1) AS sample_path
+             FROM authors a
+             ORDER BY a.name COLLATE NOCASE",
+        )
         .map_err(|error| error.to_string())?;
     let authors = authors_stmt
         .query_map([], |row| {
-            Ok(serde_json::json!({"id": row.get::<_, String>(0)?, "name": row.get::<_, String>(1)?}))
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let aliases_json: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            let sample_path: Option<String> = row.get(3)?;
+            let vault_path = sample_path
+                .as_deref()
+                .and_then(|p| extract_author_vault_path(p, &name));
+            Ok(serde_json::json!({
+                "id": id,
+                "name": name,
+                "aliases": aliases,
+                "vaultPath": vault_path,
+            }))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+
     let mut categories_stmt = connection
-        .prepare("SELECT id,name,parent_id FROM categories ORDER BY name COLLATE NOCASE")
+        .prepare(
+            "SELECT c.id, c.name, c.parent_id,
+                    (SELECT asst.parent_path
+                     FROM vault_items vi
+                     JOIN assets asst ON asst.id = vi.asset_id
+                     WHERE vi.category_id = c.id AND asst.missing = 0
+                     LIMIT 1) AS sample_path
+             FROM categories c
+             ORDER BY c.name COLLATE NOCASE",
+        )
         .map_err(|error| error.to_string())?;
     let categories = categories_stmt
         .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let parent_id: Option<String> = row.get(2)?;
+            let sample_path: Option<String> = row.get(3)?;
+            let remote_path =
+                extract_category_remote_path(&vault_root, &name, sample_path.as_deref());
             Ok(serde_json::json!({
-                "id": row.get::<_, String>(0)?,
-                "name": row.get::<_, String>(1)?,
-                "parentId": row.get::<_, Option<String>>(2)?,
+                "id": id,
+                "name": name,
+                "parentId": parent_id,
+                "remotePath": remote_path,
             }))
         })
         .map_err(|error| error.to_string())?

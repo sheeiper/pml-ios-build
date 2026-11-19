@@ -2,10 +2,18 @@ import Foundation
 
 // MARK: - P1 整理
 
+struct CuratorItemAssignment: Codable, Hashable {
+    let targetVaultPath: String?
+    let author: String?
+    let categoryPath: String?
+    let categoryName: String?
+}
+
 struct CuratorConfigPayload: Decodable {
     let filterWords: [String]?
     let pendingPath: String?
     let targetVaultRoot: String?
+    let manualAssignments: [String: CuratorItemAssignment?]?
 }
 
 struct CurateMoveItemResult: Decodable {
