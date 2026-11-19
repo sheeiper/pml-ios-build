@@ -31,9 +31,10 @@ struct PendingCurationView: View {
     @State private var vaultRoot = ""
 
     @State private var roots: [LibraryRoot] = []
-    @State private var authors: [LibraryAuthor] = []
-    @State private var categories: [LibraryCategory] = []
+    @State private var authors: [DomainMetaAuthor] = []
+    @State private var categories: [DomainMetaCategory] = []
     @State private var authorDirectoryMap: [String: String] = [:]
+    @State private var metaLoaded = false
 
     // Level 1: 项目大厅
     @State private var projects: [PendingProjectCard] = []
@@ -76,28 +77,27 @@ struct PendingCurationView: View {
         items.indices.contains(currentIndex) ? items[currentIndex] : nil
     }
 
-    private var filteredAuthors: [LibraryAuthor] {
-        let list: [LibraryAuthor]
+    private var filteredAuthors: [DomainMetaAuthor] {
+        let list: [DomainMetaAuthor]
         let query = authorSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         if query.isEmpty {
             list = authors
         } else {
             list = authors.filter { author in
-                author.name.localizedCaseInsensitiveContains(query) ||
-                author.aliases.contains { $0.localizedCaseInsensitiveContains(query) }
+                author.name.localizedCaseInsensitiveContains(query)
             }
         }
 
         // 若当前项有智能建议作者，将建议作者置顶
         if let suggested = currentItem?.suggestedAuthor?.lowercased() {
             return list.sorted { a, b in
-                let aMatch = (a.name.lowercased() == suggested || a.aliases.contains { $0.lowercased() == suggested })
-                let bMatch = (b.name.lowercased() == suggested || b.aliases.contains { $0.lowercased() == suggested })
+                let aMatch = (a.name.lowercased() == suggested)
+                let bMatch = (b.name.lowercased() == suggested)
                 if aMatch != bMatch { return aMatch }
-                return a.mediaCount > b.mediaCount
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
             }
         }
-        return list.sorted { $0.mediaCount > $1.mediaCount }
+        return list.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     var body: some View {
@@ -151,7 +151,7 @@ struct PendingCurationView: View {
                         )
                     }
                     Button {
-                        Task { await loadProjectItems(selected) }
+                        Task { await loadProjectItems(selected, forceRefresh: true) }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -160,7 +160,7 @@ struct PendingCurationView: View {
             } else {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        Task { await reloadAll() }
+                        Task { await reloadAll(forceRefresh: true) }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -287,7 +287,7 @@ struct PendingCurationView: View {
             }
         }
         .refreshable {
-            await reloadAll()
+            await reloadAll(forceRefresh: true)
         }
     }
 
@@ -627,7 +627,7 @@ struct PendingCurationView: View {
         .pmlGlassCard(cornerRadius: 20)
     }
 
-    private func authorChipButton(author: LibraryAuthor, for item: PendingItem) -> some View {
+    private func authorChipButton(author: DomainMetaAuthor, for item: PendingItem) -> some View {
         let isSuggested = (item.suggestedAuthor?.lowercased() == author.name.lowercased())
         return Button {
             Task { await quickMoveCurrent(to: author) }
@@ -845,7 +845,7 @@ struct PendingCurationView: View {
 
     // MARK: - 业务逻辑与物理移动
 
-    private func quickMoveCurrent(to author: LibraryAuthor) async {
+    private func quickMoveCurrent(to author: DomainMetaAuthor) async {
         guard let item = currentItem else { return }
         let targetDir = resolveAuthorDirectory(for: author.name)
         let targetPath = "\(targetDir)/\(item.entry.name)"
@@ -1049,74 +1049,114 @@ struct PendingCurationView: View {
 
     // MARK: - 数据扫描与发现
 
-    private func reloadAll() async {
+    private func reloadAll(forceRefresh: Bool = false) async {
         guard let client = model.apiClient else { return }
         loadingProjects = true
         errorText = ""
+        defer { loadingProjects = false }
         do {
             let config = try await client.directoryConfig()
             pendingPath = config.pendingPath ?? ""
             vaultRoot = config.vaultPath ?? ""
             roots = try await client.libraryRoots()
-            authors = try await client.libraryAuthors(filter: "all")
-            categories = try await client.libraryCategories(filter: "all")
 
-            // 预探测已整理根目录下已存在的创作者文件夹（方便精准匹配物理路径）
-            var folderMap: [String: String] = [:]
-            if let vaultRootObj = root(for: vaultRoot), !vaultRoot.isEmpty {
-                if let vaultListing = try? await client.remoteChildren(rootId: vaultRootObj.id, path: vaultRoot, refresh: false) {
-                    for entry in vaultListing.items where entry.isDirectory {
-                        let rawName = entry.name
-                        let cleanName = rawName.trimmingCharacters(in: CharacterSet(charactersIn: "【】[]()（） ")).lowercased()
-                        folderMap[cleanName] = entry.path
-                        folderMap[rawName.lowercased()] = entry.path
-                    }
-                }
-            }
-            authorDirectoryMap = folderMap
-
-            await discoverProjects()
+            // 第一级仅极速发现项目列表，不在进入待整理时拉取全量作者或执行匹配
+            await discoverProjects(forceRefresh: forceRefresh)
         } catch {
-            errorText = error.localizedDescription
+            if !pmlIsCancellation(error) {
+                errorText = error.localizedDescription
+            }
         }
-        loadingProjects = false
     }
 
-    private func discoverProjects() async {
+    private func ensureMetaLoaded() async {
+        guard !metaLoaded, let client = model.apiClient else { return }
+        if let meta = try? await client.domainMeta() {
+            authors = meta.authors
+            categories = meta.categories
+        }
+
+        // 预探测已整理根目录下已存在的创作者文件夹（方便精准匹配物理路径）
+        var folderMap: [String: String] = [:]
+        if let vaultRootObj = root(for: vaultRoot), !vaultRoot.isEmpty {
+            if let vaultListing = try? await client.remoteChildren(rootId: vaultRootObj.id, path: vaultRoot, refresh: false) {
+                for entry in vaultListing.items where entry.isDirectory {
+                    let rawName = entry.name
+                    let cleanName = rawName.trimmingCharacters(in: CharacterSet(charactersIn: "【】[]()（）# ")).lowercased()
+                    folderMap[cleanName] = entry.path
+                    folderMap[rawName.lowercased()] = entry.path
+                }
+            }
+        }
+        authorDirectoryMap = folderMap
+        metaLoaded = true
+    }
+
+    private func discoverProjects(forceRefresh: Bool = false) async {
         guard let client = model.apiClient else { return }
         do {
             var cardMap: [String: PendingProjectCard] = [:]
 
-            // 1. 从 API 获取 pendingProjects
-            if let domainProjects = try? await client.pendingProjects(), !domainProjects.isEmpty {
-                for dp in domainProjects {
-                    cardMap[dp.sourcePath] = PendingProjectCard(
-                        id: dp.id,
-                        name: dp.name,
-                        path: dp.sourcePath,
-                        projectId: dp.id,
-                        totalCount: Int(dp.totalCount),
-                        readyCount: Int(dp.readyCount),
-                        isLoose: dp.isLoose
+            // 1. 优先直读待整理根目录下的物理 pending 文件夹（缓存模式仅需 ~60ms）
+            if !pendingPath.isEmpty, let pendingRoot = root(for: pendingPath) {
+                var page = try? await client.remoteChildren(rootId: pendingRoot.id, path: pendingPath, refresh: forceRefresh)
+                if !forceRefresh, (page?.items.isEmpty ?? true) {
+                    page = try? await client.remoteChildren(rootId: pendingRoot.id, path: pendingPath, refresh: true)
+                }
+                let visible = (page?.items ?? []).filter {
+                    !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@") && $0.name != "desktop.ini" && $0.name != "Thumbs.db"
+                }
+                let batchDirs = visible.filter { $0.isDirectory && pmlIsPendingFolder($0.name) }
+                let directEntries = visible.filter { !$0.isDirectory || !pmlIsPendingFolder($0.name) }
+
+                for entry in batchDirs {
+                    cardMap[entry.path] = PendingProjectCard(
+                        id: entry.path,
+                        name: entry.name,
+                        path: entry.path,
+                        projectId: nil,
+                        totalCount: 0,
+                        readyCount: 0,
+                        isLoose: false
+                    )
+                }
+
+                if !directEntries.isEmpty {
+                    cardMap[pendingPath] = PendingProjectCard(
+                        id: pendingPath,
+                        name: "散装文件",
+                        path: pendingPath,
+                        projectId: nil,
+                        totalCount: directEntries.count,
+                        readyCount: 0,
+                        isLoose: true
                     )
                 }
             }
 
-            // 2. 扫描 pendingPath 物理目录补全文件夹批次
-            if !pendingPath.isEmpty, let root = root(for: pendingPath) {
-                if let page = try? await client.remoteChildren(rootId: root.id, path: pendingPath, refresh: true) {
-                    for entry in page.items where entry.isDirectory && pmlIsPendingFolder(entry.name) {
-                        if cardMap[entry.path] == nil {
-                            cardMap[entry.path] = PendingProjectCard(
-                                id: entry.path,
-                                name: entry.name,
-                                path: entry.path,
-                                projectId: nil,
-                                totalCount: 0,
-                                readyCount: 0,
-                                isLoose: false
-                            )
-                        }
+            // 2. 合并数据库中的 pendingProjects（0.00s），补全 projectId 与数量信息
+            if let domainProjects = try? await client.pendingProjects(), !domainProjects.isEmpty {
+                for dp in domainProjects {
+                    if let existing = cardMap[dp.sourcePath] {
+                        cardMap[dp.sourcePath] = PendingProjectCard(
+                            id: existing.id,
+                            name: existing.name,
+                            path: existing.path,
+                            projectId: dp.id,
+                            totalCount: existing.totalCount > 0 ? existing.totalCount : Int(dp.totalCount),
+                            readyCount: Int(dp.readyCount),
+                            isLoose: existing.isLoose || dp.isLoose
+                        )
+                    } else {
+                        cardMap[dp.sourcePath] = PendingProjectCard(
+                            id: dp.id,
+                            name: dp.name,
+                            path: dp.sourcePath,
+                            projectId: dp.id,
+                            totalCount: Int(dp.totalCount),
+                            readyCount: Int(dp.readyCount),
+                            isLoose: dp.isLoose
+                        )
                     }
                 }
             }
@@ -1127,48 +1167,38 @@ struct PendingCurationView: View {
         }
     }
 
-    private func loadProjectItems(_ project: PendingProjectCard) async {
+    private func loadProjectItems(_ project: PendingProjectCard, forceRefresh: Bool = false) async {
         loadingItems = true
         errorText = ""
         items = []
         currentIndex = 0
-        guard let client = model.apiClient else {
-            loadingItems = false
-            return
-        }
+        defer { loadingItems = false }
+        guard let client = model.apiClient else { return }
 
         do {
+            // 点击进入具体项目时，按需极速拉取作者与分类元数据（list_domain_meta 仅 ~10ms）
+            await ensureMetaLoaded()
+
             var loadedEntries: [RemoteBrowserEntry] = []
 
-            // 1. 如果有 projectId，优先从 pendingProjectItems 获取（含资产 ID）
-            if let pid = project.projectId, !pid.isEmpty {
-                if let domainItems = try? await client.pendingProjectItems(projectId: pid), !domainItems.isEmpty {
-                    loadedEntries = domainItems.map { d in
-                        RemoteBrowserEntry(
-                            path: d.remotePath,
-                            name: d.fileName,
-                            isDirectory: false,
-                            sizeBytes: d.sizeBytes,
-                            modifiedAt: nil,
-                            etag: nil,
-                            assetId: d.assetId,
-                            mediaType: d.mediaType,
-                            thumbnailSource: nil,
-                            coverAssetId: nil
-                        )
+            // 仅读取该 pending 文件夹的第一层直接子项（不用往子文件夹内部探查）
+            if let pendingRoot = root(for: project.path) {
+                var page = try await client.remoteChildren(rootId: pendingRoot.id, path: project.path, refresh: forceRefresh)
+                if !forceRefresh, page.items.isEmpty {
+                    page = try await client.remoteChildren(rootId: pendingRoot.id, path: project.path, refresh: true)
+                }
+                loadedEntries = page.items.filter { entry in
+                    guard !entry.name.hasPrefix("."), !entry.name.hasPrefix("@"),
+                          entry.name != "desktop.ini", entry.name != "Thumbs.db" else { return false }
+                    if project.path == pendingPath && entry.isDirectory && pmlIsPendingFolder(entry.name) {
+                        return false
                     }
+                    return true
                 }
+                .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             }
 
-            // 2. 若 API 未返回，则直读该项目的第一层直接子文件（不用往里面深入探查）
-            if loadedEntries.isEmpty, let root = root(for: project.path) {
-                let page = try await client.remoteChildren(rootId: root.id, path: project.path, refresh: true)
-                loadedEntries = page.items.filter {
-                    !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@") && $0.name != "desktop.ini" && $0.name != "Thumbs.db"
-                }
-            }
-
-            // 3. 仅在进入具体项目后，对该项目的文件进行作者与分类智能匹配
+            // 仅在进入具体项目后，对该项目的直接子项执行作者与分类匹配
             items = loadedEntries.map { entry in
                 var item = PendingItem(entry: entry, targetDir: nil, suggestedAuthor: nil)
                 let suggestion = suggest(for: entry.name)
@@ -1178,7 +1208,7 @@ struct PendingCurationView: View {
             }
             currentIndex = 0
 
-            // 同步更新项目总数
+            // 同步更新该项目的直接待整理项数
             if let idx = projects.firstIndex(where: { $0.id == project.id }) {
                 projects[idx].totalCount = items.count
                 selectedProject?.totalCount = items.count
@@ -1190,7 +1220,6 @@ struct PendingCurationView: View {
                 errorText = "加载项目文件失败: \(error.localizedDescription)"
             }
         }
-        loadingItems = false
     }
 
     private func loadPreview() async {
@@ -1216,14 +1245,12 @@ struct PendingCurationView: View {
             .first
     }
 
-    private var authorIndex: [String: LibraryAuthor] {
-        var index: [String: LibraryAuthor] = [:]
+    private var authorIndex: [String: DomainMetaAuthor] {
+        var index: [String: DomainMetaAuthor] = [:]
         for author in authors {
+            let key = author.name.trimmingCharacters(in: CharacterSet(charactersIn: "【】[]()（）# ")).lowercased()
+            if !key.isEmpty { index[key] = author }
             index[author.name.lowercased()] = author
-            for alias in author.aliases {
-                let key = alias.lowercased()
-                if !key.isEmpty { index[key] = author }
-            }
         }
         return index
     }
@@ -1231,8 +1258,9 @@ struct PendingCurationView: View {
     private func suggest(for name: String) -> (dir: String?, author: String?) {
         guard !vaultRoot.isEmpty else { return (nil, nil) }
         let index = authorIndex
-        for token in pmlBracketTokens(name) {
-            if let author = index[token.lowercased()] {
+        for rawToken in pmlBracketTokens(name) {
+            let cleanToken = rawToken.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).lowercased()
+            if let author = index[cleanToken] ?? index[rawToken.lowercased()] {
                 return (resolveAuthorDirectory(for: author.name), author.name)
             }
         }
