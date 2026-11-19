@@ -640,7 +640,13 @@ struct PendingAdvancedPickerSheet: View {
             }
             .onAppear {
                 localCategoryTree = categoryTree
-                authorNameInput = item.matchedAuthor ?? ""
+                if let matched = item.matchedAuthor, !matched.isEmpty {
+                    authorNameInput = matched
+                } else if let firstChip = item.candidateAuthorChips.first, !firstChip.isEmpty {
+                    authorNameInput = firstChip
+                } else {
+                    authorNameInput = ""
+                }
                 if let cp = item.matchedCategoryPath, !cp.isEmpty {
                     selectCategoryByPath(cp)
                 }

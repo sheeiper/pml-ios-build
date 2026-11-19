@@ -82,16 +82,17 @@ enum MediaOrganizer {
         "flv", "mov", "zip", "rar", "7z",
         // 2. 字幕、汉化与制作标签
         "中文字幕", "中字", "熟肉", "生肉", "个人汉化", "汉化", "精翻", "机翻", "双语", "简繁",
-        "无修", "去码", "步兵", "骑兵", "ai修复", "ai超分", "完全版", "合集", "重置版", "重制版",
-        "特典", "未删减", "短视频", "汉化组", "字幕组", "制作组", "扫图组", "搬运", "首发",
-        "原档", "无水印", "流出", "泄密", "最新", "顶尖", "极品", "女神", "福利", "资源",
+        "无修", "去码", "步兵", "骑兵", "ai修复", "ai超分", "ai增强", "4k修复", "4k增强", "8k修复",
+        "完全版", "合集", "重置版", "重制版", "特典", "未删减", "汉化组", "字幕组", "制作组",
+        "扫图组", "搬运", "首发", "原档", "无水印", "流出", "泄密", "最新", "顶尖", "极品",
+        "女神", "福利", "资源", "开票", "门票", "精品推荐", "定制作品", "无套", "深插", "自慰", "双插",
         // 3. 平台与常见泛标签
         "dl版", "fanbox", "patreon", "fantia", "booth", "gumroad", "ci-en",
         "c100", "c101", "c102", "c103", "c104", "c99", "c98", "c97", "c96", "comic1", "comiket",
-        "微博", "推特", "丝袜", "网袜", "情趣丝袜", "黑丝", "白丝", "裸舞", "巨乳", "大奶",
+        "丝袜", "网袜", "情趣丝袜", "黑丝", "白丝", "裸舞", "巨乳", "大奶",
         "肥臀", "美臀", "蜜桃臀", "御姐", "萝莉", "少女", "可爱", "女同", "女女", "互玩",
         "可甜可盐", "童颜巨乳", "九头身", "天然豪乳", "大尺度", "网黄", "网红", "福利姬",
-        "顶级", "反差", "母狗", "校花", "学生妹", "嫩妹", "口爆", "内射", "中出", "自拍",
+        "顶级", "反差", "母狗", "校花", "学生妹", "嫩妹", "口爆", "内射", "中出",
         // 4. 系统与占位关键字
         "pending", "未分类", "新建文件夹", "新建文件", "download", "inbox", "vault",
     ]
@@ -196,7 +197,7 @@ enum MediaOrganizer {
         return result
     }
 
-    /// 从文件名提取 3~5 个最像作者名的候选胶囊（括号词优先，其次 #标签 和 ｜分隔片段）
+    /// 从文件名提取 3~5 个最像作者名的候选胶囊（括号词优先，其次 #标签、竖线与前置自然分词）
     static func extractAuthorCandidates(_ name: String, customWords: Set<String>) -> [String] {
         let baseName: String
         if let dot = name.lastIndex(of: "."), name.distance(from: dot, to: name.endIndex) <= 5 {
@@ -209,7 +210,15 @@ enum MediaOrganizer {
         var seen: Set<String> = []
 
         func add(_ raw: String) {
-            let cleaned = raw.trimmingCharacters(in: CharacterSet(charactersIn: "#@【】[]「」『』()（）｜|_- "))
+            var cleaned = raw.trimmingCharacters(in: CharacterSet(charactersIn: "#@【】[]「」『』()（）｜|_-~ "))
+            // 去除前导纯数字、下划线、破折号
+            if let range = cleaned.range(of: "^[0-9._\\-\\s]+", options: .regularExpression) {
+                cleaned = String(cleaned[range.upperBound...])
+            }
+            // 去除尾部数字后缀（如 gougou13-5 中的 -5）
+            if let range = cleaned.range(of: "[-_][0-9]+$", options: .regularExpression) {
+                cleaned = String(cleaned[..<range.lowerBound])
+            }
             let key = cleaned.lowercased()
             guard cleaned.count >= 2, cleaned.count <= 22,
                   !isStopword(cleaned, customWords: customWords),
@@ -236,6 +245,57 @@ enum MediaOrganizer {
             let ns = baseName as NSString
             for match in hashRegex.matches(in: baseName, range: NSRange(location: 0, length: ns.length)) where match.numberOfRanges > 1 {
                 add(ns.substring(with: match.range(at: 1)))
+            }
+        }
+
+        // 4. 自然分词提取（针对无括号/无井号文件名，如 ST开票gougou13-5、cookie522-12、杏吧渣男1-...）
+        var stripped = baseName
+        // 去除最开头的【...】或 [...] 如果它包含的是停用词（如【AI增强】）
+        if let regex = try? NSRegularExpression(pattern: "^[【\\[「『(（][^】\\]」』)）]+[】\\]」』)）]") {
+            let ns = stripped as NSString
+            let match = regex.firstMatch(in: stripped, range: NSRange(location: 0, length: ns.length))
+            if let match {
+                let inside = ns.substring(with: match.range)
+                if isStopword(inside, customWords: customWords) {
+                    stripped = ns.substring(from: match.range.length)
+                }
+            }
+        }
+        // 去除前导装饰词/推广词（如 ST开票、ST-、✅、❤️等）
+        if let regex = try? NSRegularExpression(pattern: "^[✅❤️⭐⭕❣️\\s]*(ST[-_ ]?|ST开票|ST门票|ST站|开票|门票|精品推荐)+[✅❤️⭐⭕❣️\\s]*", options: .caseInsensitive) {
+            let ns = stripped as NSString
+            let match = regex.firstMatch(in: stripped, range: NSRange(location: 0, length: ns.length))
+            if let match {
+                stripped = ns.substring(from: match.range.length)
+            }
+        }
+        // 去除前置 Emoji
+        stripped = stripped.trimmingCharacters(in: CharacterSet(charactersIn: "✅❤️⭐⭕❣️ \t"))
+
+        // 分词扫描
+        let tokens = stripped.components(separatedBy: CharacterSet(charactersIn: " \t_·,，、;；"))
+        for tok in tokens where !tok.isEmpty {
+            // 匹配英数混合或英文作者名（如 gougou13、cookie522、xiaowan_xx）
+            if let match = tok.range(of: "^[a-zA-Z0-9_\\-]+", options: .regularExpression) {
+                add(String(tok[match]))
+            }
+            // 匹配紧跟数字/横杠的中文作者（如 杏吧渣男1-今天...）
+            if let match = tok.range(of: "^[\\u4e00-\\u9fa5]{2,6}(?=[0-9\\-])", options: .regularExpression) {
+                add(String(tok[match]))
+            }
+            // 若片段本身长度适中（2~8），也可以作为备选候选词
+            if tok.count >= 2 && tok.count <= 8 {
+                add(tok)
+            }
+        }
+
+        // 5. 兜底策略：如果仍未提取出任何有效候选词，截取首个自然词前 2~5 个字符
+        if candidates.isEmpty, !stripped.isEmpty {
+            let fallbackChunk = stripped.components(separatedBy: CharacterSet(charactersIn: " \t_·,，、;；-")).first ?? ""
+            if fallbackChunk.count >= 2 {
+                let candidateLen = min(5, fallbackChunk.count)
+                let sub = String(fallbackChunk.prefix(candidateLen))
+                add(sub)
             }
         }
 
@@ -301,8 +361,8 @@ enum MediaOrganizer {
             return true
         }
         for (key, synonyms) in categorySynonyms {
-            if lowerNode.contains(key) || key.contains(lowerNode) {
-                if synonyms.contains(where: { lowerText.contains($0) }) {
+            if lowerNode == key.lowercased() || lowerNode.contains(key.lowercased()) {
+                if synonyms.contains(where: { lowerText.contains($0.lowercased()) }) {
                     return true
                 }
             }
@@ -310,7 +370,7 @@ enum MediaOrganizer {
         return false
     }
 
-    /// 优先命中树中最深层的子分类
+    /// 优先命中树中最深层的子分类（数据库分类节点 100% 具备合法性，不施加停用词过滤）
     static func findDeepestMatchedCategory(
         for text: String,
         tree: [VaultCategoryNode],
@@ -321,8 +381,7 @@ enum MediaOrganizer {
 
         func dfs(_ nodes: [VaultCategoryNode], depth: Int) {
             for node in nodes {
-                if !isStopword(node.cleanName, customWords: customWords),
-                   isCategoryNameMatched(node.cleanName, in: lower) {
+                if isCategoryNameMatched(node.cleanName, in: lower) {
                     if best == nil || depth > best!.depth || (depth == best!.depth && node.cleanName.count > best!.node.cleanName.count) {
                         best = (node, depth)
                     }

@@ -826,27 +826,74 @@ struct PendingCurationView: View {
             // 紫色作者槽位：文件名推荐候选词 + 无作者/仅分类 + 手动微调
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Label("作者槽位（文件名推荐）", systemImage: "person.fill")
+                    Label("作者槽位", systemImage: "person.fill")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.purple)
+                    if !deckDirectCategoryMode && !deckAuthorInput.isEmpty {
+                        Text("已选：\(deckAuthorInput)")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.purple)
+                            .lineLimit(1)
+                    } else if deckDirectCategoryMode {
+                        Text("模式：无作者（直接归入分类根目录）")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
                     Spacer()
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 7) {
+                        // 1. 优先展示提取的文件名推荐候选词
                         ForEach(item.candidateAuthorChips, id: \.self) { chip in
                             let selected = !deckDirectCategoryMode && deckAuthorInput.lowercased() == chip.lowercased()
                             Button {
                                 deckDirectCategoryMode = false
                                 deckAuthorInput = chip
                             } label: {
-                                Text(chip)
-                                    .font(.caption.weight(selected ? .bold : .medium))
+                                HStack(spacing: 4) {
+                                    if selected {
+                                        Image(systemName: "checkmark")
+                                            .font(.caption2)
+                                    }
+                                    Text(chip)
+                                        .font(.caption.weight(selected ? .bold : .medium))
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(selected ? Color.purple : Color.purple.opacity(0.14), in: Capsule())
+                                .foregroundStyle(selected ? .white : .purple)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        // 2. 若候选词为空，后备展示该分类下已有常用作者
+                        if item.candidateAuthorChips.isEmpty {
+                            let categoryAuthors = vaultAuthors.filter {
+                                guard let cp = $0.categoryPath, !cp.isEmpty, !deckCategoryPath.isEmpty else { return false }
+                                return cp == deckCategoryPath || deckCategoryPath.hasPrefix(cp) || cp.hasPrefix(deckCategoryPath)
+                            }
+                            let fallbackAuthors = categoryAuthors.isEmpty ? Array(vaultAuthors.prefix(6)) : Array(categoryAuthors.prefix(6))
+                            ForEach(fallbackAuthors) { auth in
+                                let selected = !deckDirectCategoryMode && deckAuthorInput.lowercased() == auth.canonicalName.lowercased()
+                                Button {
+                                    deckDirectCategoryMode = false
+                                    deckAuthorInput = auth.canonicalName
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        if selected {
+                                            Image(systemName: "checkmark")
+                                                .font(.caption2)
+                                        }
+                                        Text(auth.canonicalName)
+                                            .font(.caption.weight(selected ? .bold : .medium))
+                                    }
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 6)
                                     .background(selected ? Color.purple : Color.purple.opacity(0.14), in: Capsule())
                                     .foregroundStyle(selected ? .white : .purple)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
 
                         Button {
@@ -906,8 +953,28 @@ struct PendingCurationView: View {
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 7) {
+                        // 若命中了多级子分类，在首位放置一个专属高亮胶囊
+                        if !deckCategoryPath.isEmpty && deckCategoryName.contains(" / ") {
+                            let leafName = deckCategoryName.components(separatedBy: " / ").last ?? MediaOrganizer.cleanCategoryName(deckCategoryPath)
+                            Button {
+                                // 点击保持当前命中分类
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "checkmark.seal.fill")
+                                        .font(.caption2)
+                                    Text(leafName)
+                                        .font(.caption.weight(.bold))
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.green, in: Capsule())
+                                .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
                         ForEach(quickCategories) { cat in
-                            let selected = deckCategoryPath == cat.path || deckCategoryPath.hasPrefix(cat.path + "/")
+                            let selected = deckCategoryPath == cat.path
                             Button {
                                 deckCategoryPath = cat.path
                                 deckCategoryName = cat.fullDisplayName
@@ -1266,8 +1333,17 @@ struct PendingCurationView: View {
     // MARK: - 交互逻辑：刷卡、传播、退回、高级选择、持久化
 
     private func syncDeckSlots(for item: PendingCurationItem) {
-        deckAuthorInput = item.matchedAuthor ?? ""
         deckDirectCategoryMode = false
+        // 1. 同步作者：已命中作者优先；未命中时若提取到候选词，自动预选第 1 个候选词
+        if let matched = item.matchedAuthor, !matched.isEmpty {
+            deckAuthorInput = matched
+        } else if let firstChip = item.candidateAuthorChips.first, !firstChip.isEmpty {
+            deckAuthorInput = firstChip
+        } else {
+            deckAuthorInput = ""
+        }
+
+        // 2. 同步分类：优先使用条目命中的最深层分类；若无，使用上次记忆分类
         if let cp = item.matchedCategoryPath, !cp.isEmpty {
             deckCategoryPath = cp
             deckCategoryName = item.matchedCategoryName ?? MediaOrganizer.cleanCategoryName(cp)
