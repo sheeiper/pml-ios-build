@@ -74,6 +74,8 @@ struct GestureVideoPlayerSheet: View {
     @State private var subtitleTitle: String?
     @State private var subtitleOffset: Double = 0
     @State private var backgroundObserver: NSObjectProtocol?
+    @State private var foregroundObserver: NSObjectProtocol?
+    @State private var itemStatusObserver: NSKeyValueObservation?
     @State private var showSystemPlayer = false
     @State private var isLocked = false
     @State private var showPlaylist = false
@@ -512,6 +514,21 @@ struct GestureVideoPlayerSheet: View {
         ) { [self] _ in
             saveProgress()
         }
+        if let existing = foregroundObserver {
+            NotificationCenter.default.removeObserver(existing)
+        }
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [self] _ in
+            configureAudioSession()
+            if let item = player.currentItem, item.status == .failed {
+                handlePlaybackFailure()
+            } else if isPlaying && player.timeControlStatus == .paused {
+                player.playImmediately(atRate: rate)
+            }
+        }
         if let existing = endObserver {
             NotificationCenter.default.removeObserver(existing)
         }
@@ -675,6 +692,7 @@ struct GestureVideoPlayerSheet: View {
         pendingSeek = nil
 
         let item = makePlayerItem(currentURL)
+        observeItemStatus(item)
         player.automaticallyWaitsToMinimizeStalling = true
         player.replaceCurrentItem(with: item)
 
@@ -1106,38 +1124,60 @@ struct GestureVideoPlayerSheet: View {
                 }
             }
             if player.currentItem?.status == .failed, !usedFallback {
-                usedFallback = true
-                let target = currentTime
-                let wasPlaying = isPlaying
-                withAnimation {
-                    alistExpiredWarning = "⚠️ AList 登录已失效，正在切换服务器中转流..."
-                }
-                Task { @MainActor in
-                    var fallback = currentFallbackURL
-                    if fallback == nil, let assetId = currentAssetId {
-                        fallback = await model.fallbackMediaURL(assetId: assetId)
-                    }
-                    guard let fallback else {
-                        usedFallback = false
-                        withAnimation {
-                            alistExpiredWarning = "⚠️ AList 登录已过期且无服务器备用流，请在 AList 重新登录 115"
-                        }
-                        return
-                    }
-                    player.replaceCurrentItem(with: makePlayerItem(fallback))
-                    accelLabel = "服务器中转"
-                    if await waitUntilReady() {
-                        requestSeek(to: target, resume: wasPlaying, debounce: false)
-                        withAnimation {
-                            alistExpiredWarning = "⚠️ AList 登录已过期，已切换为服务器中转播放"
-                        }
-                    }
-                }
+                handlePlaybackFailure()
             }
             isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
             if currentTime - lastSavedAt >= 5 {
                 lastSavedAt = currentTime
                 saveProgress()
+            }
+        }
+    }
+
+    private func observeItemStatus(_ item: AVPlayerItem) {
+        itemStatusObserver?.invalidate()
+        itemStatusObserver = item.observe(\.status, options: [.initial, .new]) { [self] observedItem, _ in
+            DispatchQueue.main.async {
+                if observedItem.status == .failed {
+                    handlePlaybackFailure()
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func handlePlaybackFailure() {
+        guard !usedFallback else { return }
+        usedFallback = true
+        let target = currentTime
+        let wasPlaying = isPlaying
+        withAnimation {
+            alistExpiredWarning = "⚠️ 视频流连接断开，正在切换备用流..."
+        }
+        Task { @MainActor in
+            if currentURL.host == "127.0.0.1" || currentURL.host == "localhost" {
+                LocalMediaProxy.shared.reset()
+            }
+            var fallback = currentFallbackURL
+            if fallback == nil, let assetId = currentAssetId {
+                fallback = await model.fallbackMediaURL(assetId: assetId)
+            }
+            guard let fallback else {
+                usedFallback = false
+                withAnimation {
+                    alistExpiredWarning = "⚠️ AList 登录已过期且无服务器备用流，请在 AList 重新登录 115"
+                }
+                return
+            }
+            let newItem = makePlayerItem(fallback)
+            observeItemStatus(newItem)
+            player.replaceCurrentItem(with: newItem)
+            accelLabel = "服务器中转"
+            if await waitUntilReady() {
+                requestSeek(to: target, resume: wasPlaying, debounce: false)
+                withAnimation {
+                    alistExpiredWarning = "⚠️ AList 登录已过期，已切换为服务器中转播放"
+                }
             }
         }
     }
@@ -1156,6 +1196,8 @@ struct GestureVideoPlayerSheet: View {
         controlsTask?.cancel()
         hudTask?.cancel()
         pressTask?.cancel()
+        itemStatusObserver?.invalidate()
+        itemStatusObserver = nil
         if let timeObserver {
             player.removeTimeObserver(timeObserver)
         }
@@ -1164,6 +1206,10 @@ struct GestureVideoPlayerSheet: View {
             NotificationCenter.default.removeObserver(backgroundObserver)
         }
         backgroundObserver = nil
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+        }
+        foregroundObserver = nil
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
         }

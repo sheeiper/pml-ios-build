@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import UIKit
 
 /// 高性能 App 内直连媒体代理：
 /// 1. 共享单 URLSession 连接池，复用 TCP/TLS 连接，告别每次拖动进度条重新握手；
@@ -46,7 +47,53 @@ final class LocalMediaProxy: NSObject {
         return URLSession(configuration: config, delegate: demux, delegateQueue: delegateQueue)
     }()
 
-    private override init() { super.init() }
+    private override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+    }
+
+    @objc private func handleWillEnterForeground() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if !self.isHealthy() {
+                self.reset()
+                Task {
+                    _ = await self.ensureStarted()
+                }
+            }
+        }
+    }
+
+    func isHealthy() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let l = listener, l.state == .ready, let p = port, p > 0 else {
+            return false
+        }
+        return true
+    }
+
+    func reset() {
+        lock.lock()
+        let oldListener = self.listener
+        self.listener = nil
+        self.port = nil
+        self.starting = false
+        let currentWaiters = waiters
+        waiters.removeAll()
+        lock.unlock()
+
+        oldListener?.stateUpdateHandler = nil
+        oldListener?.newConnectionHandler = nil
+        oldListener?.cancel()
+
+        for waiter in currentWaiters { waiter.resume(returning: nil) }
+    }
 
     func register(directURL: URL) async -> URL? {
         guard let port = await ensureStarted() else { return nil }
@@ -111,20 +158,28 @@ final class LocalMediaProxy: NSObject {
     }
 
     private func ensureStarted() async -> UInt16? {
-        if let existing = currentPort() {
+        if isHealthy(), let existing = currentPort() {
             return existing
         }
         return await withCheckedContinuation { continuation in
             lock.lock()
-            if let port {
+            if let l = listener, l.state == .ready, let p = port, p > 0 {
                 lock.unlock()
-                continuation.resume(returning: port)
+                continuation.resume(returning: p)
                 return
             }
-            waiters.append(continuation)
+            let oldListener = self.listener
+            self.listener = nil
+            self.port = nil
             let shouldStart = !starting
             starting = true
+            waiters.append(continuation)
             lock.unlock()
+
+            oldListener?.stateUpdateHandler = nil
+            oldListener?.newConnectionHandler = nil
+            oldListener?.cancel()
+
             if shouldStart { startListener() }
         }
     }
@@ -145,7 +200,7 @@ final class LocalMediaProxy: NSObject {
                 case .ready:
                     self.finishStart(port: listener.port?.rawValue)
                 case .failed, .cancelled:
-                    self.finishStart(port: nil)
+                    self.handleListenerTerminated()
                 default:
                     break
                 }
@@ -155,19 +210,36 @@ final class LocalMediaProxy: NSObject {
             }
             listener.start(queue: queue)
         } catch {
-            finishStart(port: nil)
+            handleListenerTerminated()
         }
     }
 
     private func finishStart(port: UInt16?) {
         lock.lock()
-        if self.port == nil { self.port = port }
+        self.port = port
         let currentPort = self.port
         let currentWaiters = waiters
         waiters.removeAll()
         starting = false
         lock.unlock()
         for waiter in currentWaiters { waiter.resume(returning: currentPort) }
+    }
+
+    private func handleListenerTerminated() {
+        lock.lock()
+        let oldListener = self.listener
+        self.listener = nil
+        self.port = nil
+        self.starting = false
+        let currentWaiters = waiters
+        waiters.removeAll()
+        lock.unlock()
+
+        oldListener?.stateUpdateHandler = nil
+        oldListener?.newConnectionHandler = nil
+        oldListener?.cancel()
+
+        for waiter in currentWaiters { waiter.resume(returning: nil) }
     }
 
     private func streamEntry(for path: String) -> StreamEntry? {

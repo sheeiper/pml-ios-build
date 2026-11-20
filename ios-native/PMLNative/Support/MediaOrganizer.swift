@@ -197,7 +197,8 @@ enum MediaOrganizer {
         return result
     }
 
-    /// 从文件名提取 3~5 个最像作者名的候选胶囊（括号词优先，其次 #标签、竖线与前置自然分词）
+    /// 从文件名提取作者名与文件名称分段候选胶囊
+    /// 逻辑：按现有识别逻辑优先匹配（括号词、竖线、#标签、前置特征词），再追加全面文件名分段，让用户拥有丰富的候选选择
     static func extractAuthorCandidates(_ name: String, customWords: Set<String>) -> [String] {
         let baseName: String
         if let dot = name.lastIndex(of: "."), name.distance(from: dot, to: name.endIndex) <= 5 {
@@ -210,29 +211,29 @@ enum MediaOrganizer {
         var seen: Set<String> = []
 
         func add(_ raw: String) {
-            var cleaned = raw.trimmingCharacters(in: CharacterSet(charactersIn: "#@【】[]「」『』()（）｜|_-~ "))
-            // 去除前导纯数字、下划线、破折号
+            var cleaned = raw.trimmingCharacters(in: CharacterSet(charactersIn: "#@【】[]「」『』()（）{}｛｝《》｜|_-~～·.。，,;；:：!！?？\\/ 　\t\r\n"))
+            // 去除前导纯数字、下划线、破折号、点号
             if let range = cleaned.range(of: "^[0-9._\\-\\s]+", options: .regularExpression) {
                 cleaned = String(cleaned[range.upperBound...])
             }
-            // 去除尾部数字后缀（如 gougou13-5 中的 -5）
+            // 去除尾部数字后缀（如 gougou13-5 中的 -5，或 _01, -001）
             if let range = cleaned.range(of: "[-_][0-9]+$", options: .regularExpression) {
                 cleaned = String(cleaned[..<range.lowerBound])
             }
             let key = cleaned.lowercased()
-            guard cleaned.count >= 2, cleaned.count <= 22,
+            guard cleaned.count >= 2, cleaned.count <= 24,
                   !isStopword(cleaned, customWords: customWords),
                   !seen.contains(key) else { return }
             seen.insert(key)
             candidates.append(cleaned)
         }
 
-        // 1. 括号内词条最高优先级（如 【#小仙云】、「一只顶美」）
+        // 1. 【优先匹配】括号内词条最高优先级（如 【#小仙云】、「一只顶美」）
         for token in extractBracketTokens(baseName, customWords: customWords) {
             add(token)
         }
 
-        // 2. 竖线分隔片段（如 頂級嫵媚女神｜Beauty0827｜...）
+        // 2. 【优先匹配】竖线分隔片段（如 頂級嫵媚女神｜Beauty0827｜...）
         if baseName.contains("｜") || baseName.contains("|") {
             let segs = baseName.components(separatedBy: CharacterSet(charactersIn: "｜|"))
             for seg in segs {
@@ -240,7 +241,7 @@ enum MediaOrganizer {
             }
         }
 
-        // 3. #Hashtag 标签（过滤掉泛标签后剩下的多半是博主名，如 #魔鬼爱 #Uaijie）
+        // 3. 【优先匹配】#Hashtag 标签（如 #魔鬼爱 #Uaijie）
         if let hashRegex = try? NSRegularExpression(pattern: "#([^\\s#【】\\[\\]「」()（）]+)") {
             let ns = baseName as NSString
             for match in hashRegex.matches(in: baseName, range: NSRange(location: 0, length: ns.length)) where match.numberOfRanges > 1 {
@@ -248,7 +249,7 @@ enum MediaOrganizer {
             }
         }
 
-        // 4. 自然分词提取（针对无括号/无井号文件名，如 ST开票gougou13-5、cookie522-12、杏吧渣男1-...）
+        // 4. 【优先匹配】自然分词提取（针对特征前缀，如 ST开票gougou13-5、cookie522-12、杏吧渣男1-...）
         var stripped = baseName
         // 去除最开头的【...】或 [...] 如果它包含的是停用词（如【AI增强】）
         if let regex = try? NSRegularExpression(pattern: "^[【\\[「『(（][^】\\]」』)）]+[】\\]」』)）]") {
@@ -283,15 +284,42 @@ enum MediaOrganizer {
             if let match = tok.range(of: "^[\\u4e00-\\u9fa5]{2,6}(?=[0-9\\-])", options: .regularExpression) {
                 add(String(tok[match]))
             }
-            // 若片段本身长度适中（2~8），也可以作为备选候选词
             if tok.count >= 2 && tok.count <= 8 {
                 add(tok)
             }
         }
 
-        // 5. 兜底策略：如果仍未提取出任何有效候选词，截取首个自然词前 2~5 个字符
+        // 5. 【新增拓展：全面文件名分段（Filename Segmentation）】
+        // 按常见分隔符切成碎片，让用户有更丰富的词段选择
+        let delimiterChars = CharacterSet(charactersIn: " \u{3000}\t\r\n-_—–－.~～·,，、;；:：/\\+*&@#｜|【】[]「」『』()（）{}｛｝《》")
+        let segmentedChunks = stripped.components(separatedBy: delimiterChars)
+        for chunk in segmentedChunks {
+            let trimmed = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                add(trimmed)
+            }
+        }
+
+        // 对原始 baseName 也补充一次分段切分（避免 stripped 误伤某些段落）
+        let baseChunks = baseName.components(separatedBy: delimiterChars)
+        for chunk in baseChunks {
+            let trimmed = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                add(trimmed)
+            }
+        }
+
+        // 6. 【自然语言词语细分】（对中文/英文复合段落，按系统自然语言分词）
+        let fullRange = stripped.startIndex..<stripped.endIndex
+        stripped.enumerateSubstrings(in: fullRange, options: [.byWords, .localized]) { substring, _, _, _ in
+            if let sub = substring, sub.count >= 2, sub.count <= 12 {
+                add(sub)
+            }
+        }
+
+        // 7. 兜底策略：如果仍未提取出任何有效候选词，截取首个自然词前 2~5 个字符
         if candidates.isEmpty, !stripped.isEmpty {
-            let fallbackChunk = stripped.components(separatedBy: CharacterSet(charactersIn: " \t_·,，、;；-")).first ?? ""
+            let fallbackChunk = stripped.components(separatedBy: delimiterChars).first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? stripped
             if fallbackChunk.count >= 2 {
                 let candidateLen = min(5, fallbackChunk.count)
                 let sub = String(fallbackChunk.prefix(candidateLen))
@@ -299,7 +327,8 @@ enum MediaOrganizer {
             }
         }
 
-        return Array(candidates.prefix(5))
+        // 提供多达 18 个候选词供用户快速点选横滑
+        return Array(candidates.prefix(18))
     }
 
     // MARK: - 分类树构建与最深层匹配

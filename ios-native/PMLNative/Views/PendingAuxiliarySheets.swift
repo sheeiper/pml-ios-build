@@ -247,6 +247,7 @@ struct PendingAdvancedPickerSheet: View {
     @State private var authorNameInput = ""
     @State private var authorFilterKeyword = ""
     @State private var aliasInput = ""
+    @State private var copiedTitleToast = false
 
     // 新建分类
     @State private var showCreateCategory = false
@@ -322,14 +323,70 @@ struct PendingAdvancedPickerSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    // 当前项目名
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("当前归类项目")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                    // 当前项目名（支持长按自由选词部分复制、整条复制与分段点选）
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("当前归类项目")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                UIPasteboard.general.string = item.entry.name
+                                copiedTitleToast = true
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                Task {
+                                    try? await Task.sleep(nanoseconds: 1_800_000_000)
+                                    copiedTitleToast = false
+                                }
+                            } label: {
+                                Label(copiedTitleToast ? "已复制" : "复制标题", systemImage: copiedTitleToast ? "checkmark" : "doc.on.doc")
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(copiedTitleToast ? .green : .accentColor)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
                         Text(item.entry.name)
                             .font(.subheadline.weight(.semibold))
-                            .lineLimit(3)
+                            .textSelection(.enabled)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if !item.candidateAuthorChips.isEmpty {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("智能分段候选（点击直接填入作者）：")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 6) {
+                                        ForEach(item.candidateAuthorChips, id: \.self) { chip in
+                                            let isSelected = authorNameInput.lowercased() == chip.lowercased()
+                                            Button {
+                                                authorNameInput = chip
+                                                directCategoryMode = false
+                                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                            } label: {
+                                                HStack(spacing: 3) {
+                                                    if isSelected {
+                                                        Image(systemName: "checkmark")
+                                                            .font(.system(size: 9, weight: .bold))
+                                                    }
+                                                    Text(chip)
+                                                        .font(.caption2.weight(.medium))
+                                                }
+                                                .padding(.horizontal, 9)
+                                                .padding(.vertical, 4)
+                                                .background(isSelected ? Color.purple : Color.purple.opacity(0.12), in: Capsule())
+                                                .foregroundStyle(isSelected ? .white : .purple)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                            }
+                            .padding(.top, 4)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(12)
@@ -524,6 +581,17 @@ struct PendingAdvancedPickerSheet: View {
                                     Button { authorNameInput = "" } label: {
                                         Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                                     }
+                                }
+                                Button {
+                                    if let clip = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty {
+                                        authorNameInput = clip
+                                        directCategoryMode = false
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    }
+                                } label: {
+                                    Image(systemName: "doc.on.clipboard")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.purple)
                                 }
                             }
                             .padding(10)
