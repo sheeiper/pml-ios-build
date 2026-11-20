@@ -475,18 +475,26 @@ struct PendingAdvancedPickerSheet: View {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 8) {
                                     ForEach(recentCategoryPaths, id: \.self) { path in
-                                        let label = path.split(separator: "/").suffix(2).map { MediaOrganizer.cleanCategoryName(String($0)) }.joined(separator: " / ")
+                                        let leaf = MediaOrganizer.cleanCategoryName(path.split(separator: "/").last.map(String.init) ?? path)
+                                        let parent = path.split(separator: "/").dropLast().last.map { MediaOrganizer.cleanCategoryName(String($0)) }
                                         let active = selectedCategoryPath == path
                                         Button {
                                             selectCategoryByPath(path)
                                         } label: {
-                                            Text(label)
-                                                .font(.caption.weight(active ? .bold : .medium))
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 6)
-                                                .background(active ? Color.green.opacity(0.2) : Color(.secondarySystemBackground), in: Capsule())
-                                                .overlay(Capsule().stroke(active ? Color.green : Color.clear, lineWidth: 1))
-                                                .foregroundStyle(active ? Color.green : Color.primary)
+                                            HStack(spacing: 3) {
+                                                Text(leaf)
+                                                    .font(.caption.weight(active ? .bold : .medium))
+                                                if let p = parent, !p.isEmpty {
+                                                    Text("(\(p))")
+                                                        .font(.system(size: 9))
+                                                        .foregroundStyle(active ? Color.green.opacity(0.85) : .secondary)
+                                                }
+                                            }
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 6)
+                                            .background(active ? Color.green.opacity(0.2) : Color(.secondarySystemBackground), in: Capsule())
+                                            .overlay(Capsule().stroke(active ? Color.green : Color.clear, lineWidth: 1))
+                                            .foregroundStyle(active ? Color.green : Color.primary)
                                         }
                                         .buttonStyle(.plain)
                                     }
@@ -860,6 +868,15 @@ struct PendingAdvancedPickerSheet: View {
         if !rawAliases.isEmpty, let existing = matchedExistingAuthor {
             let merged = Array(Set(existing.aliases + rawAliases))
             aliasUpdate = (existing.id, merged)
+        }
+
+        if !selectedCategoryPath.isEmpty {
+            var list = recentCategoryPaths.filter { $0 != selectedCategoryPath }
+            list.insert(selectedCategoryPath, at: 0)
+            if list.count > 10 {
+                list = Array(list.prefix(10))
+            }
+            recentCategoriesRaw = list.joined(separator: "|")
         }
 
         onConfirm(

@@ -75,8 +75,12 @@ struct PendingCurationView: View {
     @State private var deckDirectCategoryMode = false
     @State private var stickyCategoryPath = ""
     @State private var stickyCategoryName = ""
-    @State private var dragOffset: CGSize = .zero
     @State private var folderCoverAssetIds: [String: String] = [:]
+    @State private var copiedTitleToast = false
+    @State private var analyzingCurrentItem = false
+
+    // 最近常用分类持久化（跨卡片与高级选择弹窗共享）
+    @AppStorage("pml.pending.recentCategories") private var recentCategoriesRaw = ""
 
     // 弹窗与交互
     @State private var advancedPickerItem: PendingCurationItem?
@@ -140,12 +144,56 @@ struct PendingCurationView: View {
         return vaultRoot.isEmpty ? nil : "\(vaultRoot)/【\(authorClean)】"
     }
 
-    private var quickCategories: [VaultCategoryNode] {
-        // 优先展示一级分类与常用二级分类
-        let flat = MediaOrganizer.flattenCategories(categoryTree)
-        let l1 = categoryTree
-        if !l1.isEmpty { return l1 }
-        return Array(flat.prefix(12))
+    /// 最近使用的多级分类路径列表
+    private var recentCategoryPaths: [String] {
+        recentCategoriesRaw.split(separator: "|").map(String.init).filter { !$0.isEmpty }
+    }
+
+    /// 所有无子节点的叶子分类（最后一级分类，优先推荐）
+    private var leafCategories: [VaultCategoryNode] {
+        MediaOrganizer.extractLeafCategories(categoryTree)
+    }
+
+    /// 解析最近使用的分类节点，用于胶囊展示
+    private var recentCategoryNodes: [VaultCategoryNode] {
+        let allFlat = MediaOrganizer.flattenCategories(categoryTree)
+        var result: [VaultCategoryNode] = []
+        for path in recentCategoryPaths {
+            if let hit = allFlat.first(where: { $0.path == path }) {
+                result.append(hit)
+            } else {
+                let clean = MediaOrganizer.cleanCategoryName(path)
+                result.append(VaultCategoryNode(
+                    id: path,
+                    rawName: path,
+                    cleanName: clean,
+                    fullDisplayName: clean,
+                    path: path,
+                    parentId: nil,
+                    children: []
+                ))
+            }
+        }
+        return Array(result.prefix(6))
+    }
+
+    private func recordRecentCategory(_ path: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var list = recentCategoryPaths.filter { $0 != trimmed }
+        list.insert(trimmed, at: 0)
+        if list.count > 10 {
+            list = Array(list.prefix(10))
+        }
+        recentCategoriesRaw = list.joined(separator: "|")
+    }
+
+    private func applyCategorySelection(_ cat: VaultCategoryNode) {
+        deckCategoryPath = cat.path
+        deckCategoryName = cat.fullDisplayName
+        stickyCategoryPath = cat.path
+        stickyCategoryName = cat.fullDisplayName
+        recordRecentCategory(cat.path)
     }
 
     // MARK: - 主视图
@@ -676,91 +724,53 @@ struct PendingCurationView: View {
         ScrollView {
             VStack(spacing: 12) {
                 if let item = currentDeckItem {
-                    ZStack {
-                        // 背后第 2 张预备卡片（拖动时浮现）
-                        if triageItems.count > 1 {
-                            let nextItem = triageItems[1]
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("下一项预览")
-                                    .font(.caption2.weight(.semibold))
+                    // 顶部进度与手动重新匹配栏
+                    HStack(alignment: .center) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "tray.full.fill")
+                                .font(.caption)
+                                .foregroundStyle(Color.accentColor)
+                            Text("待归纳 \(triageItems.count) 项")
+                                .font(.caption.weight(.bold))
+                            if allItems.count > 0 {
+                                Text("· 共 \(allItems.count) 项")
+                                    .font(.caption2)
                                     .foregroundStyle(.secondary)
-                                Text(nextItem.entry.name)
-                                    .font(.subheadline.weight(.medium))
-                                    .lineLimit(2)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(18)
-                            .pmlGlassCard(cornerRadius: 20)
-                            .scaleEffect(0.95)
-                            .opacity(min(0.85, abs(dragOffset.width) / 110.0))
-                            .padding(.horizontal, 16)
                         }
 
-                        // 主互动卡片（支持左右拖拽刷卡）
-                        deckFocusCard(for: item)
-                            .padding(.horizontal, 16)
-                            .offset(x: dragOffset.width, y: dragOffset.height * 0.12)
-                            .rotationEffect(.degrees(Double(dragOffset.width / 26.0)))
-                            .overlay(alignment: .topLeading) {
-                                if dragOffset.width > 24 {
-                                    Text("归纳 READY")
-                                        .font(.caption.weight(.black))
-                                        .foregroundStyle(.green)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.green, lineWidth: 2))
-                                        .rotationEffect(.degrees(-12))
-                                        .padding(.leading, 32)
-                                        .padding(.top, 22)
-                                        .opacity(min(1, Double(dragOffset.width - 24) / 70.0))
-                                }
+                        Spacer()
+
+                        Button {
+                            reanalyzeCurrentDeckItem()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .rotationEffect(analyzingCurrentItem ? .degrees(360) : .zero)
+                                    .animation(analyzingCurrentItem ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: analyzingCurrentItem)
+                                Text(analyzingCurrentItem ? "识别中…" : "重新匹配")
+                                    .font(.caption2.weight(.semibold))
                             }
-                            .overlay(alignment: .topTrailing) {
-                                if dragOffset.width < -24 {
-                                    Text("跳过 SKIP")
-                                        .font(.caption.weight(.black))
-                                        .foregroundStyle(.orange)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.orange, lineWidth: 2))
-                                        .rotationEffect(.degrees(12))
-                                        .padding(.trailing, 32)
-                                        .padding(.top, 22)
-                                        .opacity(min(1, Double(-dragOffset.width - 24) / 70.0))
-                                }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Color(.secondarySystemBackground), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(analyzingCurrentItem)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+
+                    // 主交互卡片（已移除手势，按键驱动，标题支持长按选词部分复制）
+                    deckFocusCard(for: item)
+                        .padding(.horizontal, 16)
+                        .task(id: item.entry.path) {
+                            if !item.isAnalyzed {
+                                await analyzeItemIfNeeded(item)
                             }
-                            .gesture(
-                                DragGesture(minimumDistance: 18)
-                                    .onChanged { value in
-                                        if abs(value.translation.width) > abs(value.translation.height) {
-                                            dragOffset = value.translation
-                                        }
-                                    }
-                                    .onEnded { value in
-                                        if value.translation.width > 95, deckFinalDestination != nil {
-                                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                                            withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
-                                                dragOffset = .zero
-                                                confirmCurrentDeckItemToAssigned()
-                                            }
-                                        } else if value.translation.width < -95 {
-                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                            withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
-                                                dragOffset = .zero
-                                                skipCurrentDeckItem()
-                                            }
-                                        } else {
-                                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                                                dragOffset = .zero
-                                            }
-                                        }
-                                    }
-                            )
-                    }
-                    .task(id: item.entry.path) {
-                        syncDeckSlots(for: item)
-                        await loadCoverIfNeeded(for: item)
-                    }
+                            syncDeckSlots(for: item)
+                            await loadCoverIfNeeded(for: item)
+                        }
                 }
             }
             .padding(.bottom, 24)
@@ -818,12 +828,81 @@ struct PendingCurationView: View {
             }
             .buttonStyle(.plain)
 
-            // 文件/文件夹名称
-            Text(item.entry.name)
-                .font(.subheadline.weight(.bold))
-                .lineLimit(3)
+            // 文件/文件夹名称与部分复制选词、智能切词词块
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.entry.name)
+                            .font(.subheadline.weight(.bold))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(nil)
+                    }
+                    Spacer(minLength: 8)
+                    Button {
+                        UIPasteboard.general.string = item.entry.name
+                        copiedTitleToast = true
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        Task {
+                            try? await Task.sleep(nanoseconds: 1_800_000_000)
+                            copiedTitleToast = false
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: copiedTitleToast ? "checkmark" : "doc.on.doc")
+                                .font(.caption2)
+                            Text(copiedTitleToast ? "已复制" : "复制全名")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(copiedTitleToast ? Color.green.opacity(0.15) : Color(.tertiarySystemFill), in: Capsule())
+                        .foregroundStyle(copiedTitleToast ? Color.green : Color.primary)
+                    }
+                    .buttonStyle(.plain)
+                }
 
-            // 紫色作者槽位：文件名推荐候选词 + 无作者/仅分类 + 手动微调
+                // 智能分词词块（Word Chips）：点选直接填入作者输入框
+                if !item.candidateAuthorChips.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("智能提取词块（点击直接填入作者）：")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                ForEach(item.candidateAuthorChips, id: \.self) { chip in
+                                    let selected = !deckDirectCategoryMode && deckAuthorInput.lowercased() == chip.lowercased()
+                                    Button {
+                                        deckDirectCategoryMode = false
+                                        deckAuthorInput = chip
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    } label: {
+                                        HStack(spacing: 3) {
+                                            if selected {
+                                                Image(systemName: "checkmark")
+                                                    .font(.system(size: 9, weight: .bold))
+                                            }
+                                            Text(chip)
+                                                .font(.caption2.weight(selected ? .bold : .medium))
+                                        }
+                                        .padding(.horizontal, 9)
+                                        .padding(.vertical, 5)
+                                        .background(selected ? Color.purple : Color.purple.opacity(0.14), in: Capsule())
+                                        .foregroundStyle(selected ? .white : .purple)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+            }
+            .padding(10)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+
+            // 紫色作者槽位：输入框 + 一键粘贴 + 无作者模式
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Label("作者槽位", systemImage: "person.fill")
@@ -840,124 +919,82 @@ struct PendingCurationView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button {
+                        deckDirectCategoryMode.toggle()
+                        if deckDirectCategoryMode {
+                            deckAuthorInput = ""
+                        }
+                    } label: {
+                        Text(deckDirectCategoryMode ? "作者归类模式" : "无作者/仅分类")
+                            .font(.caption2.weight(.medium))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(deckDirectCategoryMode ? Color.gray.opacity(0.2) : Color(.tertiarySystemFill), in: Capsule())
+                            .foregroundStyle(deckDirectCategoryMode ? Color.primary : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
                 }
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 7) {
-                        // 1. 优先展示提取的文件名推荐候选词
-                        ForEach(item.candidateAuthorChips, id: \.self) { chip in
-                            let selected = !deckDirectCategoryMode && deckAuthorInput.lowercased() == chip.lowercased()
-                            Button {
-                                deckDirectCategoryMode = false
-                                deckAuthorInput = chip
-                            } label: {
-                                HStack(spacing: 4) {
-                                    if selected {
-                                        Image(systemName: "checkmark")
-                                            .font(.caption2)
-                                    }
-                                    Text(chip)
-                                        .font(.caption.weight(selected ? .bold : .medium))
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(selected ? Color.purple : Color.purple.opacity(0.14), in: Capsule())
-                                .foregroundStyle(selected ? .white : .purple)
+
+                if !deckDirectCategoryMode {
+                    HStack(spacing: 6) {
+                        Image(systemName: "pencil")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        TextField("输入或点选上方词块设定作者…", text: $deckAuthorInput)
+                            .font(.caption)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        if !deckAuthorInput.isEmpty {
+                            Button { deckAuthorInput = "" } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                             .buttonStyle(.plain)
                         }
-
-                        // 2. 若候选词为空，后备展示该分类下已有常用作者
-                        if item.candidateAuthorChips.isEmpty {
-                            let categoryAuthors = vaultAuthors.filter {
-                                guard let cp = $0.categoryPath, !cp.isEmpty, !deckCategoryPath.isEmpty else { return false }
-                                return cp == deckCategoryPath || deckCategoryPath.hasPrefix(cp) || cp.hasPrefix(deckCategoryPath)
-                            }
-                            let fallbackAuthors = categoryAuthors.isEmpty ? Array(vaultAuthors.prefix(6)) : Array(categoryAuthors.prefix(6))
-                            ForEach(fallbackAuthors) { auth in
-                                let selected = !deckDirectCategoryMode && deckAuthorInput.lowercased() == auth.canonicalName.lowercased()
-                                Button {
-                                    deckDirectCategoryMode = false
-                                    deckAuthorInput = auth.canonicalName
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        if selected {
-                                            Image(systemName: "checkmark")
-                                                .font(.caption2)
-                                        }
-                                        Text(auth.canonicalName)
-                                            .font(.caption.weight(selected ? .bold : .medium))
-                                    }
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 6)
-                                    .background(selected ? Color.purple : Color.purple.opacity(0.14), in: Capsule())
-                                    .foregroundStyle(selected ? .white : .purple)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-
                         Button {
-                            deckDirectCategoryMode = true
-                            deckAuthorInput = ""
+                            if let clip = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty {
+                                deckAuthorInput = clip
+                                deckDirectCategoryMode = false
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            }
                         } label: {
-                            Text("无作者/仅分类")
-                                .font(.caption.weight(deckDirectCategoryMode ? .bold : .medium))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(deckDirectCategoryMode ? Color.gray : Color(.secondarySystemBackground), in: Capsule())
-                                .foregroundStyle(deckDirectCategoryMode ? .white : .secondary)
+                            Image(systemName: "doc.on.clipboard")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.purple)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("粘贴剪贴板文字为作者")
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
                 }
-
-                HStack(spacing: 6) {
-                    Image(systemName: "pencil")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    TextField("手动输入或微调作者姓名（选填）…", text: $deckAuthorInput)
-                        .font(.caption)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .onChange(of: deckAuthorInput) { _, val in
-                            if !val.trimmingCharacters(in: .whitespaces).isEmpty {
-                                deckDirectCategoryMode = false
-                            }
-                        }
-                    if !deckAuthorInput.isEmpty {
-                        Button { deckAuthorInput = "" } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
             }
 
-            // 绿色分类槽位：自动带出匹配分类 / 记忆上次分类 + 一级快速切换
+            // 绿色分类槽位：最近分类推荐 + 库内叶子分类 + 优先最后一级
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Label("分类槽位", systemImage: "folder.fill")
+                    Label("分类槽位（优先最后一级叶子）", systemImage: "folder.fill")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.green)
                     if !deckCategoryName.isEmpty {
-                        Text("已选：\(deckCategoryName)")
-                            .font(.caption2.weight(.semibold))
+                        let displayLeaf = deckCategoryName.components(separatedBy: " / ").last ?? deckCategoryName
+                        Text("已选：\(displayLeaf)")
+                            .font(.caption2.weight(.bold))
                             .foregroundStyle(.green)
                             .lineLimit(1)
                     }
                     Spacer()
                 }
+
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 7) {
-                        // 若命中了多级子分类，在首位放置一个专属高亮胶囊
-                        if !deckCategoryPath.isEmpty && deckCategoryName.contains(" / ") {
+                        // 1. 若命中了分类，首位专属高亮胶囊
+                        if !deckCategoryPath.isEmpty {
                             let leafName = deckCategoryName.components(separatedBy: " / ").last ?? MediaOrganizer.cleanCategoryName(deckCategoryPath)
                             Button {
-                                // 点击保持当前命中分类
+                                // 保持已选
                             } label: {
                                 HStack(spacing: 4) {
                                     Image(systemName: "checkmark.seal.fill")
@@ -973,22 +1010,45 @@ struct PendingCurationView: View {
                             .buttonStyle(.plain)
                         }
 
-                        ForEach(quickCategories) { cat in
-                            let selected = deckCategoryPath == cat.path
-                            Button {
-                                deckCategoryPath = cat.path
-                                deckCategoryName = cat.fullDisplayName
-                                stickyCategoryPath = cat.path
-                                stickyCategoryName = cat.fullDisplayName
-                            } label: {
-                                Text(cat.cleanName)
-                                    .font(.caption.weight(selected ? .bold : .medium))
+                        // 2. 最近使用分类胶囊（跨高级选择共享持久化）
+                        ForEach(recentCategoryNodes) { cat in
+                            let isCurrent = deckCategoryPath == cat.path
+                            if !isCurrent {
+                                Button {
+                                    applyCategorySelection(cat)
+                                } label: {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "clock.arrow.circlepath")
+                                            .font(.system(size: 9))
+                                        Text(cat.cleanName)
+                                            .font(.caption.weight(.medium))
+                                    }
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 6)
-                                    .background(selected ? Color.green : Color.green.opacity(0.14), in: Capsule())
-                                    .foregroundStyle(selected ? .white : .green)
+                                    .background(Color.green.opacity(0.14), in: Capsule())
+                                    .foregroundStyle(Color.green)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
+                        }
+
+                        // 3. 库中所有叶子分类节点（保证落在最后一级分类）
+                        ForEach(leafCategories.prefix(12)) { cat in
+                            let isCurrent = deckCategoryPath == cat.path
+                            let inRecent = recentCategoryNodes.contains(where: { $0.path == cat.path })
+                            if !isCurrent && !inRecent {
+                                Button {
+                                    applyCategorySelection(cat)
+                                } label: {
+                                    Text(cat.cleanName)
+                                        .font(.caption.weight(.medium))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(Color(.secondarySystemBackground), in: Capsule())
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                     }
                 }
@@ -999,7 +1059,7 @@ struct PendingCurationView: View {
                 Text("预定归宿")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Text(deckFinalDestination ?? "请点选分类或输入作者（或点「高级」选多级子分类）")
+                Text(deckFinalDestination ?? "请选择分类并指定作者（或切换为直接归入分类模式）")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(deckFinalDestination != nil ? Color.accentColor : Color.secondary)
                     .lineLimit(2)
@@ -1008,51 +1068,52 @@ struct PendingCurationView: View {
             .padding(10)
             .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
 
-            // 底部大拇指操作栏
-            HStack(spacing: 8) {
+            // 底部大拇指高效操作栏（跳过 / 高级… / 确认归纳移入）
+            HStack(spacing: 10) {
                 Button {
-                    deckAuthorInput = ""
-                    deckCategoryPath = ""
-                    deckCategoryName = ""
-                    deckDirectCategoryMode = false
+                    skipCurrentDeckItem()
                 } label: {
-                    Image(systemName: "arrow.counterclockwise")
-                        .font(.caption.weight(.semibold))
-                        .padding(.vertical, 10)
-                        .padding(.horizontal, 10)
+                    VStack(spacing: 3) {
+                        Image(systemName: "forward.fill")
+                            .font(.body.weight(.bold))
+                        Text("跳过")
+                            .font(.caption2.weight(.medium))
+                    }
+                    .frame(minWidth: 64)
+                    .padding(.vertical, 10)
                 }
                 .buttonStyle(.bordered)
+                .tint(.secondary)
+                .disabled(triageItems.count <= 1)
 
                 Button {
                     advancedPickerItem = item
                 } label: {
-                    Label("高级", systemImage: "slider.horizontal.3")
-                        .font(.caption.weight(.semibold))
-                        .padding(.vertical, 10)
-                        .padding(.horizontal, 8)
+                    VStack(spacing: 3) {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.body.weight(.bold))
+                        Text("高级…")
+                            .font(.caption2.weight(.medium))
+                    }
+                    .frame(minWidth: 64)
+                    .padding(.vertical, 10)
                 }
                 .buttonStyle(.bordered)
-
-                Button {
-                    skipCurrentDeckItem()
-                } label: {
-                    Label("跳过", systemImage: "forward.fill")
-                        .font(.caption.weight(.semibold))
-                        .padding(.vertical, 10)
-                        .padding(.horizontal, 8)
-                }
-                .buttonStyle(.bordered)
-                .disabled(triageItems.count <= 1)
 
                 Button {
                     confirmCurrentDeckItemToAssigned()
                 } label: {
-                    Label("加入已归纳", systemImage: "checkmark")
-                        .font(.caption.weight(.bold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.title3)
+                        Text("确认归纳移入")
+                            .font(.subheadline.weight(.bold))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
                 }
                 .buttonStyle(.borderedProminent)
+                .tint(.accentColor)
                 .disabled(deckFinalDestination == nil)
             }
         }
@@ -1365,6 +1426,10 @@ struct PendingCurationView: View {
         let catPath = deckCategoryPath.isEmpty ? nil : deckCategoryPath
         let catName = deckCategoryName.isEmpty ? nil : deckCategoryName
 
+        if let cp = catPath {
+            recordRecentCategory(cp)
+        }
+
         assignItem(
             item,
             targetVaultPath: dest,
@@ -1385,6 +1450,7 @@ struct PendingCurationView: View {
         if let cp = result.categoryPath, !cp.isEmpty {
             stickyCategoryPath = cp
             stickyCategoryName = result.categoryName ?? MediaOrganizer.cleanCategoryName(cp)
+            recordRecentCategory(cp)
         }
         assignItem(
             item,
@@ -1394,6 +1460,43 @@ struct PendingCurationView: View {
             categoryName: result.categoryName,
             source: .manual
         )
+    }
+
+    /// 按需即时识别单个条目（秒开后当前展示项即时匹配）
+    private func analyzeItemIfNeeded(_ item: PendingCurationItem, force: Bool = false) async {
+        guard !item.isAnalyzed || force else { return }
+        let analyzed = MediaOrganizer.analyzePendingEntry(
+            item.entry,
+            authors: vaultAuthors,
+            categoryTree: categoryTree,
+            vaultRoot: vaultRoot,
+            customFilterWords: filterWords,
+            savedAssignments: savedAssignments
+        )
+        await MainActor.run {
+            if let idx = allItems.firstIndex(where: { $0.id == item.id }) {
+                allItems[idx] = analyzed
+                if currentDeckItem?.id == item.id {
+                    syncDeckSlots(for: analyzed)
+                }
+                if let pIdx = projects.firstIndex(where: { $0.id == selectedProject?.id }) {
+                    projects[pIdx].readyCount = assignedItems.count
+                    selectedProject?.readyCount = assignedItems.count
+                }
+            }
+        }
+    }
+
+    /// 用户在卡片上主动点击「重新匹配」
+    private func reanalyzeCurrentDeckItem() {
+        guard let item = currentDeckItem else { return }
+        analyzingCurrentItem = true
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        Task {
+            await analyzeItemIfNeeded(item, force: true)
+            analyzingCurrentItem = false
+            showHUD("已重新识别分类与作者")
+        }
     }
 
     private func assignItem(
@@ -1730,16 +1833,27 @@ struct PendingCurationView: View {
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             }
 
-            // 逐项过滤停用词/服务器过滤词 -> 优先命中作者(直接入已归纳) -> 未命中入待归纳(预记分类 + 推荐作者词)
+            // 两阶段秒开加载：只从服务端恢复已保存草稿，其余子项轻量初始化，进入待整理 0 秒延迟！
             allItems = loadedEntries.map { entry in
-                MediaOrganizer.analyzePendingEntry(
-                    entry,
-                    authors: vaultAuthors,
-                    categoryTree: categoryTree,
-                    vaultRoot: vaultRoot,
-                    customFilterWords: filterWords,
-                    savedAssignments: savedAssignments
-                )
+                if let optionalSaved = savedAssignments[entry.path],
+                   let saved = optionalSaved,
+                   let savedTarget = saved.targetVaultPath,
+                   !savedTarget.isEmpty {
+                    return PendingCurationItem(
+                        entry: entry,
+                        assignmentSource: .restoredDraft,
+                        matchedAuthorId: nil,
+                        matchedAuthor: saved.author,
+                        matchedAlias: nil,
+                        matchedCategoryPath: saved.categoryPath,
+                        matchedCategoryName: saved.categoryName,
+                        targetVaultPath: savedTarget,
+                        candidateAuthorChips: [],
+                        isAnalyzed: true
+                    )
+                } else {
+                    return PendingCurationItem(entry: entry, isAnalyzed: false)
+                }
             }
 
             if let idx = projects.firstIndex(where: { $0.id == project.id }) {

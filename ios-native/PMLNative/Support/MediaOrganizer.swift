@@ -35,6 +35,8 @@ struct PendingCurationItem: Identifiable, Hashable {
     var targetVaultPath: String? = nil
     /// 从文件名提取的候选作者词（3~5 个，用于待归纳卡片快速点选）
     var candidateAuthorChips: [String] = []
+    /// 标记是否已完成深度分析（用于秒开加载与按需即时分析）
+    var isAnalyzed: Bool = false
 
     var id: String { entry.path }
     var isAssigned: Bool {
@@ -399,20 +401,36 @@ enum MediaOrganizer {
         return false
     }
 
-    /// 优先命中树中最深层的子分类（数据库分类节点 100% 具备合法性，不施加停用词过滤）
+    /// 优先命中树中最深层的叶子分类（分类通常落在最后一级叶子分类，叶子分类赋予绝对优先权）
     static func findDeepestMatchedCategory(
         for text: String,
         tree: [VaultCategoryNode],
         customWords: Set<String>
     ) -> VaultCategoryNode? {
         let lower = text.lowercased()
-        var best: (node: VaultCategoryNode, depth: Int)? = nil
+        var best: (node: VaultCategoryNode, depth: Int, isLeaf: Bool)? = nil
 
         func dfs(_ nodes: [VaultCategoryNode], depth: Int) {
             for node in nodes {
                 if isCategoryNameMatched(node.cleanName, in: lower) {
-                    if best == nil || depth > best!.depth || (depth == best!.depth && node.cleanName.count > best!.node.cleanName.count) {
-                        best = (node, depth)
+                    let isLeaf = node.children.isEmpty
+                    if let currentBest = best {
+                        var shouldReplace = false
+                        if isLeaf && !currentBest.isLeaf {
+                            // 叶子节点绝对优先
+                            shouldReplace = true
+                        } else if isLeaf == currentBest.isLeaf {
+                            if depth > currentBest.depth {
+                                shouldReplace = true
+                            } else if depth == currentBest.depth && node.cleanName.count > currentBest.node.cleanName.count {
+                                shouldReplace = true
+                            }
+                        }
+                        if shouldReplace {
+                            best = (node, depth, isLeaf)
+                        }
+                    } else {
+                        best = (node, depth, isLeaf)
                     }
                 }
                 dfs(node.children, depth: depth + 1)
@@ -421,6 +439,19 @@ enum MediaOrganizer {
 
         dfs(tree, depth: 1)
         return best?.node
+    }
+
+    /// 提取分类树中的所有叶子分类节点（无子节点的最后一级分类）
+    static func extractLeafCategories(_ nodes: [VaultCategoryNode]) -> [VaultCategoryNode] {
+        var leaves: [VaultCategoryNode] = []
+        for node in nodes {
+            if node.children.isEmpty {
+                leaves.append(node)
+            } else {
+                leaves.append(contentsOf: extractLeafCategories(node.children))
+            }
+        }
+        return leaves
     }
 
     // MARK: - 作者索引构建（优先已整理库真实目录路径）
@@ -484,7 +515,8 @@ enum MediaOrganizer {
                 matchedCategoryPath: saved.categoryPath,
                 matchedCategoryName: saved.categoryName,
                 targetVaultPath: savedTarget,
-                candidateAuthorChips: candidates
+                candidateAuthorChips: candidates,
+                isAnalyzed: true
             )
         }
 
@@ -525,7 +557,8 @@ enum MediaOrganizer {
                     matchedCategoryPath: hit.categoryPath,
                     matchedCategoryName: hit.categoryPath.map { cleanCategoryName($0) },
                     targetVaultPath: vp,
-                    candidateAuthorChips: candidates
+                    candidateAuthorChips: candidates,
+                    isAnalyzed: true
                 )
             }
             if let aliasHit = aliasMap[key], let vp = aliasHit.author.vaultPath {
@@ -538,7 +571,8 @@ enum MediaOrganizer {
                     matchedCategoryPath: aliasHit.author.categoryPath,
                     matchedCategoryName: aliasHit.author.categoryPath.map { cleanCategoryName($0) },
                     targetVaultPath: vp,
-                    candidateAuthorChips: candidates
+                    candidateAuthorChips: candidates,
+                    isAnalyzed: true
                 )
             }
         }
@@ -559,7 +593,8 @@ enum MediaOrganizer {
                     matchedCategoryPath: author.categoryPath,
                     matchedCategoryName: author.categoryPath.map { cleanCategoryName($0) },
                     targetVaultPath: vp,
-                    candidateAuthorChips: candidates
+                    candidateAuthorChips: candidates,
+                    isAnalyzed: true
                 )
             }
         }
@@ -579,7 +614,8 @@ enum MediaOrganizer {
                     matchedCategoryPath: item.author.categoryPath,
                     matchedCategoryName: item.author.categoryPath.map { cleanCategoryName($0) },
                     targetVaultPath: vp,
-                    candidateAuthorChips: candidates
+                    candidateAuthorChips: candidates,
+                    isAnalyzed: true
                 )
             }
         }
@@ -595,7 +631,8 @@ enum MediaOrganizer {
             matchedCategoryPath: matchedCat?.path,
             matchedCategoryName: matchedCat?.fullDisplayName,
             targetVaultPath: nil,
-            candidateAuthorChips: candidates
+            candidateAuthorChips: candidates,
+            isAnalyzed: true
         )
     }
 }
