@@ -9695,7 +9695,7 @@ pub async fn curate_delete_file(
         .map_err(|e| format!("删除网络请求失败: {e}"))?;
     let status = res.status();
     if status == StatusCode::NO_CONTENT || status == StatusCode::OK || status == StatusCode::NOT_FOUND {
-        let _ = purge_pending_assets(&app, &normalized);
+        let _ = purge_pending_assets(app, normalized);
         Ok(true)
     } else {
         Err(format!("删除文件失败: HTTP {status}"))
