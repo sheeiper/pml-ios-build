@@ -215,7 +215,7 @@ public struct CleanupView: View {
             Text("确定要从资料库与存储中彻底清理选中的 \(selectedIds.count) 个文件吗？此操作无法撤销。")
         }
         .task {
-            whitelist = (try? await appModel.api.getScrapeWhitelist()) ?? []
+            whitelist = (try? await appModel.apiClient?.getScrapeWhitelist()) ?? []
         }
     }
 
@@ -233,10 +233,14 @@ public struct CleanupView: View {
     }
 
     private func saveWhitelist() async {
+        guard let client = appModel.apiClient else {
+            whitelistNotice = "未连接到数据源"
+            return
+        }
         savingWhitelist = true
         whitelistNotice = nil
         do {
-            try await appModel.api.setScrapeWhitelist(paths: whitelist)
+            try await client.setScrapeWhitelist(paths: whitelist)
             whitelistNotice = "保存成功！"
         } catch {
             whitelistNotice = "保存失败: \(error.localizedDescription)"
@@ -245,12 +249,16 @@ public struct CleanupView: View {
     }
 
     private func startScan() async {
+        guard let client = appModel.apiClient else {
+            statusMessage = "未连接到数据源"
+            return
+        }
         scanning = true
         statusMessage = nil
         cleanupItems = []
         selectedIds.removeAll()
         do {
-            let items = try await appModel.api.scanCleanupItems()
+            let items = try await client.scanCleanupItems()
             cleanupItems = items
             selectedIds = Set(items.map { $0.assetId })
             if items.isEmpty {
@@ -263,10 +271,14 @@ public struct CleanupView: View {
     }
 
     private func executeCleanup() async {
+        guard let client = appModel.apiClient else {
+            statusMessage = "未连接到数据源"
+            return
+        }
         deleting = true
         statusMessage = nil
         do {
-            let report = try await appModel.api.deleteCleanupItems(assetIds: Array(selectedIds))
+            let report = try await client.deleteCleanupItems(assetIds: Array(selectedIds))
             let deletedCount = report.deletedCount
             let freed = formatBytes(report.freedBytes)
             cleanupItems.removeAll { selectedIds.contains($0.assetId) }

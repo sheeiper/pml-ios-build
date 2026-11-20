@@ -159,10 +159,14 @@ public struct AlbumGalleryView: View {
     }
 
     private func loadAlbum() async {
+        guard let client = appModel.apiClient else {
+            errorMessage = "未连接到数据源"
+            return
+        }
         loading = true
         errorMessage = nil
         do {
-            albumInfo = try await appModel.api.getAlbumDetails(dirPath: dirPath)
+            albumInfo = try await client.getAlbumDetails(dirPath: dirPath)
         } catch {
             errorMessage = error.localizedDescription
         }

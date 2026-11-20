@@ -163,6 +163,10 @@ final class AppModel: ObservableObject {
         return try? await client.mediaSourceURL(assetId: assetId)
     }
 
+    func proxyScraperImageURL(rawUrl: String) -> URL? {
+        apiClient?.proxyScraperImageURL(rawUrl: rawUrl)
+    }
+
     /// 把 CD2 路径按前缀映射到 AList，并拼出 `/d` 直链。
     func alistDirectURL(remotePath: String) -> URL? {
         guard let base = settings.normalizedAlistURL else { return nil }

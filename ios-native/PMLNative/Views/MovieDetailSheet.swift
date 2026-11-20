@@ -69,7 +69,7 @@ public struct MovieDetailSheet: View {
                     } else if let meta = metadata {
                         // Hero section
                         HStack(alignment: .top, spacing: 16) {
-                            if let cover = meta.coverUrl, let url = appModel.api.proxyScraperImageURL(rawUrl: cover) {
+                            if let cover = meta.coverUrl, let url = appModel.proxyScraperImageURL(rawUrl: cover) {
                                 AsyncImage(url: url) { phase in
                                     switch phase {
                                     case .success(let image):
@@ -220,7 +220,7 @@ public struct MovieDetailSheet: View {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(spacing: 8) {
                                         ForEach(meta.sampleImages, id: \.self) { sample in
-                                            if let url = appModel.api.proxyScraperImageURL(rawUrl: sample) {
+                                            if let url = appModel.proxyScraperImageURL(rawUrl: sample) {
                                                 Button {
                                                     selectedSampleURL = sample
                                                 } label: {
@@ -260,11 +260,11 @@ public struct MovieDetailSheet: View {
                                             Button {
                                                 metadata = rel
                                                 Task {
-                                                    relatedMovies = (try? await appModel.api.getRelatedMovies(number: rel.number, limit: 8)) ?? []
+                                                    relatedMovies = (try? await appModel.apiClient?.getRelatedMovies(number: rel.number, limit: 8)) ?? []
                                                 }
                                             } label: {
                                                 VStack(alignment: .leading, spacing: 4) {
-                                                    if let cover = rel.coverUrl, let url = appModel.api.proxyScraperImageURL(rawUrl: cover) {
+                                                    if let cover = rel.coverUrl, let url = appModel.proxyScraperImageURL(rawUrl: cover) {
                                                         AsyncImage(url: url) { phase in
                                                             if let img = phase.image {
                                                                 img.resizable().scaledToFill()
@@ -306,7 +306,7 @@ public struct MovieDetailSheet: View {
                 get: { selectedSampleURL.map { SampleImageItem(url: $0) } },
                 set: { selectedSampleURL = $0?.url }
             )) { item in
-                if let u = appModel.api.proxyScraperImageURL(rawUrl: item.url) {
+                if let u = appModel.proxyScraperImageURL(rawUrl: item.url) {
                     NavigationStack {
                         ZStack {
                             Color.black.ignoresSafeArea()
@@ -334,15 +334,19 @@ public struct MovieDetailSheet: View {
     }
 
     private func loadData(force: Bool = false) async {
+        guard let client = appModel.apiClient else {
+            errorMessage = "未连接到数据源"
+            return
+        }
         loading = true
         errorMessage = nil
         do {
             var meta: MovieMetadata?
             if let num = number, !force {
-                meta = try? await appModel.api.getMovieMetadata(number: num)
+                meta = try? await client.getMovieMetadata(number: num)
             }
             if meta == nil {
-                meta = try await appModel.api.scrapeAsset(
+                meta = try await client.scrapeAsset(
                     assetId: assetId ?? "",
                     fileName: fileName ?? number,
                     remotePath: remotePath,
@@ -351,7 +355,7 @@ public struct MovieDetailSheet: View {
             }
             metadata = meta
             if let num = meta?.number {
-                relatedMovies = (try? await appModel.api.getRelatedMovies(number: num, limit: 8)) ?? []
+                relatedMovies = (try? await client.getRelatedMovies(number: num, limit: 8)) ?? []
             }
         } catch {
             errorMessage = error.localizedDescription
