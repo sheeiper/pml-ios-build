@@ -1,7 +1,5 @@
-use std::sync::Arc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use crate::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,9 +109,7 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
                 }
 
                 // Skip optional delimiter '-', '_', ' '
-                let mut sep = false;
                 if i < len && (chars[i] == '-' || chars[i] == '_' || chars[i] == ' ') {
-                    sep = true;
                     i += 1;
                 }
 
