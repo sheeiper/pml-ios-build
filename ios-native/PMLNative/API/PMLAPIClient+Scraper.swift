@@ -52,4 +52,28 @@ extension PMLAPIClient {
         components.query = "url=\(encoded)"
         return components.url
     }
+
+    func getBatchScrapeStats() async throws -> BatchScrapeStats {
+        return try await command("get_batch_scrape_stats", as: BatchScrapeStats.self)
+    }
+
+    func getBatchScrapeProgress() async throws -> BatchScrapeProgress {
+        return try await command("get_batch_scrape_progress", as: BatchScrapeProgress.self)
+    }
+
+    func startBatchScrape() async throws {
+        try await perform("start_batch_scrape")
+    }
+
+    func pauseBatchScrape() async throws -> BatchScrapeProgress {
+        return try await command("pause_batch_scrape", as: BatchScrapeProgress.self)
+    }
+
+    func resumeBatchScrape() async throws -> BatchScrapeProgress {
+        return try await command("resume_batch_scrape", as: BatchScrapeProgress.self)
+    }
+
+    func stopBatchScrape() async throws -> BatchScrapeProgress {
+        return try await command("stop_batch_scrape", as: BatchScrapeProgress.self)
+    }
 }

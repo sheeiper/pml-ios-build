@@ -88,3 +88,21 @@ public struct CleanupReport: Codable {
     public let deletedCount: Int
     public let freedBytes: Int64
 }
+
+public struct BatchScrapeProgress: Codable {
+    public let running: Bool
+    public let paused: Bool
+    public let total: Int
+    public let completed: Int
+    public let succeeded: Int
+    public let failed: Int
+    public let currentNumber: String?
+    public let lastError: String?
+}
+
+public struct BatchScrapeStats: Codable {
+    public let totalWhitelistedVideos: Int
+    public let distinctNumbers: Int
+    public let alreadyScraped: Int
+    public let remainingToScrape: Int
+}

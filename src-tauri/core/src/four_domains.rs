@@ -166,7 +166,7 @@ pub(crate) fn legacy_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join("personal-media-library.sqlite3"))
 }
 
-fn v2_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn v2_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join("personal-media-library-v2.sqlite3"))
 }
 

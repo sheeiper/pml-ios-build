@@ -654,17 +654,11 @@ async fn dispatch_command(
         "scrape_asset" => {
             let asset_id = payload.get("assetId").and_then(Value::as_str).unwrap_or("").to_owned();
             let file_name = payload.get("fileName").and_then(Value::as_str).unwrap_or("").to_owned();
-            let remote_path = payload.get("remotePath").and_then(Value::as_str).unwrap_or("").to_owned();
+            let _remote_path = payload.get("remotePath").and_then(Value::as_str).unwrap_or("").to_owned();
             let force = payload.get("force").and_then(Value::as_bool).unwrap_or(false);
             let app = app.clone();
             let res: Result<crate::jav_scraper::MovieMetadata, String> = async move {
                 let conn = four_domains::open_v2(&app)?;
-                if !remote_path.is_empty() && !crate::jav_scraper::is_path_whitelisted(&conn, &remote_path) {
-                    let whitelist = crate::jav_scraper::get_scrape_whitelist(&conn).unwrap_or_default();
-                    if !whitelist.is_empty() {
-                        return Err("当前文件所在目录不在刮削白名单中，已跳过自动刮削".to_string());
-                    }
-                }
                 let number = crate::jav_scraper::extract_jav_number(&file_name)
                     .or_else(|| crate::jav_scraper::extract_jav_number(&asset_id))
                     .ok_or_else(|| format!("无法从文件名【{}】提取有效日本商业番号", file_name))?;
@@ -681,6 +675,36 @@ async fn dispatch_command(
                 Ok(meta)
             }.await;
             result_response(res)
+        }
+        "get_batch_scrape_stats" => {
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::get_batch_scrape_stats(&conn)
+                    .map_err(|e| format!("获取待刮削统计失败：{e}"))
+            }).await
+        }
+        "get_batch_scrape_progress" => {
+            result_response(Ok(crate::jav_scraper::get_batch_scrape_progress()))
+        }
+        "start_batch_scrape" => {
+            let app = app.clone();
+            blocking_result_response(move || {
+                let p = four_domains::v2_path(&app)?;
+                crate::jav_scraper::start_batch_scrape_engine(p.to_string_lossy().to_string())
+            }).await
+        }
+        "pause_batch_scrape" => {
+            crate::jav_scraper::pause_batch_scrape();
+            result_response(Ok(crate::jav_scraper::get_batch_scrape_progress()))
+        }
+        "resume_batch_scrape" => {
+            crate::jav_scraper::resume_batch_scrape();
+            result_response(Ok(crate::jav_scraper::get_batch_scrape_progress()))
+        }
+        "stop_batch_scrape" => {
+            crate::jav_scraper::stop_batch_scrape();
+            result_response(Ok(crate::jav_scraper::get_batch_scrape_progress()))
         }
         "get_movie_metadata" => {
             let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();

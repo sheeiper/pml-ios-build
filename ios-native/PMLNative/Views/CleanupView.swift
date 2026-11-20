@@ -16,6 +16,10 @@ public struct CleanupView: View {
     @State private var showConfirmAlert = false
     @State private var statusMessage: String?
 
+    @State private var batchStats: BatchScrapeStats?
+    @State private var batchProgress: BatchScrapeProgress?
+    @State private var batchLoading = false
+
     public init() {}
 
     private var filteredItems: [CleanupItem] {
@@ -93,6 +97,107 @@ public struct CleanupView: View {
                 }
             } header: {
                 Label("刮削目录白名单限定", systemImage: "shield.lefthalf.filled")
+            }
+
+            // 1.5 全自动后台批量刮削
+            Section {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("服务端后台单线程温和防封（约2秒间隔）刮削日本影片百科，支持随时暂停、断点续跑。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading) {
+                            Text("\(batchStats?.totalWhitelistedVideos ?? 0)")
+                                .font(.headline.bold())
+                            Text("白名单视频").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        VStack(alignment: .leading) {
+                            Text("\(batchStats?.distinctNumbers ?? 0)")
+                                .font(.headline.bold())
+                            Text("唯一番号").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        VStack(alignment: .leading) {
+                            Text("\(batchStats?.alreadyScraped ?? 0)")
+                                .font(.headline.bold())
+                                .foregroundStyle(.green)
+                            Text("已刮削").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        VStack(alignment: .leading) {
+                            Text("\(batchStats?.remainingToScrape ?? 0)")
+                                .font(.headline.bold())
+                                .foregroundStyle(.purple)
+                            Text("待入库").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+
+                    if let prog = batchProgress, prog.running {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(prog.paused ? "已暂停" : "正在全自动刮削...")
+                                    .font(.subheadline.bold())
+                                    .foregroundStyle(prog.paused ? .orange : .purple)
+                                Spacer()
+                                Text("\(prog.completed) / \(prog.total)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let cur = prog.currentNumber {
+                                Text("当前番号: \(cur)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            ProgressView(value: Double(prog.completed), total: Double(max(prog.total, 1)))
+                                .tint(prog.paused ? .orange : .purple)
+                        }
+                    }
+
+                    HStack {
+                        if batchProgress?.running != true {
+                            Button {
+                                Task { await startBatch() }
+                            } label: {
+                                if batchLoading {
+                                    ProgressView()
+                                } else {
+                                    Label("启动全自动刮削", systemImage: "bolt.fill")
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.purple)
+                            .controlSize(.small)
+                            .disabled(batchLoading)
+                        } else {
+                            if batchProgress?.paused == true {
+                                Button("继续") {
+                                    Task { await resumeBatch() }
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.green)
+                                .controlSize(.small)
+                            } else {
+                                Button("暂停") {
+                                    Task { await pauseBatch() }
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.orange)
+                                .controlSize(.small)
+                            }
+
+                            Button("终止", role: .destructive) {
+                                Task { await stopBatch() }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+                }
+            } header: {
+                Label("全自动后台防封批量刮削", systemImage: "bolt.badge.clock.fill")
             }
 
             // 2. 垃圾广告扫描与清洗
@@ -216,6 +321,7 @@ public struct CleanupView: View {
         }
         .task {
             whitelist = (try? await appModel.apiClient?.getScrapeWhitelist()) ?? []
+            await loadBatchData()
         }
     }
 
@@ -292,5 +398,49 @@ public struct CleanupView: View {
 
     private func formatBytes(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private func loadBatchData() async {
+        guard let client = appModel.apiClient else { return }
+        if let stats = try? await client.getBatchScrapeStats() {
+            self.batchStats = stats
+        }
+        if let prog = try? await client.getBatchScrapeProgress() {
+            self.batchProgress = prog
+        }
+    }
+
+    private func startBatch() async {
+        guard let client = appModel.apiClient else { return }
+        batchLoading = true
+        do {
+            try await client.startBatchScrape()
+            await loadBatchData()
+        } catch {
+            statusMessage = "启动批量刮削失败: \(error.localizedDescription)"
+        }
+        batchLoading = false
+    }
+
+    private func pauseBatch() async {
+        guard let client = appModel.apiClient else { return }
+        if let prog = try? await client.pauseBatchScrape() {
+            self.batchProgress = prog
+        }
+    }
+
+    private func resumeBatch() async {
+        guard let client = appModel.apiClient else { return }
+        if let prog = try? await client.resumeBatchScrape() {
+            self.batchProgress = prog
+        }
+    }
+
+    private func stopBatch() async {
+        guard let client = appModel.apiClient else { return }
+        if let prog = try? await client.stopBatchScrape() {
+            self.batchProgress = prog
+            await loadBatchData()
+        }
     }
 }
