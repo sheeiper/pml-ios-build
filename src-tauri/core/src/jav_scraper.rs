@@ -671,9 +671,9 @@ pub fn is_path_whitelisted(conn: &Connection, path: &str) -> bool {
     false
 }
 
-use once_cell::sync::Lazy;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -697,24 +697,34 @@ pub struct BatchScrapeStats {
     pub remaining_to_scrape: usize,
 }
 
-static BATCH_PROGRESS: Lazy<Arc<Mutex<BatchScrapeProgress>>> = Lazy::new(|| {
-    Arc::new(Mutex::new(BatchScrapeProgress {
-        running: false,
-        paused: false,
-        total: 0,
-        completed: 0,
-        succeeded: 0,
-        failed: 0,
-        current_number: None,
-        last_error: None,
-    }))
-});
+fn batch_progress_cell() -> &'static Mutex<BatchScrapeProgress> {
+    static CELL: OnceLock<Mutex<BatchScrapeProgress>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Mutex::new(BatchScrapeProgress {
+            running: false,
+            paused: false,
+            total: 0,
+            completed: 0,
+            succeeded: 0,
+            failed: 0,
+            current_number: None,
+            last_error: None,
+        })
+    })
+}
 
-static STOP_BATCH_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
-static PAUSE_BATCH_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
+fn stop_batch_flag() -> &'static AtomicBool {
+    static CELL: OnceLock<AtomicBool> = OnceLock::new();
+    CELL.get_or_init(|| AtomicBool::new(false))
+}
+
+fn pause_batch_flag() -> &'static AtomicBool {
+    static CELL: OnceLock<AtomicBool> = OnceLock::new();
+    CELL.get_or_init(|| AtomicBool::new(false))
+}
 
 pub fn get_batch_scrape_progress() -> BatchScrapeProgress {
-    BATCH_PROGRESS.lock().map(|g| g.clone()).unwrap_or(BatchScrapeProgress {
+    batch_progress_cell().lock().map(|g| g.clone()).unwrap_or(BatchScrapeProgress {
         running: false,
         paused: false,
         total: 0,
@@ -727,23 +737,23 @@ pub fn get_batch_scrape_progress() -> BatchScrapeProgress {
 }
 
 pub fn pause_batch_scrape() {
-    PAUSE_BATCH_FLAG.store(true, Ordering::SeqCst);
-    if let Ok(mut g) = BATCH_PROGRESS.lock() {
+    pause_batch_flag().store(true, Ordering::SeqCst);
+    if let Ok(mut g) = batch_progress_cell().lock() {
         g.paused = true;
     }
 }
 
 pub fn resume_batch_scrape() {
-    PAUSE_BATCH_FLAG.store(false, Ordering::SeqCst);
-    if let Ok(mut g) = BATCH_PROGRESS.lock() {
+    pause_batch_flag().store(false, Ordering::SeqCst);
+    if let Ok(mut g) = batch_progress_cell().lock() {
         g.paused = false;
     }
 }
 
 pub fn stop_batch_scrape() {
-    STOP_BATCH_FLAG.store(true, Ordering::SeqCst);
-    PAUSE_BATCH_FLAG.store(false, Ordering::SeqCst);
-    if let Ok(mut g) = BATCH_PROGRESS.lock() {
+    stop_batch_flag().store(true, Ordering::SeqCst);
+    pause_batch_flag().store(false, Ordering::SeqCst);
+    if let Ok(mut g) = batch_progress_cell().lock() {
         g.running = false;
         g.paused = false;
     }
@@ -798,7 +808,7 @@ pub fn get_batch_scrape_stats(conn: &Connection) -> Result<BatchScrapeStats, rus
 
 pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
     {
-        let mut g = BATCH_PROGRESS.lock().map_err(|e| e.to_string())?;
+        let mut g = batch_progress_cell().lock().map_err(|e| e.to_string())?;
         if g.running {
             return Err("后台批量刮削已在运行中".to_string());
         }
@@ -810,14 +820,14 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
         g.current_number = None;
         g.last_error = None;
     }
-    STOP_BATCH_FLAG.store(false, Ordering::SeqCst);
-    PAUSE_BATCH_FLAG.store(false, Ordering::SeqCst);
+    stop_batch_flag().store(false, Ordering::SeqCst);
+    pause_batch_flag().store(false, Ordering::SeqCst);
 
     tokio::spawn(async move {
         let conn = match Connection::open(&db_path) {
             Ok(c) => c,
             Err(e) => {
-                if let Ok(mut g) = BATCH_PROGRESS.lock() {
+                if let Ok(mut g) = batch_progress_cell().lock() {
                     g.running = false;
                     g.last_error = Some(format!("打开数据库失败：{e}"));
                 }
@@ -826,7 +836,7 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
         };
 
         if let Err(e) = ensure_scraper_schema(&conn) {
-            if let Ok(mut g) = BATCH_PROGRESS.lock() {
+            if let Ok(mut g) = batch_progress_cell().lock() {
                 g.running = false;
                 g.last_error = Some(format!("初始化数据表失败：{e}"));
             }
@@ -836,7 +846,7 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
         let whitelist = match get_scrape_whitelist(&conn) {
             Ok(w) => w,
             Err(e) => {
-                if let Ok(mut g) = BATCH_PROGRESS.lock() {
+                if let Ok(mut g) = batch_progress_cell().lock() {
                     g.running = false;
                     g.last_error = Some(format!("获取白名单失败：{e}"));
                 }
@@ -845,7 +855,7 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
         };
 
         if whitelist.is_empty() {
-            if let Ok(mut g) = BATCH_PROGRESS.lock() {
+            if let Ok(mut g) = batch_progress_cell().lock() {
                 g.running = false;
                 g.last_error = Some("当前未配置任何白名单目录，已取消批量刮削".to_string());
             }
@@ -881,27 +891,27 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
 
         queue.sort();
 
-        if let Ok(mut g) = BATCH_PROGRESS.lock() {
+        if let Ok(mut g) = batch_progress_cell().lock() {
             g.total = queue.len();
         }
 
         for number in queue {
-            if STOP_BATCH_FLAG.load(Ordering::SeqCst) {
+            if stop_batch_flag().load(Ordering::SeqCst) {
                 break;
             }
 
-            while PAUSE_BATCH_FLAG.load(Ordering::SeqCst) {
-                if STOP_BATCH_FLAG.load(Ordering::SeqCst) {
+            while pause_batch_flag().load(Ordering::SeqCst) {
+                if stop_batch_flag().load(Ordering::SeqCst) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
 
-            if STOP_BATCH_FLAG.load(Ordering::SeqCst) {
+            if stop_batch_flag().load(Ordering::SeqCst) {
                 break;
             }
 
-            if let Ok(mut g) = BATCH_PROGRESS.lock() {
+            if let Ok(mut g) = batch_progress_cell().lock() {
                 g.current_number = Some(number.clone());
             }
 
@@ -909,7 +919,7 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
             match scrape_from_javdb(&number).await {
                 Ok(meta) => {
                     let _ = save_movie_metadata(&conn, &meta);
-                    if let Ok(mut g) = BATCH_PROGRESS.lock() {
+                    if let Ok(mut g) = batch_progress_cell().lock() {
                         g.completed += 1;
                         g.succeeded += 1;
                     }
@@ -937,7 +947,7 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
                     };
                     let _ = save_movie_metadata(&conn, &empty_meta);
 
-                    if let Ok(mut g) = BATCH_PROGRESS.lock() {
+                    if let Ok(mut g) = batch_progress_cell().lock() {
                         g.completed += 1;
                         g.failed += 1;
                         g.last_error = Some(format!("{number}: {e}"));
@@ -950,7 +960,7 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
             tokio::time::sleep(std::time::Duration::from_millis(jitter as u64)).await;
         }
 
-        if let Ok(mut g) = BATCH_PROGRESS.lock() {
+        if let Ok(mut g) = batch_progress_cell().lock() {
             g.running = false;
             g.paused = false;
             g.current_number = None;
