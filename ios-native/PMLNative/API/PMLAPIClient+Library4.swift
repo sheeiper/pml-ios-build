@@ -102,6 +102,14 @@ extension PMLAPIClient {
         try await perform("delete_empty_pending_batch", arguments: ["batchPath": batchPath])
     }
 
+    func deleteCurateFile(filePath: String) async throws {
+        try await perform("curate_delete_file", arguments: ["filePath": filePath])
+    }
+
+    func renameCurateEntry(sourcePath: String, targetPath: String, isDirectory: Bool) async throws {
+        _ = try await curateMoveItem(sourcePath: sourcePath, targetPath: targetPath, isDirectory: isDirectory)
+    }
+
     func rawMediaURL(remotePath: String) async throws -> URL {
         let raw: String = try await command("open_raw_media_source", arguments: ["remotePath": remotePath])
         return try resolve(raw)

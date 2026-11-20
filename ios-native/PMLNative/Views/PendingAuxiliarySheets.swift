@@ -25,6 +25,20 @@ struct PendingFolderPreviewSheet: View {
     @State private var activeVideo: FolderVideoTarget?
     @State private var activeImages: ImageViewerContext?
 
+    // 多选与删除状态
+    @State private var isEditing = false
+    @State private var selectedPaths: Set<String> = []
+    @State private var showDeleteConfirm = false
+    @State private var deleteTargetTitle = ""
+    @State private var pathsToDelete: [String] = []
+
+    // 重命名状态
+    @State private var showRenameAlert = false
+    @State private var renameTargetEntry: RemoteBrowserEntry?
+    @State private var renameInputText = ""
+    @State private var actionBusy = false
+    @State private var toastMessage: String?
+
     init(rootId: String, folderPath: String, folderName: String) {
         self.rootId = rootId
         self.folderPath = folderPath
@@ -44,6 +58,24 @@ struct PendingFolderPreviewSheet: View {
             crumbs.append((seg, running))
         }
         return crumbs
+    }
+
+    /// 智能识别广告、宣传、死链等常见垃圾文件
+    private func isJunkFile(_ entry: RemoteBrowserEntry) -> Bool {
+        if entry.isDirectory { return false }
+        let lower = entry.name.lowercased()
+        let junkExts = [".url", ".lnk", ".torrent", ".htm", ".html", ".chm"]
+        if junkExts.contains(where: { lower.hasSuffix($0) }) { return true }
+        if !entry.isVideo && !entry.isImage {
+            let promoWords = ["扫码", "进群", "防迷路", "最新地址", "永久地址", "解压密码", "备用群", "买车看", "发布页", "菠菜", "赌博", "吃瓜", "免费看", "充值", "赞助", "公众号", "免责声明", "readme", "说明"]
+            if promoWords.contains(where: { lower.contains($0) }) { return true }
+            if lower.hasSuffix(".txt") && entry.sizeBytes < 4096 { return true }
+        }
+        return false
+    }
+
+    private var junkEntries: [RemoteBrowserEntry] {
+        entries.filter { isJunkFile($0) }
     }
 
     var body: some View {
@@ -79,6 +111,41 @@ struct PendingFolderPreviewSheet: View {
 
                 Divider()
 
+                // 智能识别垃圾文件一键清理横幅（存在垃圾文件且非多选模式下浮现）
+                if !isEditing && !junkEntries.isEmpty {
+                    HStack(spacing: 10) {
+                        Image(systemName: "sparkles")
+                            .foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("发现 \(junkEntries.count) 个广告/宣传垃圾文件")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.primary)
+                            Text("例如：\(junkEntries.prefix(2).map(\.name).joined(separator: ", "))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        Button {
+                            pathsToDelete = junkEntries.map(\.path)
+                            deleteTargetTitle = "\(junkEntries.count) 个智能识别的广告/垃圾文件"
+                            showDeleteConfirm = true
+                        } label: {
+                            Text("一键清理")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.red, in: Capsule())
+                                .foregroundStyle(.white)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(actionBusy)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Color.orange.opacity(0.12))
+                }
+
                 if loading && entries.isEmpty {
                     VStack(spacing: 12) {
                         ProgressView()
@@ -92,65 +159,197 @@ struct PendingFolderPreviewSheet: View {
                 } else if entries.isEmpty {
                     ContentUnavailableView("空目录", systemImage: "folder", description: Text("该目录下暂无媒体文件"))
                 } else {
-                    List(entries) { entry in
-                        Button {
-                            handleTap(entry)
-                        } label: {
+                    List {
+                        ForEach(entries) { entry in
                             HStack(spacing: 12) {
-                                ZStack {
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(Color(.secondarySystemFill))
-                                    if let thumbId = entry.assetId ?? entry.coverAssetId {
-                                        AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
-                                            Image(systemName: entry.symbol)
-                                                .foregroundStyle(.tint)
+                                if isEditing {
+                                    Button {
+                                        if selectedPaths.contains(entry.path) {
+                                            selectedPaths.remove(entry.path)
+                                        } else {
+                                            selectedPaths.insert(entry.path)
+                                        }
+                                    } label: {
+                                        Image(systemName: selectedPaths.contains(entry.path) ? "checkmark.circle.fill" : "circle")
+                                            .font(.title3)
+                                            .foregroundStyle(selectedPaths.contains(entry.path) ? Color.accentColor : Color.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+
+                                Button {
+                                    if isEditing {
+                                        if selectedPaths.contains(entry.path) {
+                                            selectedPaths.remove(entry.path)
+                                        } else {
+                                            selectedPaths.insert(entry.path)
                                         }
                                     } else {
-                                        Image(systemName: entry.symbol)
-                                            .font(.title3)
-                                            .foregroundStyle(entry.isDirectory ? Color.accentColor : Color.secondary)
+                                        handleTap(entry)
                                     }
-                                }
-                                .frame(width: 48, height: 48)
-                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .fill(Color(.secondarySystemFill))
+                                            if let thumbId = entry.assetId ?? entry.coverAssetId {
+                                                AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
+                                                    Image(systemName: entry.symbol)
+                                                        .foregroundStyle(.tint)
+                                                }
+                                            } else {
+                                                Image(systemName: entry.symbol)
+                                                    .font(.title3)
+                                                    .foregroundStyle(entry.isDirectory ? Color.accentColor : Color.secondary)
+                                            }
+                                        }
+                                        .frame(width: 48, height: 48)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(entry.name)
-                                        .font(.subheadline.weight(.medium))
-                                        .lineLimit(2)
-                                    HStack(spacing: 6) {
-                                        Text(entry.isDirectory ? "子目录" : (entry.isVideo ? "视频" : (entry.isImage ? "图片" : "文件")))
-                                        if !entry.isDirectory {
-                                            Text("·")
-                                            Text(pmlFormatBytes(UInt64(max(0, entry.sizeBytes))))
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            HStack(spacing: 4) {
+                                                Text(entry.name)
+                                                    .font(.subheadline.weight(.medium))
+                                                    .lineLimit(2)
+                                                if isJunkFile(entry) {
+                                                    Text("垃圾")
+                                                        .font(.system(size: 9, weight: .bold))
+                                                        .padding(.horizontal, 4)
+                                                        .padding(.vertical, 1)
+                                                        .background(Color.red.opacity(0.15), in: Capsule())
+                                                        .foregroundStyle(.red)
+                                                }
+                                            }
+
+                                            HStack(spacing: 6) {
+                                                Text(entry.isDirectory ? "子目录" : (entry.isVideo ? "视频" : (entry.isImage ? "图片" : "文件")))
+                                                if !entry.isDirectory {
+                                                    Text("·")
+                                                    Text(pmlFormatBytes(UInt64(max(0, entry.sizeBytes))))
+                                                }
+                                            }
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                        }
+
+                                        Spacer()
+
+                                        if !isEditing {
+                                            Image(systemName: entry.isDirectory ? "chevron.right" : (entry.isVideo ? "play.circle.fill" : "eye"))
+                                                .foregroundStyle(entry.isVideo ? Color.accentColor : Color.secondary)
                                         }
                                     }
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
                                 }
-                                Spacer()
-                                Image(systemName: entry.isDirectory ? "chevron.right" : (entry.isVideo ? "play.circle.fill" : "eye"))
-                                    .foregroundStyle(entry.isVideo ? Color.accentColor : Color.secondary)
+                                .buttonStyle(.plain)
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                if !isEditing {
+                                    Button(role: .destructive) {
+                                        pathsToDelete = [entry.path]
+                                        deleteTargetTitle = "【\(entry.name)】"
+                                        showDeleteConfirm = true
+                                    } label: {
+                                        Label("删除", systemImage: "trash")
+                                    }
+
+                                    Button {
+                                        renameTargetEntry = entry
+                                        renameInputText = entry.name
+                                        showRenameAlert = true
+                                    } label: {
+                                        Label("重命名", systemImage: "pencil")
+                                    }
+                                    .tint(.orange)
+                                }
+                            }
+                            .contextMenu {
+                                if !isEditing {
+                                    Button {
+                                        renameTargetEntry = entry
+                                        renameInputText = entry.name
+                                        showRenameAlert = true
+                                    } label: {
+                                        Label("重命名", systemImage: "pencil")
+                                    }
+
+                                    Button(role: .destructive) {
+                                        pathsToDelete = [entry.path]
+                                        deleteTargetTitle = "【\(entry.name)】"
+                                        showDeleteConfirm = true
+                                    } label: {
+                                        Label("彻底删除", systemImage: "trash")
+                                    }
+                                }
                             }
                         }
-                        .buttonStyle(.plain)
                     }
                     .listStyle(.plain)
                 }
+
+                // 多选模式底部操作栏
+                if isEditing {
+                    HStack(spacing: 12) {
+                        Button(selectedPaths.count == entries.count ? "取消全选" : "全选 (\(entries.count))") {
+                            if selectedPaths.count == entries.count {
+                                selectedPaths.removeAll()
+                            } else {
+                                selectedPaths = Set(entries.map(\.path))
+                            }
+                        }
+                        .font(.subheadline.weight(.medium))
+
+                        Spacer()
+
+                        Button(role: .destructive) {
+                            pathsToDelete = Array(selectedPaths)
+                            deleteTargetTitle = "所选 \(selectedPaths.count) 个文件"
+                            showDeleteConfirm = true
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "trash.fill")
+                                Text("删除所选 (\(selectedPaths.count))")
+                            }
+                            .fontWeight(.bold)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                        .disabled(selectedPaths.isEmpty || actionBusy)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(.ultraThinMaterial)
+                }
             }
-            .navigationTitle("预览文件夹内容")
+            .navigationTitle(isEditing ? "已选 \(selectedPaths.count) 项" : "预览文件夹内容")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("关闭") { dismiss() }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task { await loadDirectory(currentPath, forceRefresh: true) }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+                    if isEditing {
+                        Button("取消") {
+                            isEditing = false
+                            selectedPaths.removeAll()
+                        }
+                    } else {
+                        Button("关闭") { dismiss() }
                     }
-                    .disabled(loading)
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if !entries.isEmpty {
+                        Button(isEditing ? "完成" : "多选") {
+                            isEditing.toggle()
+                            if !isEditing { selectedPaths.removeAll() }
+                        }
+                        .font(.subheadline.weight(isEditing ? .bold : .regular))
+                    }
+
+                    if !isEditing {
+                        Button {
+                            Task { await loadDirectory(currentPath, forceRefresh: true) }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .disabled(loading || actionBusy)
+                    }
                 }
             }
             .task { await loadDirectory(folderPath) }
@@ -167,7 +366,92 @@ struct PendingFolderPreviewSheet: View {
                 ImageViewer(context: ctx)
                     .environmentObject(model)
             }
+            .alert("重命名文件", isPresented: $showRenameAlert) {
+                TextField("输入新文件名", text: $renameInputText)
+                Button("取消", role: .cancel) { renameTargetEntry = nil }
+                Button("确定重命名") {
+                    if let entry = renameTargetEntry {
+                        Task { await executeRename(entry: entry, newName: renameInputText) }
+                    }
+                }
+            } message: {
+                Text("原文件名：\(renameTargetEntry?.name ?? "")")
+            }
+            .confirmationDialog("确认删除", isPresented: $showDeleteConfirm, titleVisibility: .visible) {
+                Button("确定彻底删除 \(deleteTargetTitle)", role: .destructive) {
+                    Task { await executeDelete(paths: pathsToDelete) }
+                }
+                Button("取消", role: .cancel) { pathsToDelete.removeAll() }
+            } message: {
+                Text("此操作将直接从存储中彻底删除该文件，无法撤销，请谨慎操作！")
+            }
+            .overlay(alignment: .top) {
+                if let msg = toastMessage {
+                    Text(msg)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.black.opacity(0.75), in: Capsule())
+                        .padding(.top, 10)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
         }
+    }
+
+    private func showToast(_ text: String) {
+        withAnimation { toastMessage = text }
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            withAnimation { toastMessage = nil }
+        }
+    }
+
+    private func executeRename(entry: RemoteBrowserEntry, newName: String) async {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != entry.name, let client = model.apiClient else { return }
+        actionBusy = true
+        defer { actionBusy = false }
+        let parentDir = entry.path.split(separator: "/").dropLast().joined(separator: "/")
+        let newTargetPath = parentDir.isEmpty ? "/\(trimmed)" : "/\(parentDir)/\(trimmed)"
+
+        do {
+            try await client.renameCurateEntry(sourcePath: entry.path, targetPath: newTargetPath, isDirectory: entry.isDirectory)
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            showToast("已重命名为 \(trimmed)")
+            await loadDirectory(currentPath, forceRefresh: true)
+        } catch {
+            showToast("重命名失败: \(error.localizedDescription)")
+        }
+    }
+
+    private func executeDelete(paths: [String]) async {
+        guard !paths.isEmpty, let client = model.apiClient else { return }
+        actionBusy = true
+        defer { actionBusy = false }
+        var successCount = 0
+        var failCount = 0
+
+        for path in paths {
+            do {
+                try await client.deleteCurateFile(filePath: path)
+                successCount += 1
+            } catch {
+                failCount += 1
+            }
+        }
+
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        if failCount == 0 {
+            showToast("已成功删除 \(successCount) 项")
+        } else {
+            showToast("删除完成：成功 \(successCount) 项，失败 \(failCount) 项")
+        }
+
+        selectedPaths.removeAll()
+        isEditing = false
+        await loadDirectory(currentPath, forceRefresh: true)
     }
 
     private func loadDirectory(_ path: String, forceRefresh: Bool = false) async {

@@ -78,6 +78,7 @@ struct PendingCurationView: View {
     @State private var folderCoverAssetIds: [String: String] = [:]
     @State private var copiedTitleToast = false
     @State private var analyzingCurrentItem = false
+    @State private var batchMatching = false
 
     // 最近常用分类持久化（跨卡片与高级选择弹窗共享）
     @AppStorage("pml.pending.recentCategories") private var recentCategoriesRaw = ""
@@ -127,21 +128,86 @@ struct PendingCurationView: View {
         return runningJob(for: project.path)
     }
 
+    /// 动态作者联合池（Federated Author Registry）：
+    /// 实时聚合存量基础作者 + 服务端后台已移动任务中的新作者 + 服务端草稿作者 + 本地会话已确认归纳作者
+    private var federatedAuthors: [VaultAuthorEntry] {
+        var authorMap: [String: VaultAuthorEntry] = [:]
+        let customSet = Set(filterWords.map { $0.lowercased() })
+
+        // 1. 存量基础作者
+        for auth in vaultAuthors {
+            let key = auth.canonicalName.lowercased()
+            authorMap[key] = auth
+        }
+
+        // 2. 从服务端已保存草稿中提取已知新作者（支持跨项目热同步）
+        for (_, assignmentOpt) in savedAssignments {
+            guard let assignment = assignmentOpt,
+                  let author = assignment.author?.trimmingCharacters(in: CharacterSet(charactersIn: "【】[] ")),
+                  !author.isEmpty,
+                  let targetPath = assignment.targetVaultPath else { continue }
+            let key = author.lowercased()
+            if authorMap[key] == nil {
+                let catPath: String? = {
+                    if let slash = targetPath.lastIndex(of: "/") {
+                        return String(targetPath[..<slash])
+                    }
+                    return assignment.categoryPath
+                }()
+                let aliases = MediaOrganizer.splitAuthorAliases(author, customWords: customSet)
+                authorMap[key] = VaultAuthorEntry(
+                    id: "dynamic_\(author)",
+                    canonicalName: author,
+                    vaultPath: targetPath,
+                    categoryPath: catPath,
+                    aliases: aliases
+                )
+            }
+        }
+
+        // 3. 从当前已归纳条目中动态合并
+        for item in assignedItems {
+            guard let author = item.matchedAuthor?.trimmingCharacters(in: CharacterSet(charactersIn: "【】[] ")),
+                  !author.isEmpty,
+                  let targetPath = item.targetVaultPath else { continue }
+            let key = author.lowercased()
+            if authorMap[key] == nil {
+                let aliases = MediaOrganizer.splitAuthorAliases(author, customWords: customSet)
+                authorMap[key] = VaultAuthorEntry(
+                    id: "local_\(author)",
+                    canonicalName: author,
+                    vaultPath: targetPath,
+                    categoryPath: item.matchedCategoryPath,
+                    aliases: aliases
+                )
+            }
+        }
+
+        return Array(authorMap.values)
+    }
+
     private var deckFinalDestination: String? {
         let catPath = deckCategoryPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        if deckDirectCategoryMode {
-            return catPath.isEmpty ? nil : catPath
-        }
         let authorClean = deckAuthorInput.trimmingCharacters(in: CharacterSet(charactersIn: "【】[] "))
-        if authorClean.isEmpty { return nil }
+
+        // 1. 若填写了作者名
+        if !authorClean.isEmpty {
+            if !catPath.isEmpty {
+                return "\(catPath)/【\(authorClean)】"
+            }
+            if let hit = federatedAuthors.first(where: { $0.canonicalName.lowercased() == authorClean.lowercased() }),
+               let vp = hit.vaultPath, !vp.isEmpty {
+                return vp
+            }
+            return vaultRoot.isEmpty ? nil : "\(vaultRoot)/【\(authorClean)】"
+        }
+
+        // 2. 若未填写作者名（留空），但选定了分类，直接归入该分类根目录（用户关键诉求：卡片免作者直接收纳）
         if !catPath.isEmpty {
-            return "\(catPath)/【\(authorClean)】"
+            return catPath
         }
-        if let hit = vaultAuthors.first(where: { $0.canonicalName.lowercased() == authorClean.lowercased() }),
-           let vp = hit.vaultPath, !vp.isEmpty {
-            return vp
-        }
-        return vaultRoot.isEmpty ? nil : "\(vaultRoot)/【\(authorClean)】"
+
+        return nil
     }
 
     /// 最近使用的多级分类路径列表
@@ -579,12 +645,39 @@ struct PendingCurationView: View {
                 projectEmptyCelebrationView
             } else {
                 VStack(spacing: 0) {
-                    // 顶部双分区切换器：待归纳 / 已归纳
-                    Picker("分区", selection: $activeTab) {
-                        Text("待归纳 (\(triageItems.count))").tag(PendingWorkspaceTab.triage)
-                        Text("已归纳 (\(assignedItems.count))").tag(PendingWorkspaceTab.assigned)
+                    // 顶部双分区切换器与全项目「智能预匹配」主按钮
+                    HStack(spacing: 8) {
+                        Picker("分区", selection: $activeTab) {
+                            Text("待归纳 (\(triageItems.count))").tag(PendingWorkspaceTab.triage)
+                            Text("已归纳 (\(assignedItems.count))").tag(PendingWorkspaceTab.assigned)
+                        }
+                        .pickerStyle(.segmented)
+
+                        if activeTab == .triage && !triageItems.isEmpty {
+                            Button {
+                                Task { await runProjectBatchAutoMatch() }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    if batchMatching {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                            .tint(.purple)
+                                    } else {
+                                        Image(systemName: "wand.and.stars")
+                                            .font(.caption.weight(.bold))
+                                    }
+                                    Text(batchMatching ? "匹配中" : "智能预匹配")
+                                        .font(.caption2.weight(.bold))
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(Color.purple.opacity(0.14), in: Capsule())
+                                .foregroundStyle(.purple)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(batchMatching || loadingItems)
+                        }
                     }
-                    .pickerStyle(.segmented)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
 
@@ -902,74 +995,72 @@ struct PendingCurationView: View {
             .padding(10)
             .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
 
-            // 紫色作者槽位：输入框 + 一键粘贴 + 无作者模式
+            // 紫色作者槽位：输入框 + 一键粘贴 + 免作者自动直接收纳
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Label("作者槽位", systemImage: "person.fill")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.purple)
-                    if !deckDirectCategoryMode && !deckAuthorInput.isEmpty {
-                        Text("已选：\(deckAuthorInput)")
+                    let cleanAuth = deckAuthorInput.trimmingCharacters(in: CharacterSet(charactersIn: "【】[] "))
+                    if !cleanAuth.isEmpty {
+                        Text("已选：\(cleanAuth)")
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.purple)
                             .lineLimit(1)
-                    } else if deckDirectCategoryMode {
-                        Text("模式：无作者（直接归入分类根目录）")
-                            .font(.caption2.weight(.semibold))
+                    } else {
+                        Text("未填（确认归纳时将直接放在分类根目录下）")
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button {
-                        deckDirectCategoryMode.toggle()
-                        if deckDirectCategoryMode {
-                            deckAuthorInput = ""
-                        }
-                    } label: {
-                        Text(deckDirectCategoryMode ? "作者归类模式" : "无作者/仅分类")
-                            .font(.caption2.weight(.medium))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(deckDirectCategoryMode ? Color.gray.opacity(0.2) : Color(.tertiarySystemFill), in: Capsule())
-                            .foregroundStyle(deckDirectCategoryMode ? Color.primary : Color.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                if !deckDirectCategoryMode {
-                    HStack(spacing: 6) {
-                        Image(systemName: "pencil")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        TextField("输入或点选上方词块设定作者…", text: $deckAuthorInput)
-                            .font(.caption)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        if !deckAuthorInput.isEmpty {
-                            Button { deckAuthorInput = "" } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
+                    if !deckAuthorInput.isEmpty {
                         Button {
-                            if let clip = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty {
-                                deckAuthorInput = clip
-                                deckDirectCategoryMode = false
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            }
+                            deckAuthorInput = ""
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         } label: {
-                            Image(systemName: "doc.on.clipboard")
-                                .font(.caption.weight(.semibold))
+                            Text("清空免作者")
+                                .font(.caption2.weight(.medium))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.purple.opacity(0.12), in: Capsule())
                                 .foregroundStyle(.purple)
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("粘贴剪贴板文字为作者")
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
                 }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "pencil")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    TextField("输入或点选上方词块设定作者（选填，不填直接收纳至分类）…", text: $deckAuthorInput)
+                        .font(.caption)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if !deckAuthorInput.isEmpty {
+                        Button { deckAuthorInput = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Button {
+                        if let clip = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty {
+                            deckAuthorInput = clip
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        }
+                    } label: {
+                        Image(systemName: "doc.on.clipboard")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.purple)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("粘贴剪贴板文字为作者")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
             }
 
             // 绿色分类槽位：最近分类推荐 + 库内叶子分类 + 优先最后一级
@@ -1059,10 +1150,28 @@ struct PendingCurationView: View {
                 Text("预定归宿")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Text(deckFinalDestination ?? "请选择分类并指定作者（或切换为直接归入分类模式）")
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(deckFinalDestination != nil ? Color.accentColor : Color.secondary)
-                    .lineLimit(2)
+                if let dest = deckFinalDestination {
+                    let cleanAuth = deckAuthorInput.trimmingCharacters(in: CharacterSet(charactersIn: "【】[] "))
+                    HStack(spacing: 6) {
+                        Text("→ \(dest)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(Color.accentColor)
+                            .lineLimit(2)
+                        if cleanAuth.isEmpty {
+                            Text("(免作者·直接归入分类)")
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Color.orange.opacity(0.15), in: Capsule())
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                } else {
+                    Text("请点选下方分类（可免填作者直接归入，或输入作者生成专属目录）")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(Color.secondary)
+                        .lineLimit(2)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
@@ -1419,7 +1528,7 @@ struct PendingCurationView: View {
 
     private func confirmCurrentDeckItemToAssigned() {
         guard let item = currentDeckItem, let dest = deckFinalDestination else { return }
-        let authorClean: String? = deckDirectCategoryMode ? nil : {
+        let authorClean: String? = {
             let s = deckAuthorInput.trimmingCharacters(in: CharacterSet(charactersIn: "【】[] "))
             return s.isEmpty ? nil : s
         }()
@@ -1462,12 +1571,80 @@ struct PendingCurationView: View {
         )
     }
 
+    /// 整项目手动「智能批量预匹配」：
+    /// 将本项目所有未归纳项与动态作者联合池进行全量智能匹配，命中已知作者的自动直接归纳
+    private func runProjectBatchAutoMatch() async {
+        guard !batchMatching, let project = selectedProject else { return }
+        batchMatching = true
+        defer { batchMatching = false }
+
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        // 确保元数据最新
+        await ensureMetaLoaded()
+        let activeAuthors = federatedAuthors
+        let customSet = filterWords
+
+        var autoAssignedCount = 0
+        var newAssignments: [String: CuratorItemAssignment?] = [:]
+
+        for i in allItems.indices where !allItems[i].isAssigned {
+            let analyzed = MediaOrganizer.analyzePendingEntry(
+                allItems[i].entry,
+                authors: activeAuthors,
+                categoryTree: categoryTree,
+                vaultRoot: vaultRoot,
+                customFilterWords: customSet,
+                savedAssignments: savedAssignments
+            )
+            allItems[i] = analyzed
+            if analyzed.isAssigned, let dest = analyzed.targetVaultPath {
+                autoAssignedCount += 1
+                newAssignments[analyzed.entry.path] = CuratorItemAssignment(
+                    targetVaultPath: dest,
+                    author: analyzed.matchedAuthor,
+                    categoryPath: analyzed.matchedCategoryPath,
+                    categoryName: analyzed.matchedCategoryName
+                )
+            }
+        }
+
+        // 同步持久化到服务端草稿
+        if !newAssignments.isEmpty {
+            for (k, v) in newAssignments {
+                savedAssignments[k] = v
+            }
+            if let client = model.apiClient {
+                Task { try? await client.saveCuratorAssignments(newAssignments) }
+            }
+        }
+
+        // 更新项目卡片计数
+        if let idx = projects.firstIndex(where: { $0.id == project.id }) {
+            projects[idx].totalCount = allItems.count
+            projects[idx].readyCount = assignedItems.count
+            selectedProject?.readyCount = assignedItems.count
+        }
+
+        // 若当前展示的卡片还在待归纳区，同步槽位
+        if let current = currentDeckItem {
+            syncDeckSlots(for: current)
+        }
+
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        let remaining = triageItems.count
+        if autoAssignedCount > 0 {
+            showHUD("✓ 预匹配完成：已自动归纳 \(autoAssignedCount) 项，剩余 \(remaining) 项待确认")
+        } else {
+            showHUD("预匹配完成：未发现已知作者，已推荐分类与候选词")
+        }
+    }
+
     /// 按需即时识别单个条目（秒开后当前展示项即时匹配）
     private func analyzeItemIfNeeded(_ item: PendingCurationItem, force: Bool = false) async {
         guard !item.isAnalyzed || force else { return }
         let analyzed = MediaOrganizer.analyzePendingEntry(
             item.entry,
-            authors: vaultAuthors,
+            authors: federatedAuthors,
             categoryTree: categoryTree,
             vaultRoot: vaultRoot,
             customFilterWords: filterWords,

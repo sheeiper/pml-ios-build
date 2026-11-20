@@ -1175,6 +1175,20 @@ async fn dispatch_command(
                 .await,
             )
         }
+        "curate_delete_file" => {
+            let file_path: String = match payload.get("filePath").and_then(Value::as_str) {
+                Some(value) => value.to_owned(),
+                None => return error_response("缺少 filePath 参数"),
+            };
+            result_response(
+                media_library::curate_delete_file(
+                    app.clone(),
+                    app.state::<MediaLibraryState>(),
+                    file_path,
+                )
+                .await,
+            )
+        }
         "pack_inbox_to_pending_batch" => {
             let args: media_library::PackInboxRequest = match parse_args(&payload) {
                 Ok(value) => value,

@@ -9673,6 +9673,36 @@ pub async fn delete_empty_pending_batch(
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]
+pub async fn curate_delete_file(
+    app: AppHandle,
+    state: State<'_, MediaLibraryState>,
+    file_path: String,
+) -> Result<bool, String> {
+    let normalized = normalize_remote_path(&file_path)?;
+    let session = require_session(&state).await?;
+    let delete_url = remote_url(&session.endpoint, &normalized)?;
+    let method = Method::from_bytes(b"DELETE").map_err(|e| e.to_string())?;
+    let mut req = session
+        .client
+        .request(method, delete_url)
+        .header(USER_AGENT, MEDIA_USER_AGENT);
+    if !session.api_token.is_empty() {
+        req = req.header(AUTHORIZATION, &session.api_token);
+    }
+    let res = req
+        .send()
+        .await
+        .map_err(|e| format!("删除网络请求失败: {e}"))?;
+    let status = res.status();
+    if status == StatusCode::NO_CONTENT || status == StatusCode::OK || status == StatusCode::NOT_FOUND {
+        let _ = purge_pending_assets(&app, &normalized);
+        Ok(true)
+    } else {
+        Err(format!("删除文件失败: HTTP {status}"))
+    }
+}
+
+#[cfg_attr(feature = "tauri", tauri::command)]
 pub async fn pack_inbox_to_pending_batch(
     app: AppHandle,
     state: State<'_, MediaLibraryState>,
