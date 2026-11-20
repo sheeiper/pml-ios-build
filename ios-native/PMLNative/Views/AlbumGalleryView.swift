@@ -122,20 +122,11 @@ public struct AlbumGalleryView: View {
 
     private func thumbnailCell(item: AlbumItem, index: Int) -> some View {
         ZStack(alignment: .bottomTrailing) {
-            if let url = appModel.thumbnailURL(for: item.assetId) {
-                AsyncImage(url: url) { phase in
-                    if let img = phase.image {
-                        img.resizable().scaledToFill()
-                    } else {
-                        Rectangle().fill(Color.secondary.opacity(0.15))
-                    }
-                }
-                .frame(height: 140)
-                .clipped()
-            } else {
+            AssetThumbnailView(assetId: item.assetId, contentMode: .fill) {
                 Rectangle().fill(Color.secondary.opacity(0.15))
-                    .frame(height: 140)
             }
+            .frame(height: 140)
+            .clipped()
 
             Text("\(index + 1)")
                 .font(.system(size: 10, weight: .semibold))
@@ -158,13 +149,27 @@ public struct AlbumGalleryView: View {
                 ForEach(Array(album.items.enumerated()), id: \.offset) { idx, item in
                     ZStack {
                         Color.black.ignoresSafeArea()
-                        if let url = appModel.mediaSourceURL(for: item.assetId) {
+                        if let url = appModel.alistDirectURL(remotePath: item.remotePath) {
                             AsyncImage(url: url) { phase in
-                                if let img = phase.image {
-                                    img.resizable().scaledToFit()
-                                } else {
+                                switch phase {
+                                case .success(let image):
+                                    image
+                                        .resizable()
+                                        .scaledToFit()
+                                case .failure:
+                                    AssetThumbnailView(assetId: item.assetId, contentMode: .fit) {
+                                        Image(systemName: "photo")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                case .empty:
                                     ProgressView().tint(.white)
+                                @unknown default:
+                                    EmptyView()
                                 }
+                            }
+                        } else {
+                            AssetThumbnailView(assetId: item.assetId, contentMode: .fit) {
+                                ProgressView().tint(.white)
                             }
                         }
                     }
