@@ -1,0 +1,366 @@
+import SwiftUI
+
+public struct MovieDetailSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appModel: AppModel
+
+    public let number: String?
+    public let assetId: String?
+    public let fileName: String?
+    public let remotePath: String?
+    public let onPlay: ((String) -> Void)?
+
+    @State private var loading = false
+    @State private var errorMessage: String?
+    @State private var metadata: MovieMetadata?
+    @State private var relatedMovies: [MovieMetadata] = []
+    @State private var selectedSampleURL: String?
+
+    public init(
+        number: String? = nil,
+        assetId: String? = nil,
+        fileName: String? = nil,
+        remotePath: String? = nil,
+        onPlay: ((String) -> Void)? = nil
+    ) {
+        self.number = number
+        self.assetId = assetId
+        self.fileName = fileName
+        self.remotePath = remotePath
+        self.onPlay = onPlay
+    }
+
+    public var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if loading {
+                        HStack {
+                            Spacer()
+                            VStack(spacing: 12) {
+                                ProgressView()
+                                    .scaleEffect(1.2)
+                                Text("正在联网刮削日本影视百科与剧照...")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 60)
+                    } else if let error = errorMessage {
+                        VStack(spacing: 12) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 36))
+                                .foregroundStyle(.orange)
+                            Text(error)
+                                .font(.subheadline)
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(.secondary)
+                            Button {
+                                Task { await loadData(force: true) }
+                            } label: {
+                                Label("重试刮削", systemImage: "arrow.clockwise")
+                                    .font(.subheadline.bold())
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
+                    } else if let meta = metadata {
+                        // Hero section
+                        HStack(alignment: .top, spacing: 16) {
+                            if let cover = meta.coverUrl, let url = appModel.api.proxyScraperImageURL(rawUrl: cover) {
+                                AsyncImage(url: url) { phase in
+                                    switch phase {
+                                    case .success(let image):
+                                        image
+                                            .resizable()
+                                            .scaledToFill()
+                                    case .failure:
+                                        Rectangle()
+                                            .fill(Color.secondary.opacity(0.15))
+                                            .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                                    case .empty:
+                                        Rectangle()
+                                            .fill(Color.secondary.opacity(0.1))
+                                            .overlay(ProgressView())
+                                    @unknown default:
+                                        EmptyView()
+                                    }
+                                }
+                                .frame(width: 140, height: 195)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 3)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 6) {
+                                    Text(meta.number)
+                                        .font(.caption.bold())
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 3)
+                                        .background(Color.pink.gradient)
+                                        .foregroundStyle(.white)
+                                        .clipShape(RoundedRectangle(cornerRadius: 5))
+
+                                    if let date = meta.releaseDate {
+                                        Text(date)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+
+                                Text(meta.title)
+                                    .font(.subheadline.bold())
+                                    .lineLimit(4)
+                                    .foregroundStyle(.primary)
+
+                                if let maker = meta.maker {
+                                    HStack(spacing: 4) {
+                                        Text("片商:").font(.caption2).foregroundStyle(.secondary)
+                                        Text(maker).font(.caption.bold()).foregroundStyle(.primary)
+                                    }
+                                }
+
+                                if let series = meta.series {
+                                    HStack(spacing: 4) {
+                                        Text("系列:").font(.caption2).foregroundStyle(.secondary)
+                                        Text(series).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+
+                                if let director = meta.director {
+                                    HStack(spacing: 4) {
+                                        Text("导演:").font(.caption2).foregroundStyle(.secondary)
+                                        Text(director).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+
+                        // Play & Rescrape Buttons
+                        HStack(spacing: 12) {
+                            Button {
+                                if let targetId = meta.assetId ?? assetId {
+                                    dismiss()
+                                    onPlay?(targetId)
+                                }
+                            } label: {
+                                Label("立即播放", systemImage: "play.fill")
+                                    .font(.headline)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button {
+                                Task { await loadData(force: true) }
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.headline)
+                                    .padding(.vertical, 8)
+                                    .padding(.horizontal, 14)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        // Actresses
+                        if !meta.actors.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("出演女优")
+                                    .font(.footnote.bold())
+                                    .foregroundStyle(.secondary)
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 8) {
+                                        ForEach(meta.actors, id: \.self) { actress in
+                                            Label(actress, systemImage: "person.fill")
+                                                .font(.caption)
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 5)
+                                                .background(Color.indigo.opacity(0.18))
+                                                .foregroundStyle(Color.indigo)
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Tags
+                        if !meta.tags.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("题材标签")
+                                    .font(.footnote.bold())
+                                    .foregroundStyle(.secondary)
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 6) {
+                                        ForEach(meta.tags, id: \.self) { tag in
+                                            Text(tag)
+                                                .font(.caption2)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 4)
+                                                .background(Color.secondary.opacity(0.12))
+                                                .foregroundStyle(.secondary)
+                                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Sample Images
+                        if !meta.sampleImages.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("官方高清剧照 (\(meta.sampleImages.count))")
+                                    .font(.footnote.bold())
+                                    .foregroundStyle(.secondary)
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    LazyHStack(spacing: 8) {
+                                        ForEach(meta.sampleImages, id: \.self) { sample in
+                                            if let url = appModel.api.proxyScraperImageURL(rawUrl: sample) {
+                                                Button {
+                                                    selectedSampleURL = sample
+                                                } label: {
+                                                    AsyncImage(url: url) { phase in
+                                                        switch phase {
+                                                        case .success(let image):
+                                                            image
+                                                                .resizable()
+                                                                .scaledToFill()
+                                                        default:
+                                                            Rectangle()
+                                                                .fill(Color.secondary.opacity(0.15))
+                                                                .overlay(ProgressView())
+                                                        }
+                                                    }
+                                                    .frame(width: 140, height: 95)
+                                                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                                                }
+                                                .buttonStyle(.plain)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Related movies
+                        if !relatedMovies.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("库内关联推荐 (同女优 / 同厂牌)")
+                                    .font(.footnote.bold())
+                                    .foregroundStyle(.secondary)
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 10) {
+                                        ForEach(relatedMovies) { rel in
+                                            Button {
+                                                metadata = rel
+                                                Task {
+                                                    relatedMovies = (try? await appModel.api.getRelatedMovies(number: rel.number, limit: 8)) ?? []
+                                                }
+                                            } label: {
+                                                VStack(alignment: .leading, spacing: 4) {
+                                                    if let cover = rel.coverUrl, let url = appModel.api.proxyScraperImageURL(rawUrl: cover) {
+                                                        AsyncImage(url: url) { phase in
+                                                            if let img = phase.image {
+                                                                img.resizable().scaledToFill()
+                                                            } else {
+                                                                Rectangle().fill(Color.secondary.opacity(0.15))
+                                                            }
+                                                        }
+                                                        .frame(width: 110, height: 75)
+                                                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                                                    }
+                                                    Text(rel.number)
+                                                        .font(.caption2.bold())
+                                                        .foregroundStyle(.primary)
+                                                    Text(rel.title)
+                                                        .font(.system(size: 10))
+                                                        .foregroundStyle(.secondary)
+                                                        .lineLimit(1)
+                                                        .frame(width: 110, alignment: .leading)
+                                                }
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle(metadata?.number ?? "影视百科详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+            .sheet(item: Binding<SampleImageItem?>(
+                get: { selectedSampleURL.map { SampleImageItem(url: $0) } },
+                set: { selectedSampleURL = $0?.url }
+            )) { item in
+                if let u = appModel.api.proxyScraperImageURL(rawUrl: item.url) {
+                    NavigationStack {
+                        ZStack {
+                            Color.black.ignoresSafeArea()
+                            AsyncImage(url: u) { phase in
+                                if let img = phase.image {
+                                    img.resizable().scaledToFit()
+                                } else {
+                                    ProgressView().tint(.white)
+                                }
+                            }
+                        }
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button("关闭") { selectedSampleURL = nil }
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                    }
+                }
+            }
+            .task {
+                await loadData()
+            }
+        }
+    }
+
+    private func loadData(force: Bool = false) async {
+        loading = true
+        errorMessage = nil
+        do {
+            var meta: MovieMetadata?
+            if let num = number, !force {
+                meta = try? await appModel.api.getMovieMetadata(number: num)
+            }
+            if meta == nil {
+                meta = try await appModel.api.scrapeAsset(
+                    assetId: assetId ?? "",
+                    fileName: fileName ?? number,
+                    remotePath: remotePath,
+                    force: force
+                )
+            }
+            metadata = meta
+            if let num = meta?.number {
+                relatedMovies = (try? await appModel.api.getRelatedMovies(number: num, limit: 8)) ?? []
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        loading = false
+    }
+}
+
+private struct SampleImageItem: Identifiable {
+    var id: String { url }
+    let url: String
+}

@@ -179,6 +179,8 @@ struct DirectoryView: View {
     @State private var showRemoteSearch = false
     @State private var openTask: Task<Void, Never>?
     @State private var openingEntryPath: String?
+    @State private var scraperMovieEntry: RemoteBrowserEntry?
+    @State private var albumGalleryDirPath: String?
 
     // 预计算与缓存的衍生状态，彻底消除每次视图刷新重复执行 O(N log N) 排序与 DateFormatter 解析
     @State private var cachedSortedEntries: [RemoteBrowserEntry] = []
@@ -313,6 +315,25 @@ struct DirectoryView: View {
         }
         .sheet(isPresented: $showRemoteSearch) {
             RemoteSearchView(root: root, parentPath: path)
+                .environmentObject(model)
+        }
+        .sheet(item: $scraperMovieEntry) { entry in
+            MovieDetailSheet(
+                assetId: entry.assetId,
+                fileName: entry.name,
+                remotePath: entry.path
+            ) { targetId in
+                if let target = entries.first(where: { $0.assetId == targetId }) {
+                    triggerOpen(target)
+                }
+            }
+            .environmentObject(model)
+        }
+        .sheet(item: Binding<AlbumPathItem?>(
+            get: { albumGalleryDirPath.map { AlbumPathItem(path: $0) } },
+            set: { albumGalleryDirPath = $0?.path }
+        )) { item in
+            AlbumGalleryView(dirPath: item.path)
                 .environmentObject(model)
         }
     }
@@ -649,6 +670,20 @@ struct DirectoryView: View {
 
     @ViewBuilder
     private func contextMenu(for entry: RemoteBrowserEntry) -> some View {
+        if entry.mediaType == "video" || entry.name.lowercased().hasSuffix(".mp4") || entry.name.lowercased().hasSuffix(".mkv") {
+            Button {
+                scraperMovieEntry = entry
+            } label: {
+                Label("刮削影视百科详情与剧照", systemImage: "sparkles")
+            }
+        }
+        if entry.isDirectory {
+            Button {
+                albumGalleryDirPath = entry.path
+            } label: {
+                Label("以相册模式浏览（套图聚拢）", systemImage: "photo.on.rectangle.angled")
+            }
+        }
         if let assetId = entry.assetId {
             Button {
                 Task { await toggleFavorite(assetId) }
@@ -1123,4 +1158,9 @@ struct DirectoryView: View {
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
         return formatter
     }()
+}
+
+private struct AlbumPathItem: Identifiable {
+    var id: String { path }
+    let path: String
 }

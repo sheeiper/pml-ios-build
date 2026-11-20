@@ -42,6 +42,7 @@ struct SettingsView: View {
                 }
             }
             mediaSourceLink
+            cleanupSection
             scanSection
             cacheSection
             historySection
@@ -86,6 +87,17 @@ struct SettingsView: View {
             }
             if let status, !status.connected, status.configured {
                 Text(status.message).font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private var cleanupSection: some View {
+        Section("治理与整理") {
+            NavigationLink {
+                CleanupView()
+                    .environmentObject(model)
+            } label: {
+                Label("治理与清理中心", systemImage: "shield.lefthalf.filled")
             }
         }
     }

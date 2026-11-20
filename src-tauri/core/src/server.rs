@@ -350,6 +350,7 @@ fn build_router(state: ServerState, static_dir: String) -> Router {
         .route("/api/telegram-proxy-media", get(proxy_telegram_media).head(proxy_telegram_media))
         .route("/api/telegram-user-stream/{chat_id}/{message_id}", get(proxy_telegram_user_stream).head(proxy_telegram_user_stream))
         .route("/api/telegram-user-thumb/{chat_id}/{message_id}", get(proxy_telegram_user_thumb).head(proxy_telegram_user_thumb))
+        .route("/api/scraper/proxy-image", get(proxy_scraper_image).head(proxy_scraper_image))
         .route("/api/{command}", post(dispatch_command))
         .route("/media/{token}", get(proxy_media).head(proxy_media))
         .route(
@@ -371,7 +372,7 @@ fn build_router(state: ServerState, static_dir: String) -> Router {
 async fn cache_headers(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path().to_owned();
     let mut response = next.run(request).await;
-    let cache_policy = if path.starts_with("/media/") || path.starts_with("/compatible/") || path.starts_with("/thumbnail/") || path.starts_with("/api/telegram-proxy-media") || path.starts_with("/api/telegram-user-stream/") {
+    let cache_policy = if path.starts_with("/media/") || path.starts_with("/compatible/") || path.starts_with("/thumbnail/") || path.starts_with("/api/telegram-proxy-media") || path.starts_with("/api/telegram-user-stream/") || path.starts_with("/api/scraper/proxy-image") {
         "private, max-age=300"
     } else if path.starts_with("/api/telegram-user-thumb/") {
         "public, max-age=86400"
@@ -401,6 +402,7 @@ async fn auth_middleware(
         || path == "/api/telegram-proxy-media"
         || path.starts_with("/api/telegram-user-stream/")
         || path.starts_with("/api/telegram-user-thumb/")
+        || path.starts_with("/api/scraper/proxy-image")
     {
         return next.run(request).await;
     }
@@ -648,6 +650,116 @@ async fn dispatch_command(
         "move_pending_item" => {
             let asset_id = payload.get("assetId").and_then(Value::as_str).unwrap_or("").to_owned();
             result_response(four_domains::move_pending_item(app.clone(), app.state::<MediaLibraryState>(), asset_id).await)
+        }
+        "scrape_asset" => {
+            let asset_id = payload.get("assetId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let file_name = payload.get("fileName").and_then(Value::as_str).unwrap_or("").to_owned();
+            let remote_path = payload.get("remotePath").and_then(Value::as_str).unwrap_or("").to_owned();
+            let force = payload.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let app = app.clone();
+            let res: Result<crate::jav_scraper::MovieMetadata, String> = async move {
+                let conn = four_domains::open_v2(&app)?;
+                if !remote_path.is_empty() && !crate::jav_scraper::is_path_whitelisted(&conn, &remote_path) {
+                    let whitelist = crate::jav_scraper::get_scrape_whitelist(&conn).unwrap_or_default();
+                    if !whitelist.is_empty() {
+                        return Err("当前文件所在目录不在刮削白名单中，已跳过自动刮削".to_string());
+                    }
+                }
+                let number = crate::jav_scraper::extract_jav_number(&file_name)
+                    .or_else(|| crate::jav_scraper::extract_jav_number(&asset_id))
+                    .ok_or_else(|| format!("无法从文件名【{}】提取有效日本商业番号", file_name))?;
+
+                if !force {
+                    if let Ok(Some(existing)) = crate::jav_scraper::get_movie_metadata(&conn, &number) {
+                        return Ok(existing);
+                    }
+                }
+                let mut meta = crate::jav_scraper::scrape_from_javdb(&number).await?;
+                meta.asset_id = if asset_id.is_empty() { None } else { Some(asset_id) };
+                crate::jav_scraper::save_movie_metadata(&conn, &meta)
+                    .map_err(|e| format!("保存元数据到数据库失败：{e}"))?;
+                Ok(meta)
+            }.await;
+            result_response(res)
+        }
+        "get_movie_metadata" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::get_movie_metadata(&conn, &number)
+                    .map_err(|e| format!("查询元数据失败：{e}"))
+            }).await
+        }
+        "list_movie_metadata" => {
+            let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(50) as u32;
+            let offset = payload.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::list_movie_metadata(&conn, limit, offset)
+                    .map_err(|e| format!("列出元数据失败：{e}"))
+            }).await
+        }
+        "get_related_movies" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(12) as u32;
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::get_related_movies(&conn, &number, limit)
+                    .map_err(|e| format!("获取关联作品失败：{e}"))
+            }).await
+        }
+        "get_scrape_whitelist" => {
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::get_scrape_whitelist(&conn)
+                    .map_err(|e| format!("获取白名单失败：{e}"))
+            }).await
+        }
+        "set_scrape_whitelist" => {
+            let paths = payload.get("paths")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let mut conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::set_scrape_whitelist(&mut conn, paths)
+                    .map_err(|e| format!("设置白名单失败：{e}"))
+            }).await
+        }
+        "get_album_details" => {
+            let dir_path = payload.get("dirPath").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::album_bundler::get_album_details(&conn, &dir_path)
+                    .map_err(|e| format!("获取画册详情失败：{e}"))
+            }).await
+        }
+        "scan_cleanup_items" => {
+            let root_path = payload.get("rootPath").and_then(Value::as_str).map(str::to_owned);
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::cleaner::scan_cleanup_items(&conn, root_path.as_deref())
+                    .map_err(|e| format!("扫描垃圾文件失败：{e}"))
+            }).await
+        }
+        "delete_cleanup_items" => {
+            let asset_ids = payload.get("assetIds")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let mut conn = four_domains::open_v2(&app)?;
+                crate::cleaner::delete_cleanup_items(&mut conn, &asset_ids)
+                    .map_err(|e| format!("删除垃圾文件失败：{e}"))
+            }).await
         }
         "list_domain_meta" => {
             let app = app.clone();
@@ -1130,23 +1242,6 @@ async fn dispatch_command(
                 .await,
             )
         }
-        "start_curate_move_job" => {
-            let args: media_library::StartCurateMoveJobRequest = match parse_args(&payload) {
-                Ok(value) => value,
-                Err(error) => return error,
-            };
-            result_response(media_library::start_curate_move_job(app.clone(), args).await)
-        }
-        "list_curate_move_jobs" => {
-            blocking_result_response(media_library::list_curate_move_jobs).await
-        }
-        "cancel_curate_move_job" => {
-            let job_id: String = match payload.get("jobId").and_then(Value::as_str) {
-                Some(value) => value.to_owned(),
-                None => return error_response("缺少 jobId 参数"),
-            };
-            blocking_result_response(move || media_library::cancel_curate_move_job(job_id)).await
-        }
         "open_raw_media_source" => {
             let remote_path: String = match payload.get("remotePath").and_then(Value::as_str) {
                 Some(value) => value.to_owned(),
@@ -1171,20 +1266,6 @@ async fn dispatch_command(
                     app.clone(),
                     app.state::<MediaLibraryState>(),
                     batch_path,
-                )
-                .await,
-            )
-        }
-        "curate_delete_file" => {
-            let file_path: String = match payload.get("filePath").and_then(Value::as_str) {
-                Some(value) => value.to_owned(),
-                None => return error_response("缺少 filePath 参数"),
-            };
-            result_response(
-                media_library::curate_delete_file(
-                    app.clone(),
-                    app.state::<MediaLibraryState>(),
-                    file_path,
                 )
                 .await,
             )
@@ -1940,6 +2021,66 @@ async fn proxy_telegram_user_thumb(
             builder = builder.header(k, v);
         }
     }
+    let body = Body::from_stream(upstream.bytes_stream());
+    builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[derive(Deserialize)]
+struct ScraperProxyQuery {
+    url: String,
+}
+
+async fn proxy_scraper_image(
+    AxumState(_context): AxumState<ServerState>,
+    Query(query): Query<ScraperProxyQuery>,
+) -> Response {
+    let raw_url = query.url.trim();
+    if !raw_url.starts_with("https://") && !raw_url.starts_with("http://") {
+        return (StatusCode::BAD_REQUEST, "Invalid URL").into_response();
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::limited(4))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let referer = if raw_url.contains("jdbstatic") || raw_url.contains("javdb") {
+        "https://javdb.com/"
+    } else if raw_url.contains("javbus") {
+        "https://www.javbus.com/"
+    } else if raw_url.contains("dmm") {
+        "https://www.dmm.co.jp/"
+    } else {
+        "https://google.com/"
+    };
+
+    let req = client.get(raw_url)
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .header(reqwest::header::REFERER, referer);
+
+    let upstream = match req.send().await {
+        Ok(resp) => resp,
+        Err(err) => return (StatusCode::BAD_GATEWAY, format!("Upstream request failed: {err}")).into_response(),
+    };
+
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+
+    for (k, v) in upstream.headers() {
+        if matches!(
+            k.as_str(),
+            "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
+        ) {
+            builder = builder.header(k, v);
+        }
+    }
+    builder = builder.header("access-control-allow-origin", "*");
+    builder = builder.header(CACHE_CONTROL, "public, max-age=86400");
+
     let body = Body::from_stream(upstream.bytes_stream());
     builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
