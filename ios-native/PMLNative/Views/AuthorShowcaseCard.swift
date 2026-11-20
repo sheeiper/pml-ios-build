@@ -95,11 +95,19 @@ struct AuthorShowcaseCard: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .task(id: author.id) {
+            // 微防抖：用户快速滑动视口时，离开视口的卡片 task 会在发起请求前被自动取消，避免排队塞爆网络连接池
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            guard !Task.isCancelled else { return }
+
             if let avatarId = author.avatarAssetId ?? author.coverAssetId {
-                await thumbs.image(assetId: avatarId, client: model.apiClient)
+                if thumbs.cachedImage(assetId: avatarId) == nil {
+                    await thumbs.image(assetId: avatarId, client: model.apiClient)
+                }
             }
             if let bannerId = author.bannerAssetId {
-                await thumbs.image(assetId: bannerId, client: model.apiClient)
+                if thumbs.cachedImage(assetId: bannerId) == nil {
+                    await thumbs.image(assetId: bannerId, client: model.apiClient)
+                }
             }
         }
     }

@@ -370,7 +370,18 @@ struct AuthorsView: View {
             if isHall {
                 authors = []
             } else {
-                authors = try await client.libraryAuthors(categoryId: selectedCategory?.id, filter: "all")
+                if let catId = selectedCategory?.id {
+                    let cached = CreatorDataCache.shared.getCached(categoryId: catId)
+                    if let cachedAuths = cached.authors, !cachedAuths.isEmpty {
+                        authors = cachedAuths
+                    }
+                }
+                let fetched = try await client.libraryAuthors(categoryId: selectedCategory?.id, filter: "all")
+                authors = fetched
+                if let catId = selectedCategory?.id {
+                    let cached = CreatorDataCache.shared.getCached(categoryId: catId)
+                    CreatorDataCache.shared.setCached(categoryId: catId, children: cached.children ?? [], authors: fetched)
+                }
             }
             if categories.isEmpty && authors.isEmpty {
                 viewAll = true

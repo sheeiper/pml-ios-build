@@ -170,6 +170,29 @@ struct AuthorAvatarView: View {
         _ = await thumbs.image(assetId: id, client: client)
     }
 }
+/// 创作者分类大厅二级内存高速缓存：Stale-While-Revalidate，点击分类瞬间 0ms 呈现，后台异步静默更新
+final class CreatorDataCache {
+    static let shared = CreatorDataCache()
+    private let lock = NSLock()
+    private var categoryChildren: [String: [LibraryCategory]] = [:]
+    private var categoryAuthors: [String: [LibraryAuthor]] = [:]
+
+    func getCached(categoryId: String?) -> (children: [LibraryCategory]?, authors: [LibraryAuthor]?) {
+        let key = categoryId ?? "__all__"
+        lock.lock()
+        defer { lock.unlock() }
+        return (categoryChildren[key], categoryAuthors[key])
+    }
+
+    func setCached(categoryId: String?, children: [LibraryCategory], authors: [LibraryAuthor]) {
+        let key = categoryId ?? "__all__"
+        lock.lock()
+        defer { lock.unlock() }
+        categoryChildren[key] = children
+        categoryAuthors[key] = authors
+    }
+}
+
 /// 单个分类页：子分类递归进入，作者列表在下方；系统返回键自动回到上一级。
 struct CreatorCategoryView: View {
     let category: LibraryCategory?
@@ -182,6 +205,13 @@ struct CreatorCategoryView: View {
     @State private var searchText = ""
     @State private var sortByMedia = true
     @AppStorage("pml.authors.cardLayout") private var cardLayout = "grid"
+
+    init(category: LibraryCategory?) {
+        self.category = category
+        let cached = CreatorDataCache.shared.getCached(categoryId: category?.id)
+        _children = State(initialValue: cached.children ?? [])
+        _authors = State(initialValue: cached.authors ?? [])
+    }
 
     private var displayedAuthors: [LibraryAuthor] {
         let filtered = searchText.isEmpty
@@ -301,6 +331,7 @@ struct CreatorCategoryView: View {
                 }
             }
         }
+        .refreshable { await load() }
         .task { await load() }
     }
 
@@ -319,13 +350,24 @@ struct CreatorCategoryView: View {
 
     private func load() async {
         guard let client = model.apiClient else { return }
-        loading = true
+        if children.isEmpty && authors.isEmpty {
+            loading = true
+        }
         errorText = ""
         do {
-            if let category {
-                children = try await client.libraryCategories(parentId: category.id, filter: "all")
-            }
-            authors = try await client.libraryAuthors(categoryId: category?.id, filter: "all")
+            async let fetchedChildren: [LibraryCategory] = {
+                if let category {
+                    return (try? await client.libraryCategories(parentId: category.id, filter: "all")) ?? []
+                } else {
+                    return []
+                }
+            }()
+            async let fetchedAuthors: [LibraryAuthor] = client.libraryAuthors(categoryId: category?.id, filter: "all")
+
+            let (newChildren, newAuthors) = try await (fetchedChildren, fetchedAuthors)
+            self.children = newChildren
+            self.authors = newAuthors
+            CreatorDataCache.shared.setCached(categoryId: category?.id, children: newChildren, authors: newAuthors)
         } catch {
             if !pmlIsCancellation(error) {
                 errorText = error.localizedDescription
