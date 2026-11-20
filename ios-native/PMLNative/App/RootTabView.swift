@@ -144,7 +144,7 @@ struct ProfilePlaceholderView: View {
 
 struct AppCenterView: View {
     private enum Destination: String, Identifiable {
-        case pending, history, favorites, duplicates, scan, settings, telegram
+        case movies, pending, history, favorites, duplicates, scan, settings, telegram
         var id: String { rawValue }
     }
 
@@ -154,6 +154,7 @@ struct AppCenterView: View {
     var body: some View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 12) {
+                tile("影视库", "film.stack.fill", .movies)
                 tile("Telegram 订阅", "paperplane.fill", .telegram)
                 tile("待整理", "tray.and.arrow.down.fill", .pending)
                 tile("播放记录", "clock.arrow.circlepath", .history)
@@ -168,6 +169,7 @@ struct AppCenterView: View {
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(item: $destination) { dest in
             switch dest {
+            case .movies: MovieLibraryView()
             case .telegram: TelegramFeedView()
             case .pending: PendingCurationView()
             case .history: HistoryView()

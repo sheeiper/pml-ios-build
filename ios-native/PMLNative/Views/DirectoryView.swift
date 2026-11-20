@@ -547,40 +547,6 @@ struct DirectoryView: View {
             }
             Spacer(minLength: 6)
 
-            if entry.mediaType == "video" || entry.name.lowercased().hasSuffix(".mp4") || entry.name.lowercased().hasSuffix(".mkv") {
-                Button {
-                    scraperMovieEntry = entry
-                } label: {
-                    HStack(spacing: 3) {
-                        Image(systemName: "sparkles")
-                        Text("百科")
-                    }
-                    .font(.caption2.weight(.bold))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3.5)
-                    .background(Color.purple.opacity(0.12), in: Capsule())
-                    .foregroundStyle(.purple)
-                    .overlay(Capsule().stroke(Color.purple.opacity(0.35), lineWidth: 0.8))
-                }
-                .buttonStyle(.borderless)
-            } else if entry.isDirectory {
-                Button {
-                    albumGalleryDirPath = entry.path
-                } label: {
-                    HStack(spacing: 3) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                        Text("画册")
-                    }
-                    .font(.caption2.weight(.bold))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3.5)
-                    .background(Color.blue.opacity(0.12), in: Capsule())
-                    .foregroundStyle(.blue)
-                    .overlay(Capsule().stroke(Color.blue.opacity(0.35), lineWidth: 0.8))
-                }
-                .buttonStyle(.borderless)
-            }
-
             if entry.isDirectory {
                 Image(systemName: "chevron.right")
                     .font(.caption)
@@ -620,65 +586,24 @@ struct DirectoryView: View {
 
     @ViewBuilder
     private func cell(for entry: RemoteBrowserEntry) -> some View {
-        ZStack(alignment: .topTrailing) {
-            if entry.isDirectory {
-                NavigationLink {
-                    DirectoryView(root: root, path: entry.path, domain: domain)
-                } label: {
-                    cellBody(entry)
-                }
-                .id("dir-\(entry.path)")
-                .buttonStyle(.plain)
-                .contextMenu { contextMenu(for: entry) }
-            } else {
-                Button {
-                    triggerOpen(entry)
-                } label: {
-                    cellBody(entry)
-                }
-                .id("file-\(entry.path)")
-                .buttonStyle(.plain)
-                .contextMenu { contextMenu(for: entry) }
+        if entry.isDirectory {
+            NavigationLink {
+                DirectoryView(root: root, path: entry.path, domain: domain)
+            } label: {
+                cellBody(entry)
             }
-
-            // 浮动快捷操作按钮
-            if entry.mediaType == "video" || entry.name.lowercased().hasSuffix(".mp4") || entry.name.lowercased().hasSuffix(".mkv") {
-                Button {
-                    scraperMovieEntry = entry
-                } label: {
-                    HStack(spacing: 2) {
-                        Image(systemName: "sparkles")
-                        Text("百科")
-                    }
-                    .font(.system(size: 10, weight: .bold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .foregroundStyle(.purple)
-                    .overlay(Capsule().stroke(Color.purple.opacity(0.4), lineWidth: 0.8))
-                    .shadow(color: .purple.opacity(0.25), radius: 3, y: 1)
-                }
-                .buttonStyle(.borderless)
-                .padding(6)
-            } else if entry.isDirectory {
-                Button {
-                    albumGalleryDirPath = entry.path
-                } label: {
-                    HStack(spacing: 2) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                        Text("画册")
-                    }
-                    .font(.system(size: 10, weight: .bold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .foregroundStyle(.blue)
-                    .overlay(Capsule().stroke(Color.blue.opacity(0.4), lineWidth: 0.8))
-                    .shadow(color: .blue.opacity(0.2), radius: 3, y: 1)
-                }
-                .buttonStyle(.borderless)
-                .padding(6)
+            .id("dir-\(entry.path)")
+            .buttonStyle(.plain)
+            .contextMenu { contextMenu(for: entry) }
+        } else {
+            Button {
+                triggerOpen(entry)
+            } label: {
+                cellBody(entry)
             }
+            .id("file-\(entry.path)")
+            .buttonStyle(.plain)
+            .contextMenu { contextMenu(for: entry) }
         }
     }
 

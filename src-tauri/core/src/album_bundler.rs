@@ -28,17 +28,19 @@ pub fn get_album_details(conn: &Connection, dir_path: &str) -> Result<AlbumInfo,
     let title = clean_dir.rsplit_once('/').map(|(_, name)| name).unwrap_or(clean_dir).to_string();
     let dir_with_slash = format!("{}/", clean_dir);
     let prefix_like = format!("{}%", dir_with_slash);
+    let suffix_exact_like = format!("%{}", clean_dir);
+    let suffix_sub_like = format!("%{}%", dir_with_slash);
 
     let mut stmt = conn.prepare(
         "SELECT id, file_name, remote_path, size_bytes
          FROM assets
-         WHERE (parent_path = ?1 OR parent_path = ?2 OR remote_path LIKE ?3)
-           AND (media_type = 'image' OR media_type = 'comicPage' OR file_name LIKE '%.jpg' OR file_name LIKE '%.jpeg' OR file_name LIKE '%.png' OR file_name LIKE '%.webp')
+         WHERE (parent_path = ?1 OR parent_path = ?2 OR remote_path LIKE ?3 OR parent_path LIKE ?4 OR remote_path LIKE ?5)
+           AND (media_type = 'image' OR media_type = 'comicPage' OR file_name LIKE '%.jpg' OR file_name LIKE '%.jpeg' OR file_name LIKE '%.png' OR file_name LIKE '%.webp' OR file_name LIKE '%.gif')
            AND missing = 0
          ORDER BY remote_path ASC, file_name ASC"
     )?;
 
-    let rows = stmt.query_map(params![clean_dir, dir_with_slash, prefix_like], |row| {
+    let rows = stmt.query_map(params![clean_dir, dir_with_slash, prefix_like, suffix_exact_like, suffix_sub_like], |row| {
         Ok(AlbumItem {
             asset_id: row.get(0)?,
             file_name: row.get(1)?,
