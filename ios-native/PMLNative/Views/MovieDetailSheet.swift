@@ -70,29 +70,10 @@ public struct MovieDetailSheet: View {
                     } else if let meta = metadata {
                         // Hero section
                         HStack(alignment: .top, spacing: 16) {
-                            if let cover = meta.coverUrl, let url = appModel.proxyScraperImageURL(rawUrl: cover) {
-                                AsyncImage(url: url) { phase in
-                                    switch phase {
-                                    case .success(let image):
-                                        image
-                                            .resizable()
-                                            .scaledToFill()
-                                    case .failure:
-                                        Rectangle()
-                                            .fill(Color.secondary.opacity(0.15))
-                                            .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
-                                    case .empty:
-                                        Rectangle()
-                                            .fill(Color.secondary.opacity(0.1))
-                                            .overlay(ProgressView())
-                                    @unknown default:
-                                        EmptyView()
-                                    }
-                                }
+                            CachedImageView(url: meta.coverUrl.flatMap { appModel.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fill, minHeight: 195, maxPixel: 900)
                                 .frame(width: 140, height: 195)
                                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                 .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 3)
-                            }
 
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack(spacing: 6) {
@@ -244,19 +225,8 @@ public struct MovieDetailSheet: View {
                                                 Button {
                                                     selectedSampleURL = sample
                                                 } label: {
-                                                    AsyncImage(url: url) { phase in
-                                                        switch phase {
-                                                        case .success(let image):
-                                                            image
-                                                                .resizable()
-                                                                .scaledToFill()
-                                                        default:
-                                                            Rectangle()
-                                                                .fill(Color.secondary.opacity(0.15))
-                                                                .overlay(ProgressView())
-                                                        }
-                                                    }
-                                                    .frame(width: 140, height: 95)
+                                                    CachedImageView(url: url, contentMode: .fill, minHeight: 95, maxPixel: 480)
+                                                        .frame(width: 140, height: 95)
                                                     .clipShape(RoundedRectangle(cornerRadius: 6))
                                                 }
                                                 .buttonStyle(.plain)
@@ -286,14 +256,8 @@ public struct MovieDetailSheet: View {
                                             } label: {
                                                 VStack(alignment: .leading, spacing: 4) {
                                                     if let cover = rel.coverUrl, let url = appModel.proxyScraperImageURL(rawUrl: cover) {
-                                                        AsyncImage(url: url) { phase in
-                                                            if let img = phase.image {
-                                                                img.resizable().scaledToFill()
-                                                            } else {
-                                                                Rectangle().fill(Color.secondary.opacity(0.15))
-                                                            }
-                                                        }
-                                                        .frame(width: 110, height: 75)
+                                                        CachedImageView(url: url, contentMode: .fill, minHeight: 75, maxPixel: 360)
+                                                            .frame(width: 110, height: 75)
                                                         .clipShape(RoundedRectangle(cornerRadius: 6))
                                                     }
                                                     Text(rel.number)
@@ -331,13 +295,7 @@ public struct MovieDetailSheet: View {
                     NavigationStack {
                         ZStack {
                             Color.black.ignoresSafeArea()
-                            AsyncImage(url: u) { phase in
-                                if let img = phase.image {
-                                    img.resizable().scaledToFit()
-                                } else {
-                                    ProgressView().tint(.white)
-                                }
-                            }
+                            CachedImageView(url: u, contentMode: .fit, minHeight: 360, maxPixel: 1800)
                         }
                         .toolbar {
                             ToolbarItem(placement: .topBarTrailing) {
@@ -368,18 +326,20 @@ public struct MovieDetailSheet: View {
             if let num = requestedNumber, !force {
                 meta = try? await client.getMovieMetadata(number: num)
             }
-            if meta == nil {
+            if meta == nil, force {
                 meta = try await client.scrapeAsset(
                     assetId: assetId ?? "",
                     fileName: fileName ?? requestedNumber,
                     remotePath: remotePath,
                     number: requestedNumber,
-                    force: force
+                    force: true
                 )
             }
             metadata = meta
             if let num = meta?.number {
                 relatedMovies = (try? await client.getRelatedMovies(number: num, limit: 8)) ?? []
+            } else if !force {
+                errorMessage = "暂无已验证元数据；点击刷新才会执行一次手动刮削。"
             }
         } catch {
             errorMessage = error.localizedDescription

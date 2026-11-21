@@ -70,7 +70,8 @@ struct ShortVideosView: View {
     @State private var preloadedID: String?
     @State private var preloadedItem: AVPlayerItem?
     @State private var activateGeneration = 0
-    @State private var retriedDirectID: String?
+    @State private var failedDirectID: String?
+    @State private var directStatusObserver: NSKeyValueObservation?
     @State private var lastSavedID: String?
     @State private var lastSavedAt: Double = 0
     @State private var restoringProgressID: String?
@@ -138,6 +139,8 @@ struct ShortVideosView: View {
         .onChange(of: scope) { _, _ in Task { await resetAndReload() } }
         .onChange(of: durationFilter) { _, _ in Task { await resetAndReload() } }
         .onDisappear {
+            directStatusObserver?.invalidate()
+            directStatusObserver = nil
             saveProgress(force: true)
             if let timeObserver { player.removeTimeObserver(timeObserver) }
             timeObserver = nil
@@ -852,21 +855,19 @@ struct ShortVideosView: View {
 
     @MainActor
     private func observeDirectExpiry(asset: LibraryAsset, generation: Int) {
-        let id = asset.id
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            guard generation == activateGeneration, currentAsset?.id == id else { return }
-            guard player.currentItem?.status == .failed, retriedDirectID != id else { return }
-            retriedDirectID = id
-            guard let source = await model.playbackSource(assetId: id, remotePath: asset.remotePath),
-                  source.label?.contains("直连") == true else { return }
-            guard generation == activateGeneration, currentAsset?.id == id else { return }
-            let resume = progress
-            player.replaceCurrentItem(with: makeItem(source.url))
-            player.isMuted = muted
-            player.play()
-            if resume > 1 {
-                await player.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
+        directStatusObserver?.invalidate()
+        failedDirectID = nil
+        guard let item = player.currentItem else { return }
+        directStatusObserver = item.observe(\.status, options: [.initial, .new]) { observed, _ in
+            DispatchQueue.main.async {
+                guard generation == activateGeneration, currentAsset?.id == asset.id,
+                      observed === player.currentItem, observed.status == .failed,
+                      failedDirectID != asset.id else { return }
+                failedDirectID = asset.id
+                player.pause()
+                isPlaying = false
+                isBuffering = false
+                model.playbackError = DirectPlaybackPolicy.failureMessage
             }
         }
     }
@@ -891,10 +892,8 @@ struct ShortVideosView: View {
     }
 
     private func makeItem(_ url: URL) -> AVPlayerItem {
-        let headers = model.playbackHeaders(for: url)
-        guard !headers.isEmpty else { return AVPlayerItem(url: url) }
-        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
-        return AVPlayerItem(asset: asset)
+        // Source already passed DirectPlaybackPolicy; never forward API credentials.
+        AVPlayerItem(url: url)
     }
 
     @MainActor

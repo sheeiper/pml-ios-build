@@ -1772,10 +1772,6 @@ struct PendingCurationView: View {
             Task {
                 if let source = await model.playbackSource(assetId: item.entry.assetId, remotePath: item.entry.path) {
                     activeVideoTarget = PlayableVideoTarget(url: source.url, title: item.entry.name, fallbackURL: source.fallbackURL)
-                } else if let client = model.apiClient,
-                          let raw = try? await client.rawMediaURL(remotePath: item.entry.path) {
-                    let fb = await model.fallbackMediaURL(assetId: item.entry.assetId)
-                    activeVideoTarget = PlayableVideoTarget(url: raw, title: item.entry.name, fallbackURL: fb)
                 }
             }
             return

@@ -232,7 +232,7 @@ struct ComicFolderReaderView: View {
             return
         }
         guard let assetId = entry.assetId else { return }
-        if let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) {
+        if let source = await model.imageSource(assetId: assetId, remotePath: entry.path) {
             urls[entry.path] = source.url
         }
     }

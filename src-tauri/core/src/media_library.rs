@@ -39,6 +39,9 @@ use tokio::{
 use url::Url;
 use zip::ZipArchive;
 
+mod direct_playback;
+pub use direct_playback::resolve_direct_playback;
+
 // This is a guard against malformed/cyclic remote directory listings, not a
 // normal library-size limit. The configured media root already contains more
 // than 50,000 assets, so that old value made a valid full scan fail.

@@ -182,7 +182,7 @@ struct ImageViewer: View {
             return existing
         }
         guard let assetId = entry.assetId,
-              let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else { return nil }
+              let source = await model.imageSource(assetId: assetId, remotePath: entry.path) else { return nil }
         urls[entry.id] = source.url
         return source.url
     }

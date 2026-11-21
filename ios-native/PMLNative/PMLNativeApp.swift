@@ -44,6 +44,14 @@ struct PMLNativeApp: App {
                         .zIndex(99999)
                 }
             }
+            .alert("无法直链播放", isPresented: Binding(
+                get: { model.playbackError != nil },
+                set: { if !$0 { model.playbackError = nil } }
+            )) {
+                Button("知道了", role: .cancel) { model.playbackError = nil }
+            } message: {
+                Text(model.playbackError ?? DirectPlaybackPolicy.failureMessage)
+            }
         }
     }
 }

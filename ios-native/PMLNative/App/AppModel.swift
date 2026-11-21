@@ -8,6 +8,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var coreError: String?
     @Published private(set) var settings: RuntimeSettings
     @Published private(set) var settingsRevision = 0
+    @Published var playbackError: String?
 
     init(corePort: Int32, coreError: String?, settings: RuntimeSettings = .load()) {
         self.corePort = corePort > 0 ? Int(corePort) : nil
@@ -105,70 +106,45 @@ final class AppModel: ObservableObject {
 
     // MARK: - 播放地址解析
 
-    /// 服务器模式优先走 AList `/d`。视频经本地代理转发 Range；若直链映射失败则回退服务器代理兜底。
+    /// 视频一律严格直链（包括旧 relay 设置、本地模式及只有 assetId 的影视入口）。
+    /// 控制面只返回 AList raw_url；不注册 /media，不预读视频，不通过 LocalMediaProxy。
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
-        if settings.mode == .server {
-            // relay 明确绕过 AList 直连；direct/auto 才尝试映射。
-            if settings.routeMode == .relay {
-                if let client = apiClient, let assetId,
-                   let url = try? await client.mediaSourceURL(assetId: assetId) {
-                    return PlaybackSource(url: url, fallbackURL: nil, label: "服务器中转")
-                }
+        playbackError = nil
+        guard let client = apiClient else {
+            playbackError = "无法连接直链解析服务；不会使用服务器中转"
+            return nil
+        }
+        do {
+            let url = try await client.directPlaybackURL(assetId: assetId, remotePath: remotePath)
+            guard allowsDirectPlayback(url) else {
+                playbackError = "解析结果不是安全的媒体直链，已拒绝服务器中转"
                 return nil
             }
-            var direct: URL?
-            if let remotePath { direct = alistDirectURL(remotePath: remotePath) }
-            if let direct {
-                var fallback: URL? = nil
-                if let client = apiClient, let assetId {
-                    fallback = try? await client.mediaSourceURL(assetId: assetId)
-                }
-                if let remotePath, Self.isVideoPath(remotePath) {
-                    if let proxied = await LocalMediaProxy.shared.register(directURL: direct) {
-                        return PlaybackSource(url: proxied, fallbackURL: fallback, label: "AList 直连")
-                    }
-                }
-                // auto/direct both use direct URL; direct is intentionally not preflighted
-                // because probing consumes a Range and breaks some signed CDN URLs.
-                return PlaybackSource(url: direct, fallbackURL: fallback, label: "AList 直连")
-            }
-            // 兜底：如果 remotePath 缺失或 AList 映射失败，向服务端申请中转流地址
-            if let client = apiClient, let assetId,
-               let url = try? await client.mediaSourceURL(assetId: assetId) {
-                return PlaybackSource(url: url, fallbackURL: nil, label: "服务器中转")
+            return PlaybackSource(url: url, fallbackURL: nil, label: "严格直连")
+        } catch {
+            if !Task.isCancelled {
+                playbackError = "直链解析失败，请检查服务端 AList 配置及存储登录状态；不会回退中转。"
             }
             return nil
         }
+    }
 
-        guard let client = localClient, let assetId,
-              let url = try? await client.mediaSourceURL(assetId: assetId) else {
-            return nil
+    func allowsDirectPlayback(_ url: URL) -> Bool {
+        DirectPlaybackPolicy.allows(url, serverURL: settings.normalizedServerURL, coreURL: coreBaseURL)
+    }
+
+    /// 兼容旧播放器调用；视频请求绝不附带应用 Basic Auth 或 AList 管理凭证。
+    func playbackHeaders(for url: URL) -> [String: String] { [:] }
+
+    /// 图片/漫画保留原有映射与服务器媒体行为，与视频严格直链策略隔离。
+    func imageSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
+        if settings.mode == .server, settings.routeMode != .relay,
+           let remotePath, let direct = alistDirectURL(remotePath: remotePath) {
+            return PlaybackSource(url: direct, fallbackURL: nil, label: nil)
         }
+        guard let client = apiClient, let assetId,
+              let url = try? await client.mediaSourceURL(assetId: assetId) else { return nil }
         return PlaybackSource(url: url, fallbackURL: nil, label: nil)
-    }
-
-    private static func isVideoPath(_ path: String) -> Bool {
-        let ext = (path as NSString).pathExtension.lowercased()
-        return ["mp4", "mov", "m4v", "webm", "mkv", "avi", "ts", "m2ts"].contains(ext)
-    }
-    /// AVPlayer 访问服务器 /media 时补 Basic 认证；直连 AList/CDN 不加，避免泄露。
-    func playbackHeaders(for url: URL) -> [String: String] {
-        guard settings.mode == .server,
-              let base = settings.normalizedServerURL,
-              let targetHost = url.host,
-              let baseHost = base.host,
-              targetHost == baseHost else { return [:] }
-        let targetPort = url.port ?? (url.scheme == "https" ? 443 : 80)
-        let basePort = base.port ?? (base.scheme == "https" ? 443 : 80)
-        guard targetPort == basePort else { return [:] }
-        let raw = "\(settings.serverUser):\(settings.serverPassword)"
-        let token = Data(raw.utf8).base64EncodedString()
-        return ["Authorization": "Basic \(token)"]
-    }
-    /// 媒体在直连失效时回退到服务器 CD2 WebDAV 中转流
-    func fallbackMediaURL(assetId: String?) async -> URL? {
-        guard let client = apiClient, let assetId else { return nil }
-        return try? await client.mediaSourceURL(assetId: assetId)
     }
 
     func proxyScraperImageURL(rawUrl: String) -> URL? {
@@ -197,18 +173,4 @@ final class AppModel: ObservableObject {
         return URL(string: base.absoluteString + "/d" + encoded)
     }
 
-    /// 预检直链：跟随 302 后能拿到 200/206 才使用，避免播放器黑屏。
-    private func preflight(_ url: URL) async -> Bool {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
-        request.timeoutInterval = 6
-        do {
-            let (_, response) = try await APISession.shared.session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return false }
-            return http.statusCode == 200 || http.statusCode == 206
-        } catch {
-            return false
-        }
-    }
 }

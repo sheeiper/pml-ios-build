@@ -3,8 +3,6 @@ import AVKit
 import SwiftUI
 import UIKit
 
-private let pmlAVURLAssetHTTPHeaderFieldsKey = "AVURLAssetHTTPHeaderFieldsKey"
-
 struct VideoPlaylistItem: Identifiable {
     let id: String
     let title: String
@@ -26,9 +24,8 @@ struct GestureVideoPlayerSheet: View {
     @State private var currentAssetId: String?
     @State private var currentIndex: Int?
     @State private var accelLabel: String?
-    @State private var currentFallbackURL: URL?
     @State private var currentSourceLabel: String?
-    @State private var usedFallback = false
+    @State private var playbackFailed = false
 
     @State private var isPlaying = false
     @State private var currentTime: Double = 0
@@ -107,7 +104,7 @@ struct GestureVideoPlayerSheet: View {
         _currentTitle = State(initialValue: title)
         _currentAssetId = State(initialValue: assetId)
         _currentIndex = State(initialValue: playlistIndex)
-        _currentFallbackURL = State(initialValue: fallbackURL)
+        // fallbackURL is retained only for source compatibility; never used for video.
         _currentSourceLabel = State(initialValue: sourceLabel)
         _accelLabel = State(initialValue: sourceLabel)
     }
@@ -251,7 +248,11 @@ struct GestureVideoPlayerSheet: View {
                             } label: {
                                 Label(muted ? "取消静音" : "静音", systemImage: muted ? "speaker.wave.2" : "speaker.slash")
                             }
-                            Button { showSystemPlayer = true } label: {
+                            Button {
+                                if !playbackFailed && model.allowsDirectPlayback(currentURL) {
+                                    showSystemPlayer = true
+                                } else { alistExpiredWarning = DirectPlaybackPolicy.failureMessage }
+                            } label: {
                                 Label("系统播放器", systemImage: "rectangle.inset.filled.and.person.filled")
                             }
                         } label: {
@@ -305,7 +306,7 @@ struct GestureVideoPlayerSheet: View {
                         Text(warning)
                             .font(.footnote.weight(.medium))
                             .foregroundStyle(.white)
-                            .lineLimit(2)
+                            .lineLimit(5)
                         Spacer()
                         Button {
                             withAnimation { alistExpiredWarning = nil }
@@ -669,13 +670,8 @@ struct GestureVideoPlayerSheet: View {
     }
 
     private func makePlayerItem(_ url: URL) -> AVPlayerItem {
-        let headers = model.playbackHeaders(for: url)
-        let asset: AVURLAsset
-        if headers.isEmpty {
-            asset = AVURLAsset(url: url)
-        } else {
-            asset = AVURLAsset(url: url, options: [pmlAVURLAssetHTTPHeaderFieldsKey: headers])
-        }
+        // Never attach application or provider credentials to media/CDN requests.
+        let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
         let isMOV = url.pathExtension.lowercased() == "mov"
         // 赋予充足的前向预缓冲时长（MOV 取 6 秒，其余高码率/大视频取 30 秒），提供充足吸震区，根治千兆局域网播放时的间歇性卡顿
@@ -692,6 +688,12 @@ struct GestureVideoPlayerSheet: View {
         isScrubbing = false
         pendingSeek = nil
 
+        playbackFailed = false
+        guard model.allowsDirectPlayback(currentURL) else {
+            player.replaceCurrentItem(with: nil)
+            handlePlaybackFailure()
+            return
+        }
         let item = makePlayerItem(currentURL)
         observeItemStatus(item)
         player.automaticallyWaitsToMinimizeStalling = true
@@ -705,7 +707,6 @@ struct GestureVideoPlayerSheet: View {
         resumeChecked = !trackResume
         lastSavedAt = 0
         didReachEnd = false
-        usedFallback = false
         subtitleTracks = []
         subtitleCues = []
         subtitleTitle = nil
@@ -720,9 +721,7 @@ struct GestureVideoPlayerSheet: View {
                 await checkResume(expectedAssetId: loadingAssetId, initialSeekID: initialSeekID)
             }
         }
-        Task { await refreshAccelLabel() }
         Task { await loadSubtitles() }
-        prefetchAdjacentEpisode()
     }
 
     @MainActor
@@ -740,43 +739,6 @@ struct GestureVideoPlayerSheet: View {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 6_000_000_000)
             showResumeToast = false
-        }
-    }
-
-    /// 预热下一集的本地代理流与重定向，让切换上下集更丝滑。
-    private func prefetchAdjacentEpisode() {
-        guard let index = resolvedIndex else { return }
-        for offset in [1, -1] {
-            let neighborIdx = index + offset
-            guard playlist.indices.contains(neighborIdx) else { continue }
-            let neighbor = playlist[neighborIdx]
-            guard let remotePath = neighbor.remotePath,
-                  let direct = model.alistDirectURL(remotePath: remotePath) else { continue }
-            Task {
-                _ = await LocalMediaProxy.shared.register(directURL: direct)
-            }
-        }
-    }
-
-    @MainActor
-    private func refreshAccelLabel() async {
-        guard let currentAssetId, let client = model.apiClient else {
-            accelLabel = nil
-            return
-        }
-        guard accelLabel == nil else { return }
-        guard let info = try? await client.mediaStreamInfo(assetId: currentAssetId) else {
-            accelLabel = nil
-            return
-        }
-        if info.accelerated {
-            accelLabel = "115 直连"
-        } else if info.provider == "cd2" {
-            accelLabel = "CD2 中转"
-        } else if info.provider == "alist" {
-            accelLabel = "AList 中转"
-        } else {
-            accelLabel = nil
         }
     }
 
@@ -832,16 +794,16 @@ struct GestureVideoPlayerSheet: View {
         isBuffering = true
 
         guard let source = await model.playbackSource(assetId: assetId, remotePath: item.remotePath) else {
-            isBuffering = false
-            showHUD("获取播放地址失败", seconds: 2)
+            guard currentAssetId == assetId else { return }
+            player.replaceCurrentItem(with: nil)
+            playbackFailed = false
+            handlePlaybackFailure()
             return
         }
         guard currentAssetId == assetId else { return }
         currentURL = source.url
-        currentFallbackURL = source.fallbackURL
         currentSourceLabel = source.label
         accelLabel = source.label
-        usedFallback = false
         loadCurrent(trackResume: false)
     }
 
@@ -888,6 +850,10 @@ struct GestureVideoPlayerSheet: View {
     }
 
     private func togglePlay() {
+        guard !playbackFailed else {
+            alistExpiredWarning = DirectPlaybackPolicy.failureMessage
+            return
+        }
         if isPlaying && player.timeControlStatus != .paused {
             player.pause()
             isPlaying = false
@@ -1125,7 +1091,7 @@ struct GestureVideoPlayerSheet: View {
                     duration = seconds
                 }
             }
-            if player.currentItem?.status == .failed, !usedFallback {
+            if player.currentItem?.status == .failed, !playbackFailed {
                 handlePlaybackFailure()
             }
             isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
@@ -1140,7 +1106,7 @@ struct GestureVideoPlayerSheet: View {
         itemStatusObserver?.invalidate()
         itemStatusObserver = item.observe(\.status, options: [.initial, .new]) { [self] observedItem, _ in
             DispatchQueue.main.async {
-                if observedItem.status == .failed {
+                if observedItem === player.currentItem, observedItem.status == .failed {
                     handlePlaybackFailure()
                 }
             }
@@ -1149,43 +1115,19 @@ struct GestureVideoPlayerSheet: View {
 
     @MainActor
     private func handlePlaybackFailure() {
-        guard !usedFallback else { return }
-        usedFallback = true
-        let generation = playbackGeneration
-        let target = currentTime
-        let wasPlaying = isPlaying
-        withAnimation {
-            alistExpiredWarning = "⚠️ 视频流连接断开，正在切换备用流..."
-        }
-        Task { @MainActor in
-            if currentURL.host == "127.0.0.1" || currentURL.host == "localhost" {
-                LocalMediaProxy.shared.reset()
-            }
-            var fallback = currentFallbackURL
-            if fallback == nil, let assetId = currentAssetId {
-                fallback = await model.fallbackMediaURL(assetId: assetId)
-            }
-            guard generation == playbackGeneration, currentAssetId != nil else { return }
-            guard let fallback else {
-                usedFallback = false
-                withAnimation {
-                    alistExpiredWarning = "⚠️ 视频源不可用，且没有可用的服务器备用流"
-                }
-                return
-            }
-            let newItem = makePlayerItem(fallback)
-            observeItemStatus(newItem)
-            guard generation == playbackGeneration else { return }
-            currentURL = fallback
-            player.replaceCurrentItem(with: newItem)
-            accelLabel = "服务器中转"
-            if await waitUntilReady() {
-                requestSeek(to: target, resume: wasPlaying, debounce: false)
-                withAnimation {
-                    alistExpiredWarning = "⚠️ 已切换为服务器中转播放"
-                }
-            }
-        }
+        guard !playbackFailed else { return }
+        playbackFailed = true
+        seekTask?.cancel()
+        seekWatchdog?.cancel()
+        stallRecoveryTask?.cancel()
+        player.pause()
+        isPlaying = false
+        isSeeking = false
+        isBuffering = false
+        controlsVisible = true
+        controlsTask?.cancel()
+        // No alternate URL request, retry loop, proxy reset, or fallback registration.
+        alistExpiredWarning = DirectPlaybackPolicy.failureMessage
     }
 
     private func saveProgress() {

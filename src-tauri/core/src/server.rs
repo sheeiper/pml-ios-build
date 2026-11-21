@@ -20,7 +20,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
 use futures_util::StreamExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -33,6 +33,37 @@ use crate::AppHandle;
 use tower_http::services::ServeDir;
 
 use crate::media_library::{self, MediaLibraryState};
+
+fn validate_http_url(value: &str) -> bool {
+    matches!(url::Url::parse(value), Ok(parsed) if matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some())
+}
+
+fn strict_string_array(value: &Value, field: &str) -> Result<Vec<String>, String> {
+    let array = value.as_array().ok_or_else(|| format!("{field}必须是字符串数组"))?;
+    array.iter().map(|item| item.as_str().map(str::to_owned).ok_or_else(|| format!("{field}必须是字符串数组"))).collect()
+}
+
+fn optional_string(payload: &Value, key: &str) -> Result<Option<String>, String> {
+    match payload.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.to_owned())),
+        Some(_) => Err(format!("{key}必须是字符串或null")),
+    }
+}
+
+#[cfg(test)]
+mod metadata_validation_tests {
+    use super::*;
+    #[test]
+    fn validates_urls_and_arrays() {
+        assert!(validate_http_url("https://example.com/a.jpg"));
+        assert!(!validate_http_url("file:///tmp/a.jpg"));
+        assert!(strict_string_array(&serde_json::json!(["a"]), "actors").is_ok());
+        assert!(strict_string_array(&serde_json::json!([1]), "actors").is_err());
+        assert!(optional_string(&serde_json::json!({"maker": null}), "maker").unwrap().is_none());
+        assert!(optional_string(&serde_json::json!({"maker": 1}), "maker").is_err());
+    }
+}
 
 #[derive(Clone)]
 struct ServerState {
@@ -351,7 +382,8 @@ fn build_router(state: ServerState, static_dir: String) -> Router {
         .route("/api/telegram-user-stream/{chat_id}/{message_id}", get(proxy_telegram_user_stream).head(proxy_telegram_user_stream))
         .route("/api/telegram-user-thumb/{chat_id}/{message_id}", get(proxy_telegram_user_thumb).head(proxy_telegram_user_thumb))
         .route("/api/scraper/proxy-image", get(proxy_scraper_image).head(proxy_scraper_image))
-        .route("/api/{command}", post(dispatch_command))
+        // A 2 MiB avatar expands to ~2.7 MiB base64; keep a bounded JSON envelope.
+        .route("/api/{command}", post(dispatch_command).layer(axum::extract::DefaultBodyLimit::max(3 * 1024 * 1024)))
         .route("/media/{token}", get(proxy_media).head(proxy_media))
         .route(
             "/compatible/{token}",
@@ -699,7 +731,14 @@ async fn dispatch_command(
                         return Ok(existing);
                     }
                 }
-                let mut meta = crate::jav_scraper::scrape_movie_metadata(&number).await?;
+                if force { crate::jav_scraper::invalidate_metadata_cache(&number); }
+                let mut meta = match crate::jav_scraper::scrape_movie_metadata(&number).await {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        conn.execute("INSERT INTO scrape_failures(number,error,updated_at) VALUES(?1,?2,?3) ON CONFLICT(number) DO UPDATE SET error=excluded.error,updated_at=excluded.updated_at", rusqlite::params![number, error, chrono::Utc::now().timestamp()]).map_err(|e| format!("保存失败原因失败：{e}"))?;
+                        return Err(error);
+                    }
+                };
                 meta.asset_id = if asset_id.is_empty() { None } else { Some(asset_id) };
                 crate::jav_scraper::save_movie_metadata(&conn, &meta)
                     .map_err(|e| format!("保存元数据到数据库失败：{e}"))?;
@@ -729,6 +768,13 @@ async fn dispatch_command(
                 crate::jav_scraper::start_batch_scrape_engine(p.to_string_lossy().to_string())
             }).await
         }
+        "start_batch_scrape_failed" => {
+            let app = app.clone();
+            blocking_result_response(move || {
+                let p = four_domains::v2_path(&app)?;
+                crate::jav_scraper::start_failed_batch_scrape_engine(p.to_string_lossy().to_string())
+            }).await
+        }
         "pause_batch_scrape" => {
             crate::jav_scraper::pause_batch_scrape();
             result_response(Ok(crate::jav_scraper::get_batch_scrape_progress()))
@@ -741,6 +787,41 @@ async fn dispatch_command(
             crate::jav_scraper::stop_batch_scrape();
             result_response(Ok(crate::jav_scraper::get_batch_scrape_progress()))
         }
+        "update_movie_metadata" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+            let title = payload.get("title").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+            let actors_value = payload.get("actors").ok_or_else(|| "actors必须是字符串数组".to_owned());
+            let actors = match actors_value.and_then(|value| strict_string_array(value, "actors")) {
+                Ok(value) => value,
+                Err(message) => return error_response(&message),
+            };
+            let maker = match optional_string(&payload, "maker") { Ok(value) => value, Err(message) => return error_response(&message) };
+            let release_date = match optional_string(&payload, "releaseDate") { Ok(value) => value, Err(message) => return error_response(&message) };
+            let cover_url = match optional_string(&payload, "coverUrl") { Ok(value) => value, Err(message) => return error_response(&message) };
+            let samples_value = payload.get("sampleImages").ok_or_else(|| "sampleImages必须是字符串数组".to_owned());
+            let samples = match samples_value.and_then(|value| strict_string_array(value, "sampleImages")) {
+                Ok(value) => value,
+                Err(message) => return error_response(&message),
+            };
+            if number.is_empty() || title.is_empty() { return error_response("缺少番号或标题"); }
+            if cover_url.as_deref().map(|url| !validate_http_url(url)).unwrap_or(true) {
+                return error_response("coverUrl必须是有效的http/https URL且不可为空");
+            }
+            if samples.iter().any(|url| !validate_http_url(url)) {
+                return error_response("sampleImages必须全部为有效的http/https URL");
+            }
+            let actors_json = serde_json::to_string(&actors).unwrap_or_else(|_| "[]".to_owned());
+            let samples_json = serde_json::to_string(&samples).unwrap_or_else(|_| "[]".to_owned());
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                let changed = conn.execute("UPDATE movie_metadata SET title=?1,actors_json=?2,maker=?3,release_date=?4,cover_url=?5,sample_images_json=?6,verification_version=1,updated_at=?7 WHERE number=?8 AND verification_version=1", rusqlite::params![title, actors_json, maker, release_date, cover_url, samples_json, chrono::Utc::now().timestamp(), number]).map_err(|e| format!("保存元数据失败：{e}"))?;
+                if changed == 0 { return Err("仅允许编辑已验证元数据记录".into()); }
+                crate::jav_scraper::invalidate_metadata_cache(&number);
+                conn.execute("DELETE FROM scrape_failures WHERE number = ?1", rusqlite::params![number]).map_err(|e| format!("清除失败记录失败：{e}"))?;
+                crate::jav_scraper::get_movie_metadata(&conn, &number).map_err(|e| format!("读取更新结果失败：{e}"))?.ok_or_else(|| "元数据不存在".into())
+            }).await
+        }
         "get_movie_metadata" => {
             let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
             let app = app.clone();
@@ -748,6 +829,68 @@ async fn dispatch_command(
                 let conn = four_domains::open_v2(&app)?;
                 crate::jav_scraper::get_movie_metadata(&conn, &number)
                     .map_err(|e| format!("查询元数据失败：{e}"))
+            }).await
+        }
+        "query_movie_library" | "list_scrape_issues" | "list_unrecognized_videos" | "list_movie_performers" => {
+            let operation = command.to_owned();
+            let query = payload.get("query").and_then(Value::as_str).unwrap_or("").to_owned();
+            let maker = payload.get("maker").and_then(Value::as_str).unwrap_or("").to_owned();
+            let actor = payload.get("actor").and_then(Value::as_str).unwrap_or("").to_owned();
+            let sort = payload.get("sort").and_then(Value::as_str).unwrap_or("date").to_owned();
+            let category = payload.get("category").and_then(Value::as_str).unwrap_or("").to_owned();
+            let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 100) as u32;
+            let offset = payload.get("offset").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32;
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                match operation.as_str() {
+                    "query_movie_library" => serde_json::to_value(crate::jav_scraper::query_movie_library(&conn, &query, &maker, &actor, &sort, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
+                    "list_scrape_issues" => serde_json::to_value(crate::jav_scraper::list_scrape_issues(&conn, &category, &query, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
+                    "list_unrecognized_videos" => serde_json::to_value(crate::jav_scraper::list_unrecognized_videos(&conn, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
+                    _ => serde_json::to_value(crate::performers::list_performers(&conn, &query, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
+                }
+            }).await
+        }
+        "preview_movie_performer_profile" => {
+            let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let profile_url = payload.get("profileUrl").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            let identity = tokio::task::spawn_blocking(move || -> Result<(String, Vec<String>), String> {
+                let conn = four_domains::open_v2(&app)?;
+                let detail = crate::performers::get_performer(&conn, &id).map_err(|e| e.to_string())?.ok_or("人物不存在")?;
+                let mut names = detail.person.aliases;
+                names.push(detail.person.name);
+                let mut stmt = conn.prepare("SELECT DISTINCT raw_name FROM movie_cast WHERE person_id=?1").map_err(|e| e.to_string())?;
+                let rows = stmt.query_map([&id], |r| r.get::<_,String>(0)).map_err(|e| e.to_string())?;
+                for row in rows { names.push(row.map_err(|e| e.to_string())?); }
+                Ok((detail.person.source, names))
+            }).await;
+            match identity {
+                Ok(Ok((source, names))) => result_response(crate::performers::fetch_profile_candidate(&source, &profile_url, &names).await),
+                Ok(Err(e)) => error_response(&e),
+                Err(e) => error_response(&e.to_string()),
+            }
+        }
+        "get_movie_performer" | "update_movie_performer" | "set_movie_performer_status" => {
+            let operation = command.to_owned();
+            let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                if operation == "get_movie_performer" {
+                    return serde_json::to_value(crate::performers::get_performer(&conn, &id).map_err(|e| e.to_string())?).map_err(|e| e.to_string());
+                }
+                let person = if operation == "set_movie_performer_status" {
+                    let status = payload.get("status").and_then(Value::as_str).ok_or("缺少确认状态")?;
+                    crate::performers::set_performer_status(&conn, &id, status).map_err(|e| e.to_string())?
+                } else {
+                    let name = payload.get("name").and_then(Value::as_str).ok_or("缺少姓名")?;
+                    let aliases = strict_string_array(payload.get("aliases").ok_or("缺少别名数组")?, "aliases")?;
+                    let avatar = optional_string(&payload, "avatarUrl")?;
+                    let profile = optional_string(&payload, "profileUrl")?;
+                    crate::performers::update_performer(&conn, &id, name, &aliases, avatar.as_deref(), profile.as_deref()).map_err(|e| e.to_string())?
+                };
+                serde_json::to_value(person).map_err(|e| e.to_string())
             }).await
         }
         "list_movie_metadata" => {
@@ -1448,6 +1591,14 @@ async fn dispatch_command(
             let state = app.state::<MediaLibraryState>();
             result_response(media_library::prepare_curation_preview(app.clone(), state, path, is_directory).await)
         }
+        "resolve_direct_playback" => {
+            result_response(media_library::resolve_direct_playback(
+                app.clone(),
+                app.state::<MediaLibraryState>(),
+                payload.get("assetId").and_then(Value::as_str).map(str::to_owned),
+                payload.get("remotePath").and_then(Value::as_str).map(str::to_owned),
+            ).await)
+        }
         "open_media_source" => {
             let args: AssetIdRequest = match parse_args(&payload) {
                 Ok(value) => value,
@@ -2086,70 +2237,332 @@ async fn proxy_telegram_user_thumb(
 
 #[derive(Deserialize)]
 struct ScraperProxyQuery {
-    url: String,
+    source: Option<String>,
+    url: Option<String>,
+}
+
+const SCRAPER_IMAGE_MAX_SOURCE_LEN: usize = 16384;
+
+fn decode_scraper_image_source(query: ScraperProxyQuery) -> Result<String, &'static str> {
+    // A present source always wins; malformed input must not fall back to url.
+    if let Some(source) = query.source {
+        if source.is_empty() || source.len() > SCRAPER_IMAGE_MAX_SOURCE_LEN {
+            return Err("Invalid image source length");
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(source).map_err(|_| "Invalid image source encoding")?;
+        return String::from_utf8(bytes).map_err(|_| "Invalid image source UTF-8");
+    }
+    query.url.filter(|url| !url.trim().is_empty()).ok_or("Missing image source")
 }
 
 async fn proxy_scraper_image(
-    AxumState(_context): AxumState<ServerState>,
-    Query(query): Query<ScraperProxyQuery>,
+    AxumState(context): AxumState<ServerState>,
+    query: Result<Query<ScraperProxyQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    let raw_url = query.url.trim();
-    if !raw_url.starts_with("https://") && !raw_url.starts_with("http://") {
-        return (StatusCode::BAD_REQUEST, "Invalid URL").into_response();
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(_) => return scraper_image_error(StatusCode::BAD_REQUEST, "Invalid image query"),
+    };
+    let source = match decode_scraper_image_source(query) {
+        Ok(source) => source,
+        Err(message) => return scraper_image_error(StatusCode::BAD_REQUEST, message),
+    };
+    let url = match scraper_image_url(source.trim()) {
+        Ok(url) => url,
+        Err(_) => return scraper_image_error(StatusCode::BAD_REQUEST, "Invalid public image URL"),
+    };
+    let key = format!("{:x}", Sha256::digest(url.as_str().as_bytes()));
+    let cache_path = context.app.path().app_cache_dir().ok()
+        .map(|root| root.join("scraper-images").join(&key));
+    if let Some(bytes) = cache_path.as_deref().and_then(read_scraper_image_cache) {
+        return scraper_image_response(bytes);
     }
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::limited(4))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    // Shared gate bounds simultaneous downloads and memory use. Recheck after
+    // acquiring it: a previous request may already have populated the disk cache.
+    static GATE: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(5));
+    let _permit = match tokio::time::timeout(std::time::Duration::from_secs(90), GATE.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return scraper_image_error(StatusCode::SERVICE_UNAVAILABLE, "Image queue busy"),
     };
-
-    let referer = if raw_url.contains("jdbstatic") || raw_url.contains("javdb") {
-        "https://javdb.com/"
-    } else if raw_url.contains("javbus") {
-        "https://www.javbus.com/"
-    } else if raw_url.contains("caribbeancom") {
-        "https://www.caribbeancom.com/"
-    } else if raw_url.contains("1pondo") {
-        "https://www.1pondo.tv/"
-    } else if raw_url.contains("dmm") {
-        "https://www.dmm.co.jp/"
-    } else {
-        "https://google.com/"
-    };
-
-    let req = client.get(raw_url)
-        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .header(reqwest::header::REFERER, referer);
-
-    let upstream = match req.send().await {
-        Ok(resp) => resp,
-        Err(err) => return (StatusCode::BAD_GATEWAY, format!("Upstream request failed: {err}")).into_response(),
-    };
-
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    // Never cache an anti-bot page or expired response as a valid cover.
-    let content_type = upstream.headers().get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
-    if !status.is_success() || content_type.contains("text/html")
-        || content_type.contains("application/json") || content_type.contains("text/xml") {
-        return (StatusCode::BAD_GATEWAY, [(CACHE_CONTROL, "no-store")], "Image source unavailable").into_response();
+    if let Some(bytes) = cache_path.as_deref().and_then(read_scraper_image_cache) {
+        return scraper_image_response(bytes);
     }
-    let mut builder = Response::builder().status(status);
+    let client = match &*SCRAPER_IMAGE_CLIENT {
+        Ok(client) => client,
+        Err(_) => return scraper_image_error(StatusCode::INTERNAL_SERVER_ERROR, "Image client unavailable"),
+    };
+    // Two attempts total, not two additional retries. Never persist failures.
+    for attempt in 0..2 {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(12), fetch_scraper_image(client, &url)).await;
+        if let Ok(Ok(bytes)) = result {
+            if let Some(path) = &cache_path {
+                if let Err(error) = write_scraper_image_cache(path, &bytes) {
+                    eprintln!("scraper image cache write failed: {error}");
+                }
+            }
+            return scraper_image_response(bytes);
+        }
+        if attempt == 0 { tokio::time::sleep(std::time::Duration::from_millis(200)).await; }
+    }
+    scraper_image_error(StatusCode::BAD_GATEWAY, "Image source unavailable")
+}
 
-    for (k, v) in upstream.headers() {
-        if matches!(
-            k.as_str(),
-            "content-type" | "content-length" | "etag" | "last-modified"
-        ) {
-            builder = builder.header(k, v);
+const SCRAPER_IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
+const SCRAPER_IMAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+fn scraper_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
+                && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast()
+                && a != 0 && a < 224 && !(a == 100 && (64..=127).contains(&b))
+                && !(a == 198 && (18..=19).contains(&b)) && !ip.is_documentation()
+        }
+        std::net::IpAddr::V6(ip) => {
+            // IPv4-mapped, link/site-local and transition ranges must not bypass
+            // the IPv4 checks. Ordinary public IPv6 currently lives in 2000::/3.
+            let s = ip.segments();
+            (s[0] & 0xe000) == 0x2000 && !(s[0] == 0x2001 && s[1] == 0x0db8)
+                && s[0] != 0x2002 && !(s[0] == 0x2001 && s[1] == 0)
         }
     }
-    builder = builder.header("access-control-allow-origin", "*");
-    builder = builder.header(CACHE_CONTROL, "public, max-age=86400");
+}
 
-    let body = Body::from_stream(upstream.bytes_stream());
-    builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+fn scraper_image_url(value: &str) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(value).map_err(|_| "invalid URL")?;
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+        return Err("invalid scheme or credentials".into());
+    }
+    let host = url.host_str().ok_or("missing host")?;
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") || host.ends_with(".local") {
+        return Err("local hostname".into());
+    }
+    if let Some(host) = url.host() {
+        let ip = match host {
+            url::Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+            url::Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+            _ => None,
+        };
+        if ip.is_some_and(|ip| !scraper_public_ip(ip)) { return Err("non-public address".into()); }
+    }
+    url.set_fragment(None);
+    Ok(url)
+}
+
+#[derive(Debug)]
+struct ScraperPublicDns;
+impl reqwest::dns::Resolve for ScraperPublicDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addresses: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            // Reject mixed public/private answers too; never let a DNS rebinding
+            // target reach a local address. Resolver is used on every new connection.
+            if addresses.is_empty() || addresses.iter().any(|address| !scraper_public_ip(address.ip())) {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "non-public DNS address").into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+static SCRAPER_IMAGE_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(ScraperPublicDns))
+        .connect_timeout(std::time::Duration::from_secs(6))
+        .timeout(std::time::Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 4 { attempt.error("too many image redirects") }
+            else if scraper_image_url(attempt.url().as_str()).is_err() { attempt.error("non-public image redirect") }
+            else { attempt.follow() }
+        }))
+        .build()
+});
+
+fn scraper_image_referer(url: &reqwest::Url) -> &'static str {
+    let host = url.host_str().unwrap_or("");
+    let domain = |suffix: &str| host == suffix || host.ends_with(&format!(".{suffix}"));
+    if domain("fc2.com") { "https://adult.contents.fc2.com/" }
+    else if domain("jdbstatic.com") || domain("javdb.com") { "https://javdb.com/" }
+    else if domain("javbus.com") { "https://www.javbus.com/" }
+    else if domain("caribbeancom.com") { "https://www.caribbeancom.com/" }
+    else if domain("1pondo.tv") { "https://www.1pondo.tv/" }
+    else if domain("dmm.co.jp") || domain("dmm.com") { "https://www.dmm.co.jp/" }
+    else { "https://google.com/" }
+}
+
+fn scraper_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() > SCRAPER_IMAGE_MAX_BYTES { return None; }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) && bytes.len() >= 12 { Some("image/jpeg") }
+    else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24 && &bytes[12..16] == b"IHDR" { Some("image/png") }
+    else if (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) && bytes.len() >= 13 { Some("image/gif") }
+    else if bytes.len() >= 16 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" { Some("image/webp") }
+    else if bytes.len() >= 16 && &bytes[4..8] == b"ftyp" && matches!(&bytes[8..12], b"avif" | b"avis") { Some("image/avif") }
+    else { None }
+}
+
+async fn fetch_scraper_image(client: &reqwest::Client, url: &reqwest::Url) -> Result<Vec<u8>, String> {
+    let response = client.get(url.clone())
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .header(reqwest::header::REFERER, scraper_image_referer(url))
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send().await.map_err(|e| e.to_string())?;
+    if !response.status().is_success() || response.content_length().is_some_and(|n| n > SCRAPER_IMAGE_MAX_BYTES as u64) {
+        return Err("unsuccessful or oversized image response".into());
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if chunk.len() > SCRAPER_IMAGE_MAX_BYTES.saturating_sub(bytes.len()) { return Err("image too large".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    scraper_image_mime(&bytes).ok_or("response is not an image")?;
+    Ok(bytes)
+}
+
+fn read_scraper_image_cache(path: &std::path::Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > SCRAPER_IMAGE_MAX_BYTES as u64 { return None; }
+    if let Ok(modified) = metadata.modified() {
+        if modified.elapsed().ok()?.gt(&SCRAPER_IMAGE_CACHE_TTL) { return None; }
+    }
+    let bytes = std::fs::read(path).ok()?;
+    scraper_image_mime(&bytes)?;
+    Some(bytes)
+}
+
+fn write_scraper_image_cache(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if scraper_image_mime(bytes).is_none() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an image")); }
+    std::fs::create_dir_all(path.parent().ok_or_else(|| std::io::Error::other("missing cache parent"))?)?;
+    let temporary = path.with_extension(format!("{}.tmp", rand::random::<u64>()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        match std::fs::rename(&temporary, path) {
+            Ok(()) => Ok(()),
+            Err(_) if read_scraper_image_cache(path).is_some() => Ok(()),
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
+}
+
+fn scraper_image_error(status: StatusCode, message: &'static str) -> Response {
+    (status, [(CACHE_CONTROL, "no-store")], message).into_response()
+}
+
+fn scraper_image_response(bytes: Vec<u8>) -> Response {
+    let Some(mime) = scraper_image_mime(&bytes) else {
+        return scraper_image_error(StatusCode::BAD_GATEWAY, "Invalid cached image");
+    };
+    // These are our decoded bytes: never forward upstream content-length or encoding.
+    ([(CONTENT_TYPE, mime), (CACHE_CONTROL, "public, max-age=86400"),
+      (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")], bytes).into_response()
+}
+
+#[cfg(test)]
+mod scraper_image_tests {
+    use super::*;
+    #[test]
+    fn source_roundtrips_unicode_and_query_strings() {
+        for url in [
+            "https://www.javbus.com/封面/映画😀.jpg?title=中文&token=a+b/c==&next=%2Fpath%3Fx%3D1#preview",
+            "https://example.com/a.jpg?x=1&x=2&empty=&escaped=%26%3D%25",
+        ] {
+            let source = URL_SAFE_NO_PAD.encode(url.as_bytes());
+            assert!(!source.contains(['+', '/', '=']));
+            let uri = format!("/api/scraper/proxy-image?source={source}").parse().unwrap();
+            let Query(query) = Query::<ScraperProxyQuery>::try_from_uri(&uri).unwrap();
+            assert_eq!(decode_scraper_image_source(query).unwrap(), url);
+        }
+    }
+    #[test]
+    fn source_rejects_invalid_base64_and_utf8() {
+        for source in ["", "a", "aGVsbG8=", "+w", "/w", "a Gk", "_w", "Zh"] {
+            assert!(decode_scraper_image_source(ScraperProxyQuery {
+                source: Some(source.into()), url: Some("https://example.com/legacy.jpg".into()),
+            }).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn source_enforces_encoded_length_limit() {
+        let source = URL_SAFE_NO_PAD.encode("a".repeat(SCRAPER_IMAGE_MAX_SOURCE_LEN / 4 * 3));
+        assert_eq!(source.len(), SCRAPER_IMAGE_MAX_SOURCE_LEN);
+        assert!(decode_scraper_image_source(ScraperProxyQuery {
+            source: Some(source.clone()), url: None,
+        }).is_ok());
+        assert_eq!(decode_scraper_image_source(ScraperProxyQuery {
+            source: Some(format!("{source}A")), url: None,
+        }), Err("Invalid image source length"));
+    }
+    #[test]
+    fn source_takes_precedence_and_legacy_url_remains_supported() {
+        let url = "https://example.com/封面.jpg?x=a+b&next=%2Fpath";
+        let query_string: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("url", url).finish();
+        let uri = format!("/api/scraper/proxy-image?{query_string}").parse().unwrap();
+        let Query(query) = Query::<ScraperProxyQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(decode_scraper_image_source(query).unwrap(), url);
+        assert_eq!(decode_scraper_image_source(ScraperProxyQuery {
+            source: Some(URL_SAFE_NO_PAD.encode(url.as_bytes())),
+            url: Some("https://example.com/ignored.jpg".into()),
+        }).unwrap(), url);
+    }
+    #[test]
+    fn source_rejects_missing_or_blank_legacy_url() {
+        let uri = "/api/scraper/proxy-image".parse().unwrap();
+        let Query(query) = Query::<ScraperProxyQuery>::try_from_uri(&uri).unwrap();
+        assert!(decode_scraper_image_source(query).is_err());
+        for url in ["", " \t "] {
+            assert!(decode_scraper_image_source(ScraperProxyQuery {
+                source: None, url: Some(url.into()),
+            }).is_err());
+        }
+        let response = scraper_image_error(StatusCode::BAD_REQUEST, "Invalid image source");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+    #[test]
+    fn rejects_private_urls_and_host_spoofing() {
+        for url in ["file:///tmp/a.jpg", "http://127.0.0.1/a", "http://2130706433/a", "http://10.0.0.1/a", "http://169.254.169.254/a", "http://[::1]/a", "http://[::ffff:127.0.0.1]/a", "http://localhost/a", "https://user:pass@example.com/a"] {
+            assert!(scraper_image_url(url).is_err(), "{url}");
+        }
+        let url = scraper_image_url("https://example.com/a?javbus.com").unwrap();
+        assert_eq!(scraper_image_referer(&url), "https://google.com/");
+        assert_eq!(scraper_image_referer(&scraper_image_url("https://contents-thumbnail2.fc2.com/a.jpg").unwrap()), "https://adult.contents.fc2.com/");
+        assert!(scraper_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(!scraper_public_ip("100.64.0.1".parse().unwrap()));
+    }
+    #[test]
+    fn validates_magic_size_and_response_headers() {
+        assert!(scraper_image_mime(b"<html>blocked</html>").is_none());
+        assert!(scraper_image_mime(b"{\"error\":\"blocked\"}").is_none());
+        let mut bytes = vec![0xff, 0xd8, 0xff]; bytes.resize(32, 0);
+        assert_eq!(scraper_image_mime(&bytes), Some("image/jpeg"));
+        let response = scraper_image_response(bytes);
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/jpeg");
+        assert!(!response.headers().contains_key("content-encoding"));
+        assert_eq!(scraper_image_error(StatusCode::BAD_GATEWAY, "failed").headers()[CACHE_CONTROL], "no-store");
+        assert!(scraper_image_mime(&vec![0; SCRAPER_IMAGE_MAX_BYTES + 1]).is_none());
+    }
+    #[test]
+    fn disk_cache_only_persists_valid_images_atomically() {
+        let directory = std::env::temp_dir().join(format!("pml-scraper-image-test-{}", rand::random::<u64>()));
+        let path = directory.join("test-key");
+        assert!(write_scraper_image_cache(&path, b"<html>no</html>").is_err());
+        assert!(!path.exists());
+        let mut bytes = vec![0xff, 0xd8, 0xff]; bytes.resize(32, 0);
+        write_scraper_image_cache(&path, &bytes).unwrap();
+        assert_eq!(read_scraper_image_cache(&path), Some(bytes));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::write(&path, b"not an image").unwrap();
+        assert!(read_scraper_image_cache(&path).is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -486,10 +486,6 @@ struct PendingFolderPreviewSheet: View {
             Task {
                 if let source = await model.playbackSource(assetId: entry.assetId, remotePath: entry.path) {
                     activeVideo = FolderVideoTarget(url: source.url, title: entry.name, fallbackURL: source.fallbackURL)
-                } else if let client = model.apiClient,
-                          let raw = try? await client.rawMediaURL(remotePath: entry.path) {
-                    let fb = await model.fallbackMediaURL(assetId: entry.assetId)
-                    activeVideo = FolderVideoTarget(url: raw, title: entry.name, fallbackURL: fb)
                 }
             }
             return

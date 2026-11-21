@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +52,11 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             number TEXT NOT NULL REFERENCES movie_metadata(number) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_movie_asset_bindings_number ON movie_asset_bindings(number);
+        CREATE TABLE IF NOT EXISTS scrape_failures (
+            number TEXT PRIMARY KEY,
+            error TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS scrape_whitelist (
             path TEXT PRIMARY KEY,
             enabled INTEGER NOT NULL DEFAULT 1,
@@ -204,6 +209,87 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
     None
 }
 
+fn caribbean_exact_identity(html: &str, number: &str) -> bool {
+    let expected = number.replace('_', "-");
+    let detail_prefix = format!("/moviepages/{expected}/");
+    let gallery_prefix = format!("/moviepages/{expected}/images/l/");
+
+    // Canonical/OG identity is authoritative. If a canonical tag exists but
+    // points elsewhere, reject immediately; never fall back to recommendations.
+    let mut canonical_seen = false;
+    let mut canonical_exact = false;
+    for seg in html.split('<').filter(|tag| tag.starts_with("link ") || tag.starts_with("meta ")) {
+        let is_canonical = attribute(seg, "rel").is_some_and(|v| v.split_whitespace().any(|x| x.eq_ignore_ascii_case("canonical")));
+        let is_og = attribute(seg, "property").is_some_and(|v| v.eq_ignore_ascii_case("og:url"));
+        if !(is_canonical || is_og) { continue; }
+        if is_canonical { canonical_seen = true; }
+        let Some(raw) = attribute(seg, "href").or_else(|| attribute(seg, "content")) else { return false; };
+        let Ok(url) = reqwest::Url::parse(&raw).or_else(|_| reqwest::Url::parse("https://www.caribbeancom.com/").and_then(|base| base.join(&raw))) else { return false; };
+        let exact = url.host_str() == Some("www.caribbeancom.com") && url.path() == detail_prefix;
+        if is_canonical && exact { canonical_exact = true; }
+        if is_canonical && !exact { return false; }
+        if is_og && !exact { return false; }
+    }
+    if canonical_seen { return canonical_exact; }
+
+    // Archived pages without canonical: require a real main gallery anchor,
+    // not an arbitrary h1, recommendation link, or nearby text. The live page
+    // uses <a class="gallery-item fancy-gallery" href="/moviepages/<id>/images/l/001.jpg">.
+    for (idx, _) in html.match_indices("<a ") {
+        let part = &html[idx + 3..];
+        let Some((tag, body)) = part.split_once('>') else { continue; };
+        if !attribute(tag, "class").is_some_and(|classes| classes.split_whitespace().any(|c| c == "gallery-item")) { continue; }
+        // Build a UTF-8-safe forward context window; reversing the chars would
+        // make marker searches fail and slicing raw bytes could panic on CJK.
+        let context = html[..idx].chars().rev().take(1200).collect::<String>().chars().rev().collect::<String>().to_ascii_lowercase();
+        if !context.contains("movie-gallery") || context.contains("recommend") || context.contains("related") { continue; }
+        let Some(raw) = attribute(tag, "href") else { continue; };
+        let image_src = body.split('<').find_map(|piece| {
+            let tag = piece.strip_prefix("img ").unwrap_or(piece);
+            if tag == piece { None } else { attribute(tag, "src") }
+        });
+        let Some(image_src) = image_src else { continue; };
+        let Ok(image_url) = reqwest::Url::parse(&image_src).or_else(|_| reqwest::Url::parse("https://www.caribbeancom.com/").and_then(|base| base.join(&image_src))) else { continue; };
+        if image_url.host_str() != Some("www.caribbeancom.com") || !image_url.path().starts_with(&format!("/moviepages/{expected}/images/s/")) { continue; }
+        let Ok(url) = reqwest::Url::parse(&raw).or_else(|_| reqwest::Url::parse("https://www.caribbeancom.com/").and_then(|base| base.join(&raw))) else { continue; };
+        if url.host_str() != Some("www.caribbeancom.com") || !url.path().starts_with(&gallery_prefix) { continue; }
+        let tail = &url.path()[gallery_prefix.len()..];
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c == '.' || c.is_ascii_alphabetic() || c == '-') {
+            return true;
+        }
+    }
+    false
+}
+
+fn caribbean_sample_images(html: &str, number: &str) -> Vec<String> {
+    let mut images = Vec::new();
+    let expected = format!("/moviepages/{number}/images/l/");
+    for seg in html.split("<a ").skip(1) {
+        let tag = seg.split('>').next().unwrap_or("");
+        let Some(raw) = attribute(tag, "href") else { continue };
+        let Some(url) = valid_image_url("https://www.caribbeancom.com/", &raw) else { continue };
+        let Ok(parsed) = reqwest::Url::parse(&url) else { continue };
+        // Member-only links and recommendations must not become broken public stills.
+        if parsed.host_str() == Some("www.caribbeancom.com") && parsed.path().starts_with(&expected)
+            && !images.contains(&url) { images.push(url); }
+    }
+    images
+}
+
+fn javbus_sample_images(html: &str) -> Vec<String> {
+    let mut images = Vec::new();
+    for seg in html.split("<a ").skip(1) {
+        let Some(tag) = seg.split('>').next() else { continue };
+        if !attribute(tag, "class").is_some_and(|classes| classes.split_whitespace().any(|c| c == "sample-box")) { continue; }
+        let Some(raw) = attribute(tag, "href") else { continue };
+        if raw.trim().is_empty() { continue; }
+        if let Some(url) = valid_image_url("https://www.javbus.com/", &raw) {
+            if !images.contains(&url) { images.push(url); }
+        }
+    }
+    images
+}
+
 /// Only a card's dedicated <strong> identifier may establish its identity.
 /// Titles mentioning another number must never qualify a search result.
 fn javdb_exact_card<'a>(html: &'a str, number: &str) -> Option<(String, &'a str)> {
@@ -232,6 +318,98 @@ fn detail_identity(html: &str, labels: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone)]
+struct Fc2Parsed {
+    title: String,
+    cover: Option<String>,
+    samples: Vec<String>,
+    release_date: Option<String>,
+}
+
+fn exact_fc2_url(value: &str, id: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else { return false; };
+    url.scheme() == "https" && url.host_str() == Some("adult.contents.fc2.com") && url.path() == format!("/article/{id}/")
+}
+
+fn fc2_title_has_id(title: &str, id: &str) -> bool {
+    let upper = title.to_ascii_uppercase();
+    [format!("FC2-PPV-{id}"), format!("FC2 PPV {id}")].iter().any(|needle| {
+        let mut from = 0;
+        while let Some(pos) = upper[from..].find(needle) {
+            let start = from + pos;
+            let end = start + needle.len();
+            let before = upper[..start].chars().next_back();
+            let after = upper[end..].chars().next();
+            if !before.is_some_and(|c| c.is_ascii_alphanumeric()) && !after.is_some_and(|c| c.is_ascii_digit()) { return true; }
+            from = end;
+        }
+        false
+    })
+}
+
+fn parse_fc2_html(html: &str, id: &str, base: &str) -> Result<Fc2Parsed, String> {
+    let canonical = html.split("<link ").skip(1).filter_map(|s| s.split('>').next()).find_map(|tag| {
+        (attribute(tag, "rel").is_some_and(|v| v.split_whitespace().any(|x| x.eq_ignore_ascii_case("canonical"))))
+            .then(|| attribute(tag, "href")).flatten()
+    });
+    let og_url = html.split("<meta ").skip(1).filter_map(|s| s.split('>').next()).find_map(|tag| {
+        (attribute(tag, "property").is_some_and(|v| v.eq_ignore_ascii_case("og:url"))).then(|| attribute(tag, "content")).flatten()
+    });
+    if !canonical.as_deref().is_some_and(|v| exact_fc2_url(v, id)) && !og_url.as_deref().is_some_and(|v| exact_fc2_url(v, id)) {
+        return Err(format!("FC2 官方页面身份未验证【FC2-{id}】"));
+    }
+    let mut product = None::<serde_json::Value>;
+    for block in html.split("<script type=\"application/ld+json\">").skip(1) {
+        let Some(json) = block.split("</script>").next().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) else { continue };
+        let matches = json.get("sku").and_then(|v| v.as_str()) == Some(id) || json.get("productID").and_then(|v| v.as_str()) == Some(id);
+        if matches { product = Some(json); break; }
+    }
+    let product = product.ok_or_else(|| format!("FC2 官方页面缺少精确商品数据【FC2-{id}】"))?;
+    // Official Product.name may omit the printed FC2 number. The exact canonical
+    // URL and the same Product's exact sku/productID already establish identity.
+    let title = product.get("name").and_then(|v| v.as_str()).map(plain_text).filter(|s| !s.trim().is_empty()).ok_or_else(|| format!("FC2 官方商品缺少标题【FC2-{id}】"))?;
+    let cover = product.get("image").and_then(|v| v.get("url")).and_then(|v| v.as_str()).and_then(|v| valid_image_url(base, v));
+    let mut samples = Vec::new();
+    if let Some(seg) = html.split("data-feed=\"sample-images\"").nth(1).and_then(|s| s.split("</ul>").next()) {
+        for a in seg.split("<a ").skip(1) {
+            if let Some(v) = attribute(a.split('>').next().unwrap_or(""), "href").and_then(|v| valid_image_url(base, &v)) { if !samples.contains(&v) { samples.push(v); } }
+        }
+    }
+    let release_date = html.split("販売日 :").nth(1).and_then(|s| s.split('<').next()).map(str::trim).filter(|s| s.len() >= 10).map(str::to_string);
+    Ok(Fc2Parsed { title, cover, samples, release_date })
+}
+
+pub async fn scrape_from_fc2(number: &str) -> Result<MovieMetadata, String> {
+    let id = number.strip_prefix("FC2-").ok_or_else(|| "FC2番号格式错误".to_string())?;
+    if !id.chars().all(|c| c.is_ascii_digit()) || !(5..=8).contains(&id.len()) {
+        return Err(format!("FC2番号格式错误【{number}】"));
+    }
+    let client = scraper_client()?;
+    let url = format!("https://adult.contents.fc2.com/article/{id}/");
+    let resp = client.get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml")
+        .send().await.map_err(|e| format!("请求 FC2 官方页面失败：{e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!("FC2 官方页面未找到作品【{number}】"));
+    }
+    if !resp.status().is_success() { return Err(format!("FC2 官方页面状态异常：{}", resp.status())); }
+    let html = resp.text().await.map_err(|e| format!("读取 FC2 官方页面失败：{e}"))?;
+    let lower = html.to_ascii_lowercase();
+    if lower.contains("cf-chl-") || lower.contains("captcha") {
+        return Err(format!("FC2 官方页面需要验证【{number}】"));
+    }
+    // FC2 sometimes returns HTTP 200 for a soft-404 page. Treat it as a
+    // missing work, not as an identity or generic parse failure.
+    if lower.contains("page not found") || lower.contains("ページが見つかりません")
+        || lower.contains("お探しのページは見つかりません")
+        || lower.contains("商品が見つかりません") {
+        return Err(format!("FC2 官方页面未找到作品（软404）【{number}】"));
+    }
+    let parsed = parse_fc2_html(&html, id, &url)?;
+    Ok(MovieMetadata { number: number.to_string(), asset_id: None, title: parsed.title.clone(), original_title: Some(parsed.title), actors: vec![], maker: Some("FC2".to_string()), label: None, series: None, director: None, release_date: parsed.release_date, duration_minutes: None, cover_url: parsed.cover, sample_images: parsed.samples, tags: vec!["FC2".to_string()], source: "fc2-official".to_string(), updated_at: chrono::Utc::now().timestamp() })
 }
 
 /// Fetch metadata from JavBus by JAV number (Direct, fast, highly reliable for commercial JAV).
@@ -358,23 +536,7 @@ pub async fn scrape_from_javbus(number: &str) -> Result<MovieMetadata, String> {
     let actors = javbus_actors(&html);
 
     // 8. Sample Images (剧照)
-    let mut sample_images = Vec::new();
-    for seg in html.split("<a class=\"sample-box\"").skip(1) {
-        if let Some(href_idx) = seg.find("href=\"") {
-            let rest = &seg[href_idx + 6..];
-            if let Some(href_end) = rest.find('"') {
-                let mut u = rest[..href_end].trim().to_string();
-                if !u.is_empty() {
-                    if !u.starts_with("http") {
-                        u = format!("https://www.javbus.com{}", u);
-                    }
-                    if !sample_images.contains(&u) {
-                        sample_images.push(u);
-                    }
-                }
-            }
-        }
-    }
+    let sample_images = javbus_sample_images(&html);
 
     // 9. Tags
     let mut tags = Vec::new();
@@ -468,10 +630,12 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
     };
 
     let is_captcha = html.contains("auth-captcha-image") || html.contains("driver-verify") || html.is_empty();
-    if !is_captcha && detail_identity(&html, &["<strong>番號:</strong>", "<strong>番号:</strong>"]).as_deref() != Some(number) {
+    if is_captcha {
+        return Err(format!("JavDB 详情页需要验证或加载失败【{number}】"));
+    }
+    if detail_identity(&html, &["<strong>番號:</strong>", "<strong>番号:</strong>"]).as_deref() != Some(number) {
         return Err(format!("JavDB 详情番号不匹配【{number}】"));
     }
-    let html = if is_captcha { String::new() } else { html };
 
     // Parse Title
     let mut title = number.to_string();
@@ -671,13 +835,9 @@ pub async fn scrape_from_caribbeancom(number: &str) -> Result<MovieMetadata, Str
         html = String::from_utf8_lossy(&bytes).to_string();
     }
 
-    let expected_path = format!("/moviepages/{clean_num}/");
-    let canonical_match = html.split('<').filter(|tag| tag.starts_with("link ") || tag.starts_with("meta "))
-        .any(|tag| (attribute(tag, "rel").as_deref() == Some("canonical")
-            || attribute(tag, "property").as_deref() == Some("og:url"))
-            && attribute(tag, "href").or_else(|| attribute(tag, "content"))
-                .is_some_and(|url| url.contains(&expected_path)));
-    if !canonical_match { return Err(format!("Caribbeancom 无法核验详情番号【{number}】")); }
+    if !caribbean_exact_identity(&html, &clean_num) {
+        return Err(format!("Caribbeancom 无法核验详情番号【{number}】"));
+    }
     // Title
     let mut title = clean_num.clone();
     if let Some(start) = html.find("<h1 itemprop=\"name\">") {
@@ -712,6 +872,8 @@ pub async fn scrape_from_caribbeancom(number: &str) -> Result<MovieMetadata, Str
         None
     };
 
+    let sample_images = caribbean_sample_images(&html, &clean_num);
+
     // Do not harvest all itemprop=name spans: most are navigation/recommendations.
     // Until a dedicated performer field is present, unknown is safer than wrong.
     let actors = Vec::new();
@@ -730,7 +892,7 @@ pub async fn scrape_from_caribbeancom(number: &str) -> Result<MovieMetadata, Str
         release_date,
         duration_minutes: None,
         cover_url,
-        sample_images: Vec::new(),
+        sample_images,
         tags: vec!["无码".to_string(), "加勒比".to_string()],
         source: "caribbeancom".to_string(),
         updated_at: now,
@@ -802,6 +964,10 @@ pub async fn scrape_from_1pondo(number: &str) -> Result<MovieMetadata, String> {
         return Err(format!("1pondo 未找到封面【{}】", number));
     }
 
+    // The official JSON exposes video samples, not still-image URLs. Do not
+    // reinterpret SampleFiles or invent gallery paths when HasGallery=false.
+    let sample_images = Vec::new();
+
     let now = chrono::Utc::now().timestamp();
     Ok(MovieMetadata {
         number: number.to_string(),
@@ -816,7 +982,7 @@ pub async fn scrape_from_1pondo(number: &str) -> Result<MovieMetadata, String> {
         release_date,
         duration_minutes: None,
         cover_url,
-        sample_images: Vec::new(),
+        sample_images,
         tags: vec!["无码".to_string(), "一本道".to_string()],
         source: "1pondo".to_string(),
         updated_at: now,
@@ -828,12 +994,20 @@ fn valid_image_url(base: &str, value: &str) -> Option<String> {
     if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() { Some(url.to_string()) } else { None }
 }
 
+fn metadata_cache() -> &'static Mutex<std::collections::HashMap<String, MovieMetadata>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, MovieMetadata>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn invalidate_metadata_cache(number: &str) {
+    if let Ok(mut items) = metadata_cache().lock() { items.remove(number); }
+}
+
 /// Shared successes avoid repeated network requests. Failures are never negative-cached:
 /// a timeout/challenge is not proof that an identity does not exist.
 pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
     let number = normalize_jav_number(raw).ok_or_else(|| "无效或有歧义的番号".to_string())?;
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, MovieMetadata>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let cache = metadata_cache();
     if let Ok(items) = cache.lock() {
         if let Some(meta) = items.get(&number).filter(|m| chrono::Utc::now().timestamp() - m.updated_at < 3600) {
             return Ok(meta.clone());
@@ -849,6 +1023,9 @@ pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
             // Never cross-fallback between these providers or JavDB's ambiguous date search.
             if number.contains('_') { scrape_from_1pondo(&number).await }
             else { scrape_from_caribbeancom(&number).await }
+        } else if number.starts_with("FC2-") {
+            // FC2 has an official public detail page; prefer it over generic JAV indexes.
+            scrape_from_fc2(&number).await
         } else {
             // Direct detail source is faster. Start the second source after a short hedge,
             // returning the first *validated* success, not the first HTTP 200.
@@ -931,6 +1108,7 @@ pub fn save_movie_metadata(conn: &Connection, meta: &MovieMetadata) -> Result<()
     )?;
 
     if let Some(asset_id) = &meta.asset_id { bind_movie_asset(conn, &meta.number, asset_id)?; }
+    conn.execute("DELETE FROM scrape_failures WHERE number=?1", params![meta.number])?;
     Ok(())
 }
 
@@ -1025,6 +1203,192 @@ pub fn list_movie_metadata(conn: &Connection, limit: u32, offset: u32) -> Result
 }
 
 /// Get related movies from the library (same actress, same maker, or same series)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieLibraryPage {
+    pub items: Vec<MovieMetadata>,
+    pub total: usize,
+    pub makers: Vec<String>,
+    pub actors: Vec<String>,
+}
+
+fn metadata_from_row(row: &rusqlite::Row<'_>) -> Result<MovieMetadata, rusqlite::Error> {
+    let actors_json: String = row.get(4)?;
+    let sample_json: String = row.get(12)?;
+    let tags_json: String = row.get(13)?;
+    Ok(MovieMetadata {
+        number: row.get(0)?, asset_id: row.get(1)?, title: row.get(2)?, original_title: row.get(3)?,
+        actors: serde_json::from_str(&actors_json).unwrap_or_default(), maker: row.get(5)?, label: row.get(6)?,
+        series: row.get(7)?, director: row.get(8)?, release_date: row.get(9)?, duration_minutes: row.get(10)?,
+        cover_url: row.get(11)?, sample_images: serde_json::from_str(&sample_json).unwrap_or_default(),
+        tags: serde_json::from_str(&tags_json).unwrap_or_default(), source: row.get(14)?, updated_at: row.get(15)?,
+    })
+}
+
+/// Search the verified movie library. All user values are bound SQL parameters;
+/// sort is selected from a fixed allow-list and always has number as a tie-breaker.
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') { escaped.push('\\'); }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+pub fn query_movie_library(conn: &Connection, query: &str, maker: &str, actor: &str, sort: &str, limit: u32, offset: u32) -> Result<MovieLibraryPage, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    // Keep performer candidates synchronized before any read. Errors are wrapped
+    // as rusqlite conversion failures so the public API remains DB-compatible.
+    crate::performers::sync_performers(conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))))?;
+    let verified_where = " WHERE verification_version = 1 AND source NOT IN ('javdb_not_found','not_found','') AND cover_url IS NOT NULL AND cover_url != ''";
+    let mut where_sql = verified_where.to_string();
+    let q = query.trim();
+    let m = maker.trim();
+    let a = actor.trim();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    if !q.is_empty() {
+        where_sql.push_str(" AND (lower(number) LIKE lower(?) ESCAPE '\\' OR lower(title) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(original_title,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(maker,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(label,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(series,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(director,'')) LIKE lower(?) ESCAPE '\\' OR lower(actors_json) LIKE lower(?) ESCAPE '\\' OR lower(tags_json) LIKE lower(?) ESCAPE '\\' OR EXISTS (SELECT 1 FROM movie_cast qc JOIN performers qp ON qp.id=qc.person_id WHERE qc.number=movie_metadata.number AND (lower(qp.name) LIKE lower(?) ESCAPE '\\' OR EXISTS (SELECT 1 FROM json_each(qp.aliases_json) qa WHERE lower(CAST(qa.value AS TEXT)) LIKE lower(?) ESCAPE '\\'))))");
+        let pat = format!("%{}%", escape_like_pattern(q));
+        for _ in 0..11 { args.push(Box::new(pat.clone())); }
+    }
+    if !m.is_empty() { where_sql.push_str(" AND maker = ?"); args.push(Box::new(m.to_string())); }
+    if !a.is_empty() {
+        // Actor filter accepts a stable performer id, the original raw credit,
+        // or an exact current name/alias. Every comparison is parameterized.
+        where_sql.push_str(" AND (EXISTS (SELECT 1 FROM json_each(actors_json) actor_value WHERE lower(CAST(actor_value.value AS TEXT)) = lower(?)) OR EXISTS (SELECT 1 FROM movie_cast ac WHERE ac.number=movie_metadata.number AND (lower(ac.person_id)=lower(?) OR lower(ac.raw_name)=lower(?) OR EXISTS (SELECT 1 FROM performers ap WHERE ap.id=ac.person_id AND (lower(ap.name)=lower(?) OR EXISTS (SELECT 1 FROM json_each(ap.aliases_json) aa WHERE lower(CAST(aa.value AS TEXT))=lower(?)))))))");
+        for _ in 0..5 { args.push(Box::new(a.to_string())); }
+    }
+    let total_sql = format!("SELECT COUNT(*) FROM movie_metadata{where_sql}");
+    let total: usize = conn.query_row(&total_sql, rusqlite::params_from_iter(args.iter().map(|v| v.as_ref())), |r| r.get::<_, i64>(0))? as usize;
+
+    // Facets intentionally come from the full verified library, not the active
+    // maker/actor/query filter, so changing one dropdown does not erase options.
+    let mut makers = std::collections::BTreeSet::new();
+    let mut maker_stmt = conn.prepare("SELECT DISTINCT maker FROM movie_metadata WHERE verification_version = 1 AND source NOT IN ('javdb_not_found','not_found','') AND cover_url IS NOT NULL AND cover_url != '' AND maker IS NOT NULL AND maker != '' ORDER BY maker")?;
+    let maker_rows = maker_stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for row in maker_rows { makers.insert(row?); }
+    let mut actors_set = std::collections::BTreeSet::new();
+    let mut actor_stmt = conn.prepare("SELECT actors_json FROM movie_metadata WHERE verification_version = 1 AND source NOT IN ('javdb_not_found','not_found','') AND cover_url IS NOT NULL AND cover_url != ''")?;
+    let actor_rows = actor_stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for row in actor_rows {
+        if let Ok(values) = serde_json::from_str::<Vec<String>>(&row?) { for value in values { if !value.trim().is_empty() { actors_set.insert(value); } } }
+    }
+
+    let order_sql = match sort.trim().to_ascii_lowercase().as_str() {
+        "number" | "number_asc" => "number ASC, updated_at DESC",
+        "title" | "title_asc" => "title COLLATE NOCASE ASC, number ASC",
+        "date" | "release_date" | "release_date_desc" => "release_date DESC, number ASC",
+        "updated_at_asc" => "updated_at ASC, number ASC",
+        _ => "updated_at DESC, number ASC",
+    };
+    let sql = format!("SELECT number, asset_id, title, original_title, actors_json, maker, label, series, director, release_date, duration_minutes, cover_url, sample_images_json, tags_json, source, updated_at FROM movie_metadata{where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut page_args: Vec<Box<dyn ToSql>> = args;
+    page_args.push(Box::new(limit.min(100)));
+    page_args.push(Box::new(offset));
+    let rows = stmt.query_map(rusqlite::params_from_iter(page_args.iter().map(|v| v.as_ref())), metadata_from_row)?;
+    let items = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(MovieLibraryPage { items, total, makers: makers.into_iter().collect(), actors: actors_set.into_iter().collect() })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrapeIssue {
+    pub number: String,
+    pub error: String,
+    pub category: String,
+    pub retryable: bool,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrapeIssueCount { pub category: String, pub count: usize }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrapeIssuePage {
+    pub items: Vec<ScrapeIssue>,
+    pub total: usize,
+    pub counts: Vec<ScrapeIssueCount>,
+}
+
+fn looks_like_padding_candidate(number: &str) -> bool {
+    let Some((prefix, digits)) = number.split_once('-') else { return false; };
+    (2..=7).contains(&prefix.len()) && digits.len() == 5 && digits.starts_with("00")
+}
+
+fn classify_scrape_error(number: &str, error: &str) -> (&'static str, bool) {
+    let lower = error.to_ascii_lowercase();
+    // A conventional title with a zero-padded 5-digit suffix may be an
+    // alternate presentation (e.g. IPX-00015), never an automatic binding.
+    // Surface it for an explicit operator decision instead of retrying blindly.
+    if looks_like_padding_candidate(number) && !number.starts_with("FC2-")
+        && (lower.contains("404") || lower.contains("未找到") || lower.contains("not found") || lower.contains("不匹配") || lower.contains("身份")) {
+        return ("padding_candidate", false);
+    }
+    if lower.contains("fc2") && (lower.contains("404") || lower.contains("未找到") || lower.contains("软404") || lower.contains("not found")) { ("fc2_missing", false) }
+    else if lower.contains("身份") || lower.contains("不匹配") || lower.contains("核验") || lower.contains("番号格式") { ("identity", false) }
+    else if lower.contains("404") || lower.contains("未找到") || lower.contains("not found") || lower.contains("not_found") { ("not_found", false) }
+    else if lower.contains("验证") || lower.contains("captcha") || lower.contains("cloudflare") || lower.contains("driver-verify") || lower.contains("challenge") { ("blocked", true) }
+    else if lower.contains("请求") || lower.contains("读取") || lower.contains("超时") || lower.contains("timeout") || lower.contains("状态异常") || lower.contains("连接") { ("network", true) }
+    else { ("other", true) }
+}
+
+pub fn list_scrape_issues(conn: &Connection, kind: &str, query: &str, limit: u32, offset: u32) -> Result<ScrapeIssuePage, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let mut stmt = conn.prepare("SELECT number, error, updated_at FROM scrape_failures ORDER BY updated_at DESC, number ASC")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+    let kind = kind.trim().to_ascii_lowercase();
+    let query = query.trim().to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (number, error, updated_at) = row?;
+        let (category, retryable) = classify_scrape_error(&number, &error);
+        if !query.is_empty() && !format!("{} {} {}", number, error, category).to_ascii_lowercase().contains(&query) { continue; }
+        candidates.push(ScrapeIssue { number, error, category: category.to_string(), retryable, updated_at });
+    }
+    // Counts represent every category matching the text query, independent of
+    // the selected category chip; total/items honor the selected kind.
+    let mut count_map = std::collections::BTreeMap::<String, usize>::new();
+    for item in &candidates { *count_map.entry(item.category.clone()).or_default() += 1; }
+    let all: Vec<ScrapeIssue> = candidates.into_iter().filter(|item| kind.is_empty() || kind == "all" || kind == item.category).collect();
+    let total = all.len();
+    let start = offset as usize;
+    let end = start.saturating_add(limit.min(100) as usize).min(total);
+    let items = if start >= total { Vec::new() } else { all[start..end].to_vec() };
+    let counts = count_map.into_iter().map(|(category, count)| ScrapeIssueCount { category, count }).collect();
+    Ok(ScrapeIssuePage { items, total, counts })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnrecognizedVideo { pub id: String, pub file_name: String, pub remote_path: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnrecognizedVideoPage { pub items: Vec<UnrecognizedVideo>, pub total: usize }
+
+/// Return only current, non-missing video assets under the configured whitelist
+/// whose filename extractor cannot establish one unambiguous identity.
+pub fn list_unrecognized_videos(conn: &Connection, limit: u32, offset: u32) -> Result<UnrecognizedVideoPage, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let whitelist = get_scrape_whitelist(conn)?;
+    let mut stmt = conn.prepare("SELECT id, file_name, remote_path FROM assets WHERE missing = 0 AND media_type = 'video' ORDER BY id ASC")?;
+    let rows = stmt.query_map([], |r| Ok(UnrecognizedVideo { id: r.get(0)?, file_name: r.get(1)?, remote_path: r.get(2)? }))?;
+    let mut all = Vec::new();
+    for row in rows {
+        let item = row?;
+        if whitelist.iter().any(|prefix| path_under(&item.remote_path, prefix)) && extract_jav_number(&item.file_name).is_none() { all.push(item); }
+    }
+    let total = all.len();
+    let start = offset as usize;
+    let end = start.saturating_add(limit.min(100) as usize).min(total);
+    let items = if start >= total { Vec::new() } else { all[start..end].to_vec() };
+    Ok(UnrecognizedVideoPage { items, total })
+}
+
 pub fn get_related_movies(conn: &Connection, number: &str, limit: u32) -> Result<Vec<MovieMetadata>, rusqlite::Error> {
     let current = match get_movie_metadata(conn, number)? {
         Some(m) => m,
@@ -1187,10 +1551,10 @@ pub fn set_scrape_whitelist(conn: &mut Connection, paths: Vec<String>) -> Result
     tx.execute("DELETE FROM scrape_whitelist", [])?;
     let now = chrono::Utc::now().timestamp();
     for p in paths {
-        let clean = p.trim();
+        let clean = normalize_scrape_path(&p);
         if !clean.is_empty() {
             tx.execute(
-                "INSERT INTO scrape_whitelist (path, enabled, created_at) VALUES (?1, 1, ?2)",
+                "INSERT OR IGNORE INTO scrape_whitelist (path, enabled, created_at) VALUES (?1, 1, ?2)",
                 params![clean, now],
             )?;
         }
@@ -1199,7 +1563,18 @@ pub fn set_scrape_whitelist(conn: &mut Connection, paths: Vec<String>) -> Result
     Ok(())
 }
 
+fn normalize_scrape_path(path: &str) -> String {
+    let path = path.trim().replace('\\', "/");
+    let mut result = String::new();
+    for ch in path.chars() {
+        if ch != '/' || !result.ends_with('/') { result.push(ch); }
+    }
+    result
+}
+
 fn path_under(path: &str, prefix: &str) -> bool {
+    let path = normalize_scrape_path(path);
+    let prefix = normalize_scrape_path(prefix);
     let prefix = prefix.trim_end_matches('/');
     prefix.is_empty() || path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
 }
@@ -1247,6 +1622,9 @@ pub struct BatchScrapeStats {
     pub distinct_numbers: usize,
     pub already_scraped: usize,
     pub remaining_to_scrape: usize,
+    pub failed_count: usize,
+    pub pending_revalidation: usize,
+    pub unrecognized_videos: usize,
 }
 
 fn batch_progress_cell() -> &'static Mutex<BatchScrapeProgress> {
@@ -1330,10 +1708,21 @@ pub fn get_batch_scrape_stats(conn: &Connection) -> Result<BatchScrapeStats, rus
         distinct_numbers: distinct_numbers.len(),
         already_scraped,
         remaining_to_scrape: remaining,
+        failed_count: number_assets.keys().filter(|number| conn.query_row("SELECT EXISTS(SELECT 1 FROM scrape_failures WHERE number=?1)", params![number], |row| row.get::<_, bool>(0)).unwrap_or(false)).count(),
+        pending_revalidation: conn.query_row("SELECT count(*) FROM movie_metadata WHERE verification_version=0", [], |row| row.get(0))?,
+        unrecognized_videos: total_videos.saturating_sub(number_assets.values().map(Vec::len).sum::<usize>()),
     })
 }
 
 pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
+    start_batch_scrape_with_mode(db_path, false)
+}
+
+pub fn start_failed_batch_scrape_engine(db_path: String) -> Result<(), String> {
+    start_batch_scrape_with_mode(db_path, true)
+}
+
+fn start_batch_scrape_with_mode(db_path: String, failed_only: bool) -> Result<(), String> {
     {
         let mut g = batch_progress_cell().lock().map_err(|e| e.to_string())?;
         if g.running {
@@ -1402,9 +1791,20 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
         };
         let mut queue = Vec::new();
         for (number, assets) in &number_assets {
+            if failed_only {
+                match conn.query_row("SELECT EXISTS(SELECT 1 FROM scrape_failures WHERE number=?1)", params![number], |row| row.get::<_, bool>(0)) {
+                    Ok(true) => {},
+                    Ok(false) => continue,
+                    Err(e) => {
+                        if let Ok(mut g) = batch_progress_cell().lock() { g.running = false; g.last_error = Some(e.to_string()); }
+                        return;
+                    }
+                }
+            }
             match get_movie_metadata(&conn, number) {
                 Ok(Some(_)) => {
                     // Repair cached entries too: no network is necessary to bind each duplicate file.
+                    let _ = conn.execute("DELETE FROM scrape_failures WHERE number=?1", params![number]);
                     for asset in assets {
                         if let Err(e) = bind_movie_asset(&conn, number, asset) {
                             if let Ok(mut g) = batch_progress_cell().lock() { g.last_error = Some(e.to_string()); }
@@ -1460,6 +1860,13 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
                 }
                 Err(e) => Err(e),
             };
+            let persistence = match &result {
+                Ok(()) => conn.execute("DELETE FROM scrape_failures WHERE number=?1", params![number]),
+                Err(error) => conn.execute("INSERT INTO scrape_failures(number,error,updated_at) VALUES (?1,?2,?3) ON CONFLICT(number) DO UPDATE SET error=excluded.error,updated_at=excluded.updated_at", params![number, error, chrono::Utc::now().timestamp()]),
+            };
+            if let Err(e) = persistence {
+                if let Ok(mut g) = batch_progress_cell().lock() { g.last_error = Some(format!("记录重试状态失败：{e}")); }
+            }
             if let Ok(mut g) = batch_progress_cell().lock() {
                 g.completed += 1;
                 match result {
@@ -1506,6 +1913,34 @@ mod tests {
     }
 
     #[test]
+    fn fc2_parser_rejects_related_and_near_id_pages() {
+        let base = "https://adult.contents.fc2.com/article/4939195/";
+        let related = r#"<link rel="canonical" href="https://adult.contents.fc2.com/article/4939195/"><script type="application/ld+json">{"sku":"49391950","name":"FC2-PPV-49391950"}</script>"#;
+        assert!(parse_fc2_html(related, "4939195", base).is_err());
+        let wrong = r#"<link rel="canonical" href="https://adult.contents.fc2.com/article/49391950/"><script type="application/ld+json">{"sku":"49391950","name":"FC2-PPV-49391950"}</script>"#;
+        assert!(parse_fc2_html(wrong, "4939195", base).is_err());
+        let no_data = r#"<link rel="canonical" href="https://adult.contents.fc2.com/article/4939195/"><meta property="og:title" content="FC2-PPV-4939195">"#;
+        assert!(parse_fc2_html(no_data, "4939195", base).is_err());
+    }
+
+    #[test]
+    fn fc2_parser_accepts_actual_html_fixture() {
+        let html = r#"<link rel="canonical" href="https://adult.contents.fc2.com/article/4939195/"><meta property="og:url" content="https://adult.contents.fc2.com/article/4939195/"><script type="application/ld+json">{"sku":"4939195","productID":"4939195","name":"FC2-PPV-4939195 Sample","image":{"url":"//storage200000.contents.fc2.com/cover.png"}}</script><div data-feed="sample-images"><ul><a href="//contents-thumbnail2.fc2.com/w1280/sample.png"></a></ul></div><p>販売日 : 2026/07/15</p>"#;
+        let parsed = parse_fc2_html(html, "4939195", "https://adult.contents.fc2.com/article/4939195/").unwrap();
+        assert_eq!(parsed.title, "FC2-PPV-4939195 Sample");
+        let unnumbered = html.replace("FC2-PPV-4939195 Sample", "Official product title without printed number");
+        assert!(parse_fc2_html(&unnumbered, "4939195", "https://adult.contents.fc2.com/article/4939195/").is_ok());
+        assert_eq!(parsed.samples.len(), 1);
+        assert_eq!(parsed.release_date.as_deref(), Some("2026/07/15"));
+    }
+
+    #[test]
+    fn fc2_filename_normalization_does_not_guess_nonstandard_ids() {
+        assert_eq!(extract_jav_number("FC2PPV-4939195.mp4").as_deref(), Some("FC2-4939195"));
+        assert_eq!(extract_jav_number("fc3162920_4K.mp4"), None);
+    }
+
+    #[test]
     fn filename_identities_are_precise_and_provider_scoped() {
         for (input, expected) in [
             ("[中文字幕] SSIS-123_4K.mp4", "SSIS-123"),
@@ -1535,6 +1970,47 @@ mod tests {
         assert!(javdb_exact_card(html, "SSIS-12").is_none());
         assert!(javdb_exact_card(r#"<a href="/v/title"><div>SSIS-123</div></a>"#, "SSIS-123").is_none());
         assert!(javdb_exact_card(r#"<a href="/v/a"><strong>FC2-PPV-1234567</strong></a>"#, "FC2-1234567").is_some());
+    }
+
+    #[test]
+    fn caribbean_identity_compatibility_requires_main_work_evidence() {
+        let canonical = r#"<link rel='canonical' href='https://www.caribbeancom.com/moviepages/011015-780/'><div class='recommend'><h1>011015-780</h1></div>"#;
+        assert!(caribbean_exact_identity(canonical, "011015-780"));
+        let archived = r#"<main><div class='movie-gallery section' id='sampleexclude'><div class='gallery-item fancy-gallery'><a class='gallery-item fancy-gallery' href='/moviepages/011015-780/images/l/001.jpg'><img src='/moviepages/011015-780/images/s/001.jpg'></a></div></div><h1>日本語タイトル</h1></main><div class='recommend'><h1>011015-999</h1></div>"#;
+        assert!(caribbean_exact_identity(archived, "011015-780"));
+        let related_only = r#"<div class='recommend'><h1>011015-780</h1><a class='gallery-item fancy-gallery' href='/moviepages/011015-7800/images/l/001.jpg'></a></div>"#;
+        assert!(!caribbean_exact_identity(related_only, "011015-780"));
+    }
+
+    #[test]
+    fn caribbean_identity_rejects_contradictory_canonical_and_near_id() {
+        let contradictory = r#"<link rel='canonical' href='https://www.caribbeancom.com/moviepages/011015-781/'><a class='gallery-item fancy-gallery' href='/moviepages/011015-780/images/l/001.jpg'></a>"#;
+        assert!(!caribbean_exact_identity(contradictory, "011015-780"));
+        let near = r#"<a class='gallery-item fancy-gallery' href='/moviepages/011015-7800/images/l/001.jpg'></a>"#;
+        assert!(!caribbean_exact_identity(near, "011015-780"));
+        let unicode = "<main>日本語タイトル<div class='movie-gallery'><a class='gallery-item fancy-gallery' href='/moviepages/011015-780/images/l/001.jpg'><img src='/moviepages/011015-780/images/s/001.jpg'></a></div></main>";
+        assert!(caribbean_exact_identity(unicode, "011015-780"));
+    }
+
+    #[test]
+    fn caribbean_gallery_excludes_members_and_related_movies() {
+        let html = r#"<a href='/moviepages/011015-780/images/l/001.jpg'><img src='/moviepages/011015-780/images/s/001.jpg'></a>
+            <a href='/member/moviepages/011015-780/images/l/006.jpg'>Member</a>
+            <a href='/moviepages/other/images/l/001.jpg'>Related</a>"#;
+        assert_eq!(caribbean_sample_images(html, "011015-780"), vec!["https://www.caribbeancom.com/moviepages/011015-780/images/l/001.jpg"]);
+        assert!(path_under(r"/library\\movies//one", "/library/movies/"));
+        assert!(!path_under("/library/movies-other", "/library/movies"));
+    }
+
+    #[test]
+    fn javbus_gallery_handles_class_order_quotes_and_relative_links() {
+        let html = r#"<a href='//cdn.example.com/a.jpg?x=1&amp;y=2' class='extra sample-box'><img></a>
+            <a id="b" class="sample-box extra" href="images/b.jpg"></a>
+            <a class="sample-box" href="images/b.jpg"></a>
+            <a class="not-sample-box" href="wrong.jpg"></a>"#;
+        assert_eq!(javbus_sample_images(html), vec![
+            "https://cdn.example.com/a.jpg?x=1&y=2", "https://www.javbus.com/images/b.jpg"
+        ]);
     }
 
     #[test]
@@ -1591,6 +2067,55 @@ mod tests {
         let stats = get_batch_scrape_stats(&conn).unwrap();
         assert_eq!(stats.total_whitelisted_videos, 2);
         assert_eq!(stats.distinct_numbers, 1);
+    }
+
+    #[test]
+    fn library_query_filters_verified_rows_and_paginates_stably() {
+        let conn = database();
+        let mut first = metadata("SSIS-002", None); first.actors = vec!["演员甲".into()]; first.maker = Some("MakerA".into()); first.updated_at = 2;
+        let mut second = metadata("SSIS-001", None); second.actors = vec!["演员乙".into()]; second.maker = Some("MakerA".into()); second.updated_at = 1;
+        save_movie_metadata(&conn, &first).unwrap(); save_movie_metadata(&conn, &second).unwrap();
+        conn.execute("INSERT INTO scrape_failures(number,error,updated_at) VALUES ('BAD-001','FC2 官方页面未找到作品（软404）',9)", []).unwrap();
+        let page = query_movie_library(&conn, "", "MakerA", "演员甲", "number", 10, 0).unwrap();
+        assert_eq!(page.total, 1); assert_eq!(page.items[0].number, "SSIS-002");
+        assert_eq!(page.makers, vec!["MakerA"]); assert!(page.actors.iter().any(|value| value == "演员甲"));
+        let performer_id: String = conn.query_row("SELECT id FROM performers WHERE name='演员甲'", [], |r| r.get(0)).unwrap();
+        conn.execute("UPDATE performers SET aliases_json='[\"Alias A\"]' WHERE id=?1", params![performer_id]).unwrap();
+        assert_eq!(query_movie_library(&conn, "Alias A", "", "", "number", 10, 0).unwrap().total, 1);
+        assert_eq!(query_movie_library(&conn, "", "", &performer_id, "number", 10, 0).unwrap().total, 1);
+        let all = query_movie_library(&conn, "", "", "", "number", 1, 1).unwrap();
+        assert_eq!(all.items[0].number, "SSIS-002");
+        assert_eq!(query_movie_library(&conn, "%", "", "", "number", 10, 0).unwrap().total, 0);
+        let date = query_movie_library(&conn, "", "", "", "date", 10, 0).unwrap();
+        assert_eq!(date.total, 2);
+        assert!(date.makers.iter().any(|value| value == "MakerA"));
+        assert!(date.actors.iter().any(|value| value == "演员甲") && date.actors.iter().any(|value| value == "演员乙"));
+    }
+
+    #[test]
+    fn issue_categories_are_filtered_and_counts_exclude_successes() {
+        let conn = database();
+        for (number, error) in [("FC2-1", "FC2 官方页面未找到作品（软404）"), ("SSIS-1", "JavBus 请求超时"), ("SSIS-2", "JavDB 详情番号不匹配")] {
+            conn.execute("INSERT INTO scrape_failures(number,error,updated_at) VALUES (?1,?2,1)", params![number, error]).unwrap();
+        }
+        conn.execute("INSERT INTO scrape_failures(number,error,updated_at) VALUES ('IPX-00015','JavBus 未找到番号',1)", []).unwrap();
+        let page = list_scrape_issues(&conn, "network", "", 10, 0).unwrap();
+        assert_eq!(page.total, 1); assert_eq!(page.items[0].category, "network"); assert!(page.items[0].retryable);
+        let padding = list_scrape_issues(&conn, "padding_candidate", "", 10, 0).unwrap();
+        assert_eq!(padding.total, 1); assert!(!padding.items[0].retryable);
+        let all = list_scrape_issues(&conn, "all", "", 10, 0).unwrap();
+        assert_eq!(all.total, 4); assert!(all.counts.iter().any(|c| c.category == "fc2_missing" && c.count == 1));
+    }
+
+    #[test]
+    fn unrecognized_videos_honor_whitelist_and_current_video_boundary() {
+        let mut conn = database();
+        set_scrape_whitelist(&mut conn, vec!["/media".into()]).unwrap();
+        for (id, name, path, missing, media) in [("a", "holiday.mp4", "/media/holiday.mp4", 0, "video"), ("b", "SSIS-123.mp4", "/media/ok.mp4", 0, "video"), ("c", "unknown.mp4", "/outside/unknown.mp4", 0, "video"), ("d", "gone.mp4", "/media/gone.mp4", 1, "video"), ("e", "doc.bin", "/media/doc.bin", 0, "image")] {
+            conn.execute("INSERT INTO assets VALUES (?1,?2,?3,?4,?5)", params![id,name,path,missing,media]).unwrap();
+        }
+        let page = list_unrecognized_videos(&conn, 10, 0).unwrap();
+        assert_eq!(page.total, 1); assert_eq!(page.items[0].id, "a");
     }
 
     #[test]
