@@ -12,9 +12,12 @@ public struct MovieLibraryView: View {
     @State private var showScrapeSheet = false
     @State private var batchStats: BatchScrapeStats?
     @State private var batchProgress: BatchScrapeProgress?
+    @State private var preview: PreviewItem?
 
+    // 手机端黄金 2 列网格；iPad 端根据宽度自动扩展
     private let columns = [
-        GridItem(.adaptive(minimum: 155, maximum: 200), spacing: 14)
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12)
     ]
 
     public init() {}
@@ -57,67 +60,73 @@ public struct MovieLibraryView: View {
     public var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                // 正在运行时的简易状态提示
+                // 正在运行时的悬浮状态提示
                 if let prog = batchProgress, prog.running {
-                    HStack {
+                    HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
-                        Text(prog.paused ? "增量刮削已暂停" : "正在温和刮削: \(prog.currentNumber ?? "")")
-                            .font(.caption.bold())
-                            .foregroundStyle(.purple)
+                            .tint(.purple)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(prog.paused ? "增量刮削已暂停" : "正在温和防封刮削")
+                                .font(.caption.bold())
+                                .foregroundStyle(.primary)
+                            if let cur = prog.currentNumber {
+                                Text("番号: \(cur)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.purple)
+                            }
+                        }
                         Spacer()
-                        Text("\(prog.completed)/\(prog.total)")
-                            .font(.caption2)
+                        Text("\(prog.completed) / \(prog.total)")
+                            .font(.caption2.bold())
                             .foregroundStyle(.secondary)
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
-                    .background(Color.purple.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                    .background(Color.purple.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Color.purple.opacity(0.25), lineWidth: 1)
+                    )
                     .padding(.horizontal)
                 }
 
-                // 筛选胶囊水平滚动
-                if !availableMakers.isEmpty || !availableActors.isEmpty {
+                // 热门女优快捷横向筛选轨（女优专区）
+                if !availableActors.isEmpty {
+                    hotActorsTrack
+                }
+
+                // 片厂与综合筛选
+                if !availableMakers.isEmpty || selectedActor != nil || selectedMaker != nil {
                     filterChips
                 }
 
                 if loading && movies.isEmpty {
                     VStack(spacing: 12) {
                         ProgressView()
-                        Text("正在载入影视库海报墙...")
+                            .controlSize(.regular)
+                            .tint(.purple)
+                        Text("正在载入影视百科海报墙...")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 80)
                 } else if filteredMovies.isEmpty {
-                    VStack(spacing: 12) {
-                        Image(systemName: "film")
-                            .font(.system(size: 44))
-                            .foregroundStyle(.secondary)
-                        Text(movies.isEmpty ? "影视库暂无入库影片" : "未找到匹配的影片")
-                            .font(.headline)
-                        Text(movies.isEmpty ? "请点击右上角【手动刮削】按钮，从白名单目录中抓取官方海报与百科。" : "请尝试更改搜索关键词或重置筛选。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 32)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 60)
+                    emptyStateView
                 } else {
-                    // Emby 风格官方高清海报网格
-                    LazyVGrid(columns: columns, spacing: 16) {
+                    // 流媒体风格 2 列官方海报流
+                    LazyVGrid(columns: columns, spacing: 14) {
                         ForEach(filteredMovies) { m in
                             Button {
                                 selectedMovie = m
                             } label: {
                                 posterCell(m)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(PosterCardButtonStyle())
                         }
                     }
-                    .padding(.horizontal)
+                    .padding(.horizontal, 14)
                 }
             }
             .padding(.vertical, 8)
@@ -131,10 +140,14 @@ public struct MovieLibraryView: View {
                     showScrapeSheet = true
                 } label: {
                     Label("手动刮削", systemImage: "bolt.badge.clock.fill")
+                        .foregroundStyle(Color.purple)
                 }
             }
         }
         .task {
+            await loadData()
+        }
+        .refreshable {
             await loadData()
         }
         .sheet(item: $selectedMovie) { m in
@@ -143,9 +156,22 @@ public struct MovieLibraryView: View {
                 assetId: m.assetId,
                 fileName: m.title,
                 remotePath: nil
-            ) { _ in
-                // 在详情中点击播放时
+            ) { targetId in
+                Task { await playAsset(targetId, title: m.title) }
             }
+            .environmentObject(model)
+        }
+        .fullScreenCover(item: $preview) { item in
+            GestureVideoPlayerSheet(
+                url: item.url,
+                title: item.title,
+                assetId: item.assetId,
+                startAt: item.startAt,
+                fallbackURL: item.fallbackURL,
+                sourceLabel: item.sourceLabel,
+                remotePath: item.remotePath
+            )
+            .id(item.id)
             .environmentObject(model)
         }
         .sheet(isPresented: $showScrapeSheet) {
@@ -153,74 +179,46 @@ public struct MovieLibraryView: View {
         }
     }
 
-    private func posterCell(_ m: MovieMetadata) -> some View {
+    // MARK: - 热门女优横向快捷条
+    private var hotActorsTrack: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ZStack(alignment: .topLeading) {
-                // 封面
-                if let cover = m.coverUrl, let url = model.proxyScraperImageURL(rawUrl: cover) {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image
-                                .resizable()
-                                .scaledToFill()
-                        case .failure:
-                            Rectangle().fill(Color.secondary.opacity(0.15))
-                        case .empty:
-                            Rectangle().fill(Color.secondary.opacity(0.1))
-                        @unknown default:
-                            EmptyView()
+            HStack(spacing: 4) {
+                Image(systemName: "heart.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.pink)
+                Text("女优专区")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(availableActors.prefix(30), id: \.self) { actor in
+                        let isSelected = selectedActor == actor
+                        Button {
+                            selectedActor = isSelected ? nil : actor
+                        } label: {
+                            Text(actor)
+                                .font(.caption2.weight(isSelected ? .bold : .medium))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    isSelected ?
+                                    AnyShapeStyle(LinearGradient(colors: [.pink, .roseRed], startPoint: .topLeading, endPoint: .bottomTrailing)) :
+                                    AnyShapeStyle(Color.secondary.opacity(0.12)),
+                                    in: Capsule()
+                                )
+                                .foregroundStyle(isSelected ? .white : .primary)
                         }
                     }
-                } else {
-                    Rectangle().fill(Color.secondary.opacity(0.15))
                 }
-
-                // 左上角：番号药丸
-                Text(m.number)
-                    .font(.system(size: 9.5, weight: .bold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2.5)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 4))
-                    .foregroundStyle(.white)
-                    .padding(5)
-
-                // 右上角：年份
-                if let date = m.releaseDate, let yr = date.split(separator: "-").first {
-                    Text(String(yr))
-                        .font(.system(size: 9, weight: .semibold))
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 2)
-                        .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 3))
-                        .foregroundStyle(.white)
-                        .padding(5)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                }
-            }
-            .aspectRatio(2 / 3, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .shadow(color: .black.opacity(0.2), radius: 5, y: 3)
-
-            // 文本信息
-            Text(m.title)
-                .font(.system(size: 11.5, weight: .semibold))
-                .lineLimit(2)
-                .foregroundStyle(.primary)
-
-            if !m.actors.isEmpty {
-                Text(m.actors.joined(separator: " / "))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.purple)
-                    .lineLimit(1)
-            } else if let maker = m.maker {
-                Text(maker)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                .padding(.horizontal)
             }
         }
     }
 
+    // MARK: - 片厂与辅助筛选
     private var filterChips: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
@@ -234,7 +232,7 @@ public struct MovieLibraryView: View {
                             Text("重置筛选")
                         }
                         .font(.caption2.bold())
-                        .padding(.horizontal, 8)
+                        .padding(.horizontal, 9)
                         .padding(.vertical, 5)
                         .background(Color.red.opacity(0.12), in: Capsule())
                         .foregroundStyle(.red)
@@ -243,34 +241,21 @@ public struct MovieLibraryView: View {
 
                 // 片厂筛选
                 ForEach(availableMakers.prefix(15), id: \.self) { maker in
+                    let isSelected = selectedMaker == maker
                     Button {
-                        selectedMaker = (selectedMaker == maker) ? nil : maker
+                        selectedMaker = isSelected ? nil : maker
                     } label: {
                         Text(maker)
-                            .font(.caption2.bold())
+                            .font(.caption2.weight(isSelected ? .bold : .medium))
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
-                            .background(selectedMaker == maker ? Color.purple : Color.secondary.opacity(0.12), in: Capsule())
-                            .foregroundStyle(selectedMaker == maker ? .white : .primary)
-                    }
-                }
-
-                // 女优筛选
-                ForEach(availableActors.prefix(20), id: \.self) { actor in
-                    Button {
-                        selectedActor = (selectedActor == actor) ? nil : actor
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "heart.fill")
-                                .font(.system(size: 8))
-                                .foregroundStyle(selectedActor == actor ? .white : .pink)
-                            Text(actor)
-                        }
-                        .font(.caption2.bold())
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(selectedActor == actor ? Color.pink : Color.secondary.opacity(0.12), in: Capsule())
-                        .foregroundStyle(selectedActor == actor ? .white : .primary)
+                            .background(
+                                isSelected ?
+                                AnyShapeStyle(LinearGradient(colors: [.purple, .indigo], startPoint: .topLeading, endPoint: .bottomTrailing)) :
+                                AnyShapeStyle(Color.secondary.opacity(0.12)),
+                                in: Capsule()
+                            )
+                            .foregroundStyle(isSelected ? .white : .primary)
                     }
                 }
             }
@@ -278,6 +263,157 @@ public struct MovieLibraryView: View {
         }
     }
 
+    // MARK: - 空状态视图
+    private var emptyStateView: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "film.stack")
+                .font(.system(size: 48))
+                .foregroundStyle(.purple.opacity(0.8))
+            Text(movies.isEmpty ? "影视库暂未入库影片" : "未找到匹配的影片")
+                .font(.headline)
+            Text(movies.isEmpty ? "请点击下方或右上角【手动刮削】，系统将基于白名单目录智能抓取官方高清海报与百科。" : "请尝试更改搜索关键词或重置筛选。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+
+            if movies.isEmpty {
+                Button {
+                    showScrapeSheet = true
+                } label: {
+                    Label("立即手动增量刮削", systemImage: "bolt.fill")
+                        .font(.subheadline.bold())
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 10)
+                        .background(LinearGradient(colors: [.purple, .indigo], startPoint: .leading, endPoint: .trailing), in: Capsule())
+                        .foregroundStyle(.white)
+                        .shadow(color: .purple.opacity(0.35), radius: 8, y: 3)
+                }
+                .padding(.top, 4)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 60)
+    }
+
+    // MARK: - 官方海报卡片 (2 列黄金比例)
+    private func posterCell(_ m: MovieMetadata) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack(alignment: .topLeading) {
+                // 封面海报
+                if let cover = m.coverUrl, let url = model.proxyScraperImageURL(rawUrl: cover) {
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image
+                                .resizable()
+                                .scaledToFill()
+                        case .failure:
+                            Rectangle().fill(Color.secondary.opacity(0.18))
+                                .overlay(Image(systemName: "film").foregroundStyle(.secondary))
+                        case .empty:
+                            Rectangle().fill(Color.secondary.opacity(0.12))
+                                .overlay(ProgressView().controlSize(.small))
+                        @unknown default:
+                            EmptyView()
+                        }
+                    }
+                } else {
+                    Rectangle().fill(Color.secondary.opacity(0.18))
+                        .overlay(Image(systemName: "film").foregroundStyle(.secondary))
+                }
+
+                // 底部半透明暗黑渐变遮罩
+                LinearGradient(
+                    colors: [.clear, Color.black.opacity(0.75)],
+                    startPoint: .center,
+                    endPoint: .bottom
+                )
+
+                // 左上角：番号药丸
+                Text(m.number)
+                    .font(.system(size: 9.5, weight: .bold))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+                    .padding(6)
+
+                // 右上角：来源/年份彩色标签
+                sourceOrYearBadge(m)
+                    .padding(6)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+
+                // 悬浮/海报底部女优小标
+                if !m.actors.isEmpty {
+                    HStack(spacing: 3) {
+                        Image(systemName: "heart.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.pink)
+                        Text(m.actors.joined(separator: " / "))
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                    }
+                    .padding(6)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                }
+            }
+            .aspectRatio(2 / 3, contentMode: .fill)
+            .clipped()
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .shadow(color: .black.opacity(0.22), radius: 6, y: 3)
+
+            // 卡片下部文本信息
+            Text(m.title)
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(2)
+                .foregroundStyle(.primary)
+
+            if m.actors.isEmpty, let maker = m.maker {
+                Text(maker)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sourceOrYearBadge(_ m: MovieMetadata) -> some View {
+        if m.source == "caribbeancom" {
+            Text("加勒比")
+                .font(.system(size: 8.5, weight: .bold))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(LinearGradient(colors: [.blue, .cyan], startPoint: .leading, endPoint: .trailing), in: RoundedRectangle(cornerRadius: 4))
+                .foregroundStyle(.white)
+        } else if m.source == "1pondo" {
+            Text("一本道")
+                .font(.system(size: 8.5, weight: .bold))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(LinearGradient(colors: [.orange, .yellow], startPoint: .leading, endPoint: .trailing), in: RoundedRectangle(cornerRadius: 4))
+                .foregroundStyle(.white)
+        } else if m.number.hasPrefix("FC2-") {
+            Text("FC2")
+                .font(.system(size: 8.5, weight: .bold))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(LinearGradient(colors: [.red, .pink], startPoint: .leading, endPoint: .trailing), in: RoundedRectangle(cornerRadius: 4))
+                .foregroundStyle(.white)
+        } else if let date = m.releaseDate, let yr = date.split(separator: "-").first {
+            Text(String(yr))
+                .font(.system(size: 8.5, weight: .semibold))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 4))
+                .foregroundStyle(.white)
+        }
+    }
+
+    // MARK: - 手动刮削管理控制台
     private var manualScrapeSheet: some View {
         NavigationStack {
             Form {
@@ -384,13 +520,30 @@ public struct MovieLibraryView: View {
         loading = true
         do {
             let list = try await client.listMovieMetadata(limit: 1000, offset: 0)
-            self.movies = list.filter { $0.source != "javdb_not_found" }
+            // 过滤无封面或失败占位
+            self.movies = list.filter {
+                $0.source != "javdb_not_found" &&
+                !($0.coverUrl ?? "").isEmpty
+            }
             self.batchStats = try? await client.getBatchScrapeStats()
             self.batchProgress = try? await client.getBatchScrapeProgress()
         } catch {
             print("Failed to load movies:", error)
         }
         loading = false
+    }
+
+    private func playAsset(_ assetId: String, title: String) async {
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else { return }
+        preview = PreviewItem(
+            url: source.url,
+            isVideo: true,
+            assetId: assetId,
+            title: title,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: nil
+        )
     }
 
     private func startManualScrape() async {
@@ -418,4 +571,17 @@ public struct MovieLibraryView: View {
         batchProgress = try? await client.stopBatchScrape()
         await loadData()
     }
+}
+
+// 触摸微缩微动效
+private struct PosterCardButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
+            .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
+    }
+}
+
+private extension Color {
+    static let roseRed = Color(red: 0.96, green: 0.25, blue: 0.37)
 }

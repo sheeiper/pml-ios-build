@@ -668,7 +668,7 @@ async fn dispatch_command(
                         return Ok(existing);
                     }
                 }
-                let mut meta = crate::jav_scraper::scrape_from_javdb(&number).await?;
+                let mut meta = crate::jav_scraper::scrape_movie_metadata(&number).await?;
                 meta.asset_id = if asset_id.is_empty() { None } else { Some(asset_id) };
                 crate::jav_scraper::save_movie_metadata(&conn, &meta)
                     .map_err(|e| format!("保存元数据到数据库失败：{e}"))?;
@@ -2076,6 +2076,10 @@ async fn proxy_scraper_image(
         "https://javdb.com/"
     } else if raw_url.contains("javbus") {
         "https://www.javbus.com/"
+    } else if raw_url.contains("caribbeancom") {
+        "https://www.caribbeancom.com/"
+    } else if raw_url.contains("1pondo") {
+        "https://www.1pondo.tv/"
     } else if raw_url.contains("dmm") {
         "https://www.dmm.co.jp/"
     } else {

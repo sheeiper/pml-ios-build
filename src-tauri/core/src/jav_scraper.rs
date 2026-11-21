@@ -70,7 +70,7 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
 
     // 1. FC2-PPV or FC2 check
     if let Some(idx) = upper.find("FC2") {
-        let remainder = &upper[idx..];
+        let remainder = &upper[idx + 3..];
         let digits: String = remainder.chars().filter(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 5 && digits.len() <= 8 {
             return Some(format!("FC2-{}", digits));
@@ -131,6 +131,215 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
     None
 }
 
+/// Fetch metadata from JavBus by JAV number (Direct, fast, highly reliable for commercial JAV).
+pub async fn scrape_from_javbus(number: &str) -> Result<MovieMetadata, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| format!("构建 HTTP 客户端失败：{e}"))?;
+
+    let url = format!("https://www.javbus.com/{}", number);
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7")
+        .header("Cookie", "existmag=mag;")
+        .send()
+        .await
+        .map_err(|e| format!("请求 JavBus 失败：{e}"))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!("JavBus 未收录番号【{number}】"));
+    }
+    if !resp.status().is_success() {
+        return Err(format!("JavBus 响应状态异常：{}", resp.status()));
+    }
+
+    let html = resp.text().await.map_err(|e| format!("读取 JavBus 响应失败：{e}"))?;
+    if html.contains("404 Page Not Found") || html.contains("404 Not Found") {
+        return Err(format!("JavBus 未找到番号【{number}】的作品"));
+    }
+
+    // 1. Title
+    let mut title = number.to_string();
+    if let Some(start) = html.find("<h3>") {
+        let rest = &html[start + 4..];
+        if let Some(end) = rest.find("</h3>") {
+            let t = rest[..end].trim();
+            if !t.is_empty() {
+                title = t.to_string();
+            }
+        }
+    }
+
+    // 2. Big Cover
+    let mut cover_url = None;
+    if let Some(start) = html.find("<a class=\"bigImage\"") {
+        let rest = &html[start..std::cmp::min(html.len(), start + 250)];
+        if let Some(href_idx) = rest.find("href=\"") {
+            let href_rest = &rest[href_idx + 6..];
+            if let Some(href_end) = href_rest.find('"') {
+                let mut c = href_rest[..href_end].trim().to_string();
+                if !c.is_empty() {
+                    if !c.starts_with("http") {
+                        c = format!("https://www.javbus.com{}", c);
+                    }
+                    cover_url = Some(c);
+                }
+            }
+        }
+    }
+
+    // 3. Release Date
+    let mut release_date = None;
+    if let Some(start) = html.find("發行日期:</span>") {
+        let rest = &html[start + 20..std::cmp::min(html.len(), start + 80)];
+        let date_chars: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+        let trimmed_date = date_chars.trim();
+        if !trimmed_date.is_empty() && trimmed_date.contains('-') {
+            release_date = Some(trimmed_date.to_string());
+        }
+    }
+
+    // 4. Maker (制作商)
+    let mut maker = None;
+    if let Some(start) = html.find("製作商:</span>") {
+        let rest = &html[start..std::cmp::min(html.len(), start + 200)];
+        if let Some(a_start) = rest.find("<a ") {
+            if let Some(txt_start) = rest[a_start..].find('>') {
+                let txt_rest = &rest[a_start + txt_start + 1..];
+                if let Some(txt_end) = txt_rest.find("</a>") {
+                    let m = txt_rest[..txt_end].trim();
+                    if !m.is_empty() {
+                        maker = Some(m.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Label (发行商)
+    let mut label = None;
+    if let Some(start) = html.find("發行商:</span>") {
+        let rest = &html[start..std::cmp::min(html.len(), start + 200)];
+        if let Some(a_start) = rest.find("<a ") {
+            if let Some(txt_start) = rest[a_start..].find('>') {
+                let txt_rest = &rest[a_start + txt_start + 1..];
+                if let Some(txt_end) = txt_rest.find("</a>") {
+                    let l = txt_rest[..txt_end].trim();
+                    if !l.is_empty() {
+                        label = Some(l.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Series (系列)
+    let mut series = None;
+    if let Some(start) = html.find("系列:</span>") {
+        let rest = &html[start..std::cmp::min(html.len(), start + 200)];
+        if let Some(a_start) = rest.find("<a ") {
+            if let Some(txt_start) = rest[a_start..].find('>') {
+                let txt_rest = &rest[a_start + txt_start + 1..];
+                if let Some(txt_end) = txt_rest.find("</a>") {
+                    let s = txt_rest[..txt_end].trim();
+                    if !s.is_empty() {
+                        series = Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Actresses (女优)
+    let mut actors = Vec::new();
+    for seg in html.split("<div class=\"star-name\"") {
+        if let Some(a_idx) = seg.find("<a ") {
+            if let Some(gt) = seg[a_idx..].find('>') {
+                let inner = &seg[a_idx + gt + 1..];
+                if let Some(lt) = inner.find("</a>") {
+                    let name = inner[..lt].trim();
+                    if !name.is_empty() && !actors.contains(&name.to_string()) {
+                        actors.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if actors.is_empty() {
+        for seg in html.split("href=\"https://www.javbus.com/star/") {
+            if let Some(gt) = seg.find('>') {
+                let inner = &seg[gt + 1..];
+                if let Some(lt) = inner.find("</a>") {
+                    let name = inner[..lt].trim();
+                    if !name.is_empty() && !actors.contains(&name.to_string()) {
+                        actors.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 8. Sample Images (剧照)
+    let mut sample_images = Vec::new();
+    for seg in html.split("<a class=\"sample-box\"") {
+        if let Some(href_idx) = seg.find("href=\"") {
+            let rest = &seg[href_idx + 6..];
+            if let Some(href_end) = rest.find('"') {
+                let mut u = rest[..href_end].trim().to_string();
+                if !u.is_empty() {
+                    if !u.starts_with("http") {
+                        u = format!("https://www.javbus.com{}", u);
+                    }
+                    if !sample_images.contains(&u) {
+                        sample_images.push(u);
+                    }
+                }
+            }
+        }
+    }
+
+    // 9. Tags
+    let mut tags = Vec::new();
+    for seg in html.split("href=\"https://www.javbus.com/genre/") {
+        if let Some(gt) = seg.find('>') {
+            let inner = &seg[gt + 1..];
+            if let Some(lt) = inner.find("</a>") {
+                let t = inner[..lt].trim();
+                if !t.is_empty() && t.len() <= 20 && !tags.contains(&t.to_string()) {
+                    tags.push(t.to_string());
+                }
+            }
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    if html.contains("driver-verify") || cover_url.is_none() {
+        return Err(format!("JavBus 未找到封面或遭遇安全验证【{number}】"));
+    }
+    Ok(MovieMetadata {
+        number: number.to_string(),
+        asset_id: None,
+        title,
+        original_title: None,
+        actors,
+        maker,
+        label,
+        series,
+        director: None,
+        release_date,
+        duration_minutes: None,
+        cover_url,
+        sample_images,
+        tags,
+        source: "javbus".to_string(),
+        updated_at: now,
+    })
+}
+
 /// Fetch metadata from JavDB by JAV number.
 pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
     let client = reqwest::Client::builder()
@@ -148,11 +357,17 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
     let search_url = format!("https://javdb.com/search?q={}&f=all", search_term);
     let search_resp = client
         .get(&search_url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7")
+        .header("Cookie", "over18=1; locale=zh;")
         .send()
         .await
         .map_err(|e| format!("请求 JavDB 搜索失败：{e}"))?;
+
+    if !search_resp.status().is_success() {
+        return Err(format!("JavDB 搜索状态码异常：{}", search_resp.status()));
+    }
 
     let search_html = search_resp.text().await.map_err(|e| format!("读取搜索响应失败：{e}"))?;
 
@@ -171,17 +386,59 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
     }
 
     let detail_path = detail_path.ok_or_else(|| format!("未在 JavDB 找到番号【{}】的作品", number))?;
-    let detail_url = format!("https://javdb.com{}", detail_path);
 
+    // In search_html, also parse search card for title & cover fallback
+    let mut search_title = None;
+    let mut search_cover = None;
+    let mut search_date = None;
+    if let Some(pos) = search_html.find(&format!("href=\"{}\"", detail_path)) {
+        let slice = &search_html[pos..std::cmp::min(search_html.len(), pos + 1500)];
+        if let Some(t_pos) = slice.find("title=\"") {
+            let rest = &slice[t_pos + 7..];
+            if let Some(t_end) = rest.find('"') {
+                let t = rest[..t_end].trim();
+                if !t.is_empty() {
+                    search_title = Some(t.to_string());
+                }
+            }
+        }
+        if let Some(c_pos) = slice.find("jdbstatic.com/covers/") {
+            let c_start = slice[..c_pos].rfind("http").unwrap_or(c_pos);
+            let rest = &slice[c_start..];
+            if let Some(c_end) = rest.find('"') {
+                let c = rest[..c_end].trim();
+                if !c.is_empty() {
+                    search_cover = Some(c.to_string());
+                }
+            }
+        }
+        if let Some(d_pos) = slice.find("<div class=\"meta\">") {
+            let rest = &slice[d_pos + 18..];
+            if let Some(d_end) = rest.find("</div>") {
+                let d = rest[..d_end].trim();
+                if d.len() == 10 && d.contains('-') {
+                    search_date = Some(d.to_string());
+                }
+            }
+        }
+    }
+
+    let detail_url = format!("https://javdb.com{}", detail_path);
     let detail_resp = client
         .get(&detail_url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7")
+        .header("Cookie", "over18=1; locale=zh;")
         .send()
-        .await
-        .map_err(|e| format!("请求作品详情失败：{e}"))?;
+        .await;
 
-    let html = detail_resp.text().await.map_err(|e| format!("读取详情响应失败：{e}"))?;
+    let html = match detail_resp {
+        Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    let is_captcha = html.contains("auth-captcha-image") || html.contains("driver-verify") || html.is_empty();
 
     // Parse Title
     let mut title = number.to_string();
@@ -189,7 +446,6 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         let rest = &html[start + 23..];
         if let Some(end) = rest.find("</h2>") {
             let raw_title = &rest[..end];
-            // Strip HTML tags
             let clean: String = raw_title
                 .replace("<strong>", "")
                 .replace("</strong>", "")
@@ -212,6 +468,16 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
             let rest = &slice[src_start + 5..];
             if let Some(src_end) = rest.find('"') {
                 cover_url = Some(rest[..src_end].to_string());
+            }
+        }
+    }
+    if cover_url.is_none() {
+        // Fallback search for c0.jdbstatic.com/covers
+        if let Some(pos) = html.find("jdbstatic.com/covers/") {
+            let start = html[..pos].rfind("http").unwrap_or(pos);
+            let rest = &html[start..];
+            if let Some(end) = rest.find('"') {
+                cover_url = Some(rest[..end].to_string());
             }
         }
     }
@@ -322,6 +588,27 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         }
     }
 
+    // Fallback from search card if detail was blocked or missing elements
+    if cover_url.is_none() {
+        cover_url = search_cover;
+    }
+    if title.trim() == number.trim() {
+        if let Some(st) = search_title {
+            title = st;
+        }
+    }
+    if release_date.is_none() {
+        release_date = search_date;
+    }
+    if maker.is_none() && number.starts_with("FC2-") {
+        maker = Some("FC2".to_string());
+    }
+
+    let final_cover = cover_url.ok_or_else(|| format!("未在 JavDB 找到作品有效封面【{}】", number))?;
+    if title.trim() == number.trim() && !number.starts_with("FC2-") {
+        return Err(format!("未在 JavDB 找到作品有效标题【{}】", number));
+    }
+
     let now = chrono::Utc::now().timestamp();
 
     Ok(MovieMetadata {
@@ -336,12 +623,238 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         director,
         release_date,
         duration_minutes: None,
-        cover_url,
+        cover_url: Some(final_cover),
         sample_images,
         tags,
         source: "javdb".to_string(),
         updated_at: now,
     })
+}
+
+/// Fetch metadata from Caribbeancom official website (unblocked, direct for date-based numbers MMDDYY-NNN)
+pub async fn scrape_from_caribbeancom(number: &str) -> Result<MovieMetadata, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| format!("构建 HTTP 客户端失败：{e}"))?;
+
+    let clean_num = number.replace('_', "-");
+    let url = format!("https://www.caribbeancom.com/moviepages/{}/index.html", clean_num);
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .send()
+        .await
+        .map_err(|e| format!("请求 Caribbeancom 失败：{e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Caribbeancom 状态码异常：{}", resp.status()));
+    }
+
+    let bytes = resp.bytes().await.map_err(|e| format!("读取 Caribbeancom 失败：{e}"))?;
+    let (cow, _, _) = encoding_rs::EUC_JP.decode(&bytes);
+    let mut html = cow.to_string();
+    if !html.contains("<h1") && !html.contains("<title") {
+        html = String::from_utf8_lossy(&bytes).to_string();
+    }
+
+    // Title
+    let mut title = clean_num.clone();
+    if let Some(start) = html.find("<h1 itemprop=\"name\">") {
+        let rest = &html[start + 20..];
+        if let Some(end) = rest.find("</h1>") {
+            let t = rest[..end].trim();
+            if !t.is_empty() {
+                title = t.to_string();
+            }
+        }
+    } else if let Some(start) = html.find("<title>") {
+        let rest = &html[start + 7..];
+        if let Some(end) = rest.find("</title>") {
+            let t = rest[..end].trim();
+            if !t.is_empty() {
+                title = t.to_string();
+            }
+        }
+    }
+
+    // Cover
+    let cover_url = Some(format!("https://www.caribbeancom.com/moviepages/{}/images/l_l.jpg", clean_num));
+
+    // Release Date (MMDDYY-NNN -> 20YY-MM-DD)
+    let parts: Vec<&str> = clean_num.split('-').collect();
+    let release_date = if parts.len() == 2 && parts[0].len() == 6 {
+        let mm = &parts[0][0..2];
+        let dd = &parts[0][2..4];
+        let yy = &parts[0][4..6];
+        Some(format!("20{}-{}-{}", yy, mm, dd))
+    } else {
+        None
+    };
+
+    // Actors
+    let mut actors = Vec::new();
+    let mut search_slice = html.as_str();
+    while let Some(start) = search_slice.find("<span itemprop=\"name\">") {
+        let rest = &search_slice[start + 22..];
+        if let Some(end) = rest.find("</span>") {
+            let a = rest[..end].trim();
+            if !a.is_empty() && a.len() <= 20 && !actors.contains(&a.to_string()) {
+                actors.push(a.to_string());
+            }
+            search_slice = &rest[end + 7..];
+        } else {
+            break;
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    Ok(MovieMetadata {
+        number: clean_num,
+        asset_id: None,
+        title,
+        original_title: None,
+        actors,
+        maker: Some("Caribbeancom 加勒比".to_string()),
+        label: Some("Caribbeancom".to_string()),
+        series: None,
+        director: None,
+        release_date,
+        duration_minutes: None,
+        cover_url,
+        sample_images: Vec::new(),
+        tags: vec!["无码".to_string(), "加勒比".to_string()],
+        source: "caribbeancom".to_string(),
+        updated_at: now,
+    })
+}
+
+/// Fetch metadata from 1pondo (一本道) official API (JSON based, 100% reliable)
+pub async fn scrape_from_1pondo(number: &str) -> Result<MovieMetadata, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| format!("构建 HTTP 客户端失败：{e}"))?;
+
+    let clean_num = number.replace('-', "_");
+    let url = format!("https://www.1pondo.tv/dyn/phpauto/movie_details/movie_id/{}.json", clean_num);
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .send()
+        .await
+        .map_err(|e| format!("请求 1pondo 失败：{e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("1pondo 状态码异常：{}", resp.status()));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("解析 1pondo JSON 失败：{e}"))?;
+
+    let title = json.get("Title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| number.to_string());
+
+    let release_date = json.get("Release")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut actors = Vec::new();
+    if let Some(arr) = json.get("ActressesJa").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() && !actors.contains(&trimmed.to_string()) {
+                    actors.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if actors.is_empty() {
+        if let Some(s) = json.get("Actor").and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                actors.push(trimmed.to_string());
+            }
+        }
+    }
+
+    let cover_url = json.get("ThumbHigh")
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("ThumbMed").and_then(|v| v.as_str()))
+        .or_else(|| json.get("ThumbLow").and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if cover_url.is_none() {
+        return Err(format!("1pondo 未找到封面【{}】", number));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    Ok(MovieMetadata {
+        number: number.to_string(),
+        asset_id: None,
+        title,
+        original_title: None,
+        actors,
+        maker: Some("一本道 1pondo".to_string()),
+        label: Some("1pondo".to_string()),
+        series: json.get("Series").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        director: None,
+        release_date,
+        duration_minutes: None,
+        cover_url,
+        sample_images: Vec::new(),
+        tags: vec!["无码".to_string(), "一本道".to_string()],
+        source: "1pondo".to_string(),
+        updated_at: now,
+    })
+}
+
+/// Unified multi-source scraper.
+pub async fn scrape_movie_metadata(number: &str) -> Result<MovieMetadata, String> {
+    let clean_num = number.trim();
+
+    // 1. Date-based numbers (Caribbeancom / 1pondo: MMDDYY-NNN or MMDDYY_NNN)
+    let is_date_code = {
+        let parts: Vec<&str> = clean_num.split(|c| c == '-' || c == '_').collect();
+        parts.len() == 2 && parts[0].len() == 6 && parts[0].chars().all(|c| c.is_ascii_digit())
+            && parts[1].len() == 3 && parts[1].chars().all(|c| c.is_ascii_digit())
+    };
+
+    if is_date_code {
+        if let Ok(meta) = scrape_from_caribbeancom(clean_num).await {
+            return Ok(meta);
+        }
+        if let Ok(meta) = scrape_from_1pondo(clean_num).await {
+            return Ok(meta);
+        }
+        return scrape_from_javdb(clean_num).await;
+    }
+
+    // 2. FC2
+    if clean_num.starts_with("FC2-") {
+        if let Ok(meta) = scrape_from_javdb(clean_num).await {
+            return Ok(meta);
+        }
+        return scrape_from_javbus(clean_num).await;
+    }
+
+    // 3. Commercial standard JAV: JavDB first (has reliable search + cover even on server)
+    match scrape_from_javdb(clean_num).await {
+        Ok(meta) => Ok(meta),
+        Err(db_err) => {
+            match scrape_from_javbus(clean_num).await {
+                Ok(meta) => Ok(meta),
+                Err(bus_err) => Err(format!("JavDB: {db_err}; JavBus: {bus_err}")),
+            }
+        }
+    }
 }
 
 /// Save movie metadata into SQLite
@@ -405,7 +918,10 @@ pub fn get_movie_metadata(conn: &Connection, identifier: &str) -> Result<Option<
                 director, release_date, duration_minutes, cover_url, sample_images_json,
                 tags_json, source, updated_at
          FROM movie_metadata
-         WHERE number = ?1 OR asset_id = ?1 LIMIT 1"
+         WHERE (number = ?1 OR asset_id = ?1)
+           AND source NOT IN ('javdb_not_found', 'not_found', '')
+           AND cover_url IS NOT NULL AND cover_url != ''
+         LIMIT 1"
     )?;
 
     let res = stmt.query_row(params![upper], |row| {
@@ -444,6 +960,8 @@ pub fn list_movie_metadata(conn: &Connection, limit: u32, offset: u32) -> Result
                 director, release_date, duration_minutes, cover_url, sample_images_json,
                 tags_json, source, updated_at
          FROM movie_metadata
+         WHERE source NOT IN ('javdb_not_found', 'not_found', '')
+           AND cover_url IS NOT NULL AND cover_url != ''
          ORDER BY updated_at DESC
          LIMIT ?1 OFFSET ?2"
     )?;
@@ -789,7 +1307,7 @@ pub fn get_batch_scrape_stats(conn: &Connection) -> Result<BatchScrapeStats, rus
     }
 
     let mut already_scraped = 0usize;
-    let mut check_stmt = conn.prepare("SELECT 1 FROM movie_metadata WHERE number = ?1 LIMIT 1")?;
+    let mut check_stmt = conn.prepare("SELECT 1 FROM movie_metadata WHERE number = ?1 AND source NOT IN ('javdb_not_found', 'not_found', '') AND cover_url IS NOT NULL AND cover_url != '' LIMIT 1")?;
     for num in &distinct_numbers {
         if check_stmt.exists(params![num])? {
             already_scraped += 1;
@@ -879,9 +1397,9 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
             }
         }
 
-        // 过滤已刮削的
+        // 过滤已成功刮削入库的（未找到或失败的条目允许重试）
         let mut queue = Vec::new();
-        if let Ok(mut check_stmt) = conn.prepare("SELECT 1 FROM movie_metadata WHERE number = ?1 LIMIT 1") {
+        if let Ok(mut check_stmt) = conn.prepare("SELECT 1 FROM movie_metadata WHERE number = ?1 AND source NOT IN ('javdb_not_found', 'not_found', '') AND cover_url IS NOT NULL AND cover_url != '' LIMIT 1") {
             for num in distinct_numbers {
                 if let Ok(false) = check_stmt.exists(params![num]) {
                     queue.push(num);
@@ -915,8 +1433,8 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
                 g.current_number = Some(number.clone());
             }
 
-            // 执行刮削
-            match scrape_from_javdb(&number).await {
+            // 执行高可靠多源刮削（优先 JavBus 极速入库，备选 JavDB）
+            match scrape_movie_metadata(&number).await {
                 Ok(meta) => {
                     let _ = save_movie_metadata(&conn, &meta);
                     if let Ok(mut g) = batch_progress_cell().lock() {
@@ -925,7 +1443,7 @@ pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
                     }
                 }
                 Err(e) => {
-                    // 若未找到，记录一个精简占位，避免下次重启死循环重复检索
+                    // 若均未找到，记录一个精简占位
                     let now = chrono::Utc::now().timestamp();
                     let empty_meta = MovieMetadata {
                         number: number.clone(),

@@ -99,12 +99,18 @@ public struct MovieDetailSheet: View {
                                         .font(.caption.bold())
                                         .padding(.horizontal, 7)
                                         .padding(.vertical, 3)
-                                        .background(Color.pink.gradient)
+                                        .background(LinearGradient(colors: [.purple, .indigo], startPoint: .leading, endPoint: .trailing))
                                         .foregroundStyle(.white)
                                         .clipShape(RoundedRectangle(cornerRadius: 5))
 
                                     if let date = meta.releaseDate {
                                         Text(date)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    if let duration = meta.durationMinutes, duration > 0 {
+                                        Text("\(duration) 分钟")
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
@@ -114,6 +120,13 @@ public struct MovieDetailSheet: View {
                                     .font(.subheadline.bold())
                                     .lineLimit(4)
                                     .foregroundStyle(.primary)
+
+                                if let orig = meta.originalTitle, !orig.isEmpty, orig != meta.title {
+                                    Text(orig)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
 
                                 if let maker = meta.maker {
                                     HStack(spacing: 4) {
@@ -152,6 +165,7 @@ public struct MovieDetailSheet: View {
                                     .padding(.vertical, 8)
                             }
                             .buttonStyle(.borderedProminent)
+                            .tint(.purple)
 
                             Button {
                                 Task { await loadData(force: true) }
@@ -167,19 +181,24 @@ public struct MovieDetailSheet: View {
                         // Actresses
                         if !meta.actors.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
-                                Text("出演女优")
-                                    .font(.footnote.bold())
-                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 4) {
+                                    Image(systemName: "heart.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.pink)
+                                    Text("出演女优")
+                                        .font(.footnote.bold())
+                                        .foregroundStyle(.secondary)
+                                }
 
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 8) {
                                         ForEach(meta.actors, id: \.self) { actress in
-                                            Label(actress, systemImage: "person.fill")
-                                                .font(.caption)
+                                            Label(actress, systemImage: "heart.fill")
+                                                .font(.caption.weight(.semibold))
                                                 .padding(.horizontal, 10)
                                                 .padding(.vertical, 5)
-                                                .background(Color.indigo.opacity(0.18))
-                                                .foregroundStyle(Color.indigo)
+                                                .background(Color.pink.opacity(0.14))
+                                                .foregroundStyle(Color.pink)
                                                 .clipShape(Capsule())
                                         }
                                     }
