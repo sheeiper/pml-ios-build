@@ -67,6 +67,7 @@ struct GestureVideoPlayerSheet: View {
     @State private var seekTask: Task<Void, Never>?
     @State private var seekRequestID = 0
     @State private var seekWatchdog: Task<Void, Never>?
+    @State private var playbackGeneration = 0
     @State private var isRecovering = false
     @State private var stallRecoveryTask: Task<Void, Never>?
     @State private var subtitleTracks: [SubtitleTrack] = []
@@ -813,6 +814,7 @@ struct GestureVideoPlayerSheet: View {
     private func playIndex(_ index: Int) async {
         guard playlist.indices.contains(index) else { return }
         let item = playlist[index]
+        playbackGeneration &+= 1
         guard let assetId = item.assetId else {
             showHUD("该视频无法播放", seconds: 2)
             return
@@ -1149,6 +1151,7 @@ struct GestureVideoPlayerSheet: View {
     private func handlePlaybackFailure() {
         guard !usedFallback else { return }
         usedFallback = true
+        let generation = playbackGeneration
         let target = currentTime
         let wasPlaying = isPlaying
         withAnimation {
@@ -1162,21 +1165,24 @@ struct GestureVideoPlayerSheet: View {
             if fallback == nil, let assetId = currentAssetId {
                 fallback = await model.fallbackMediaURL(assetId: assetId)
             }
+            guard generation == playbackGeneration, currentAssetId != nil else { return }
             guard let fallback else {
                 usedFallback = false
                 withAnimation {
-                    alistExpiredWarning = "⚠️ AList 登录已过期且无服务器备用流，请在 AList 重新登录 115"
+                    alistExpiredWarning = "⚠️ 视频源不可用，且没有可用的服务器备用流"
                 }
                 return
             }
             let newItem = makePlayerItem(fallback)
             observeItemStatus(newItem)
+            guard generation == playbackGeneration else { return }
+            currentURL = fallback
             player.replaceCurrentItem(with: newItem)
             accelLabel = "服务器中转"
             if await waitUntilReady() {
                 requestSeek(to: target, resume: wasPlaying, debounce: false)
                 withAnimation {
-                    alistExpiredWarning = "⚠️ AList 登录已过期，已切换为服务器中转播放"
+                    alistExpiredWarning = "⚠️ 已切换为服务器中转播放"
                 }
             }
         }

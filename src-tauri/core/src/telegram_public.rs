@@ -468,8 +468,9 @@ fn parse_preview(html: &str, requested: &str, now: i64) -> ParsedPreview {
                 None
             }
         });
-    let mut posts = message_posts(html, requested, now);
-    posts.reverse();
+    // Telegram pages expose messages newest-first; preserve that order so the
+    // first item is the latest playable post and pagination remains descending.
+    let posts = message_posts(html, requested, now);
     ParsedPreview {
         kind,
         username,

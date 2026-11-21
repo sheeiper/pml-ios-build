@@ -506,11 +506,15 @@ fileprivate final class ProxyTransfer: NSObject {
                 return
             }
             completionHandler(.cancel)
-            if http.statusCode == 500 || http.statusCode == 401 || http.statusCode == 403 {
+            // 401/403 may be a signed CDN expiry or a protected media object;
+            // do not claim the whole AList session expired. The caller will use fallback.
+            if http.statusCode == 401,
+               let host = http.url?.host,
+               host != entry.direct.host {
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(
                         name: .pmlAlistSessionExpired,
-                        object: "AList 网盘账号登录已过期，请在 AList 后台重新登录 115"
+                        object: "AList 认证失败，请检查网盘连接配置"
                     )
                 }
             }

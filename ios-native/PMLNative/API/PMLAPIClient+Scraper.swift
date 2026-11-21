@@ -1,11 +1,12 @@
 import Foundation
 
 extension PMLAPIClient {
-    func scrapeAsset(assetId: String, fileName: String? = nil, remotePath: String? = nil, force: Bool = false) async throws -> MovieMetadata {
+    func scrapeAsset(assetId: String, fileName: String? = nil, remotePath: String? = nil, number: String? = nil, force: Bool = false) async throws -> MovieMetadata {
         var args: [String: Any] = [
             "assetId": assetId,
             "force": force
         ]
+        if let number, !number.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { args["number"] = number }
         if let fileName = fileName { args["fileName"] = fileName }
         if let remotePath = remotePath { args["remotePath"] = remotePath }
         return try await command("scrape_asset", arguments: args, as: MovieMetadata.self)
@@ -46,10 +47,9 @@ extension PMLAPIClient {
     }
 
     func proxyScraperImageURL(rawUrl: String) -> URL? {
-        guard let encoded = rawUrl.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return nil }
         guard var components = URLComponents(url: configuration.baseURL, resolvingAgainstBaseURL: false) else { return nil }
         components.path = "/api/scraper/proxy-image"
-        components.query = "url=\(encoded)"
+        components.queryItems = [URLQueryItem(name: "url", value: rawUrl)]
         return components.url
     }
 

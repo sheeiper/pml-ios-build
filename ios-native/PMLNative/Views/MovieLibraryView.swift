@@ -13,6 +13,7 @@ public struct MovieLibraryView: View {
     @State private var batchStats: BatchScrapeStats?
     @State private var batchProgress: BatchScrapeProgress?
     @State private var preview: PreviewItem?
+    @State private var scrapePollTask: Task<Void, Never>?
 
     // 手机端黄金 2 列网格；iPad 端根据宽度自动扩展
     private let columns = [
@@ -146,6 +147,9 @@ public struct MovieLibraryView: View {
         }
         .task {
             await loadData()
+        }
+        .onDisappear {
+            scrapePollTask?.cancel()
         }
         .refreshable {
             await loadData()
@@ -519,7 +523,15 @@ public struct MovieLibraryView: View {
         guard let client = model.apiClient else { return }
         loading = true
         do {
-            let list = try await client.listMovieMetadata(limit: 1000, offset: 0)
+            var list: [MovieMetadata] = []
+            var offset = 0
+            let pageSize = 200
+            repeat {
+                let page = try await client.listMovieMetadata(limit: pageSize, offset: offset)
+                list.append(contentsOf: page)
+                offset += page.count
+                if page.count < pageSize { break }
+            } while !Task.isCancelled
             // 过滤无封面或失败占位
             self.movies = list.filter {
                 $0.source != "javdb_not_found" &&
@@ -551,8 +563,28 @@ public struct MovieLibraryView: View {
         do {
             try await client.startBatchScrape()
             batchProgress = try? await client.getBatchScrapeProgress()
+            beginScrapePolling()
         } catch {
             print("Failed to start batch scrape:", error)
+        }
+    }
+
+    private func beginScrapePolling() {
+        scrapePollTask?.cancel()
+        scrapePollTask = Task { @MainActor [weak model] in
+            guard let model else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard !Task.isCancelled, let client = model.apiClient else { return }
+                let progress = try? await client.getBatchScrapeProgress()
+                let stats = try? await client.getBatchScrapeStats()
+                await MainActor.run {
+                    if let progress { batchProgress = progress }
+                    if let stats { batchStats = stats }
+                    if progress?.running == false { scrapePollTask?.cancel() }
+                }
+                if progress?.running == false { return }
+            }
         }
     }
 

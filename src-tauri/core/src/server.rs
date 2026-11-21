@@ -585,6 +585,26 @@ fn rewrite_media_url(result: Result<String, String>) -> Result<String, String> {
     })
 }
 
+/// Reuse the HTTP command implementation for trusted native IPC without
+/// requiring a running HTTP listener or a second copy of scraper business logic.
+pub async fn dispatch_native(app: AppHandle, command: &str, payload: Value) -> Result<Value, String> {
+    let response = dispatch_command(
+        AxumState(ServerState { app, auth: AuthConfig::default() }),
+        Path(command.to_owned()),
+        Json(payload),
+    ).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024)
+        .await.map_err(|e| format!("读取命令响应失败：{e}"))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("解析命令响应失败：{e}"))?;
+    if !status.is_success() {
+        return Err(value.get("error").and_then(Value::as_str)
+            .unwrap_or("命令执行失败").to_owned());
+    }
+    Ok(value)
+}
+
 async fn dispatch_command(
     AxumState(context): AxumState<ServerState>,
     Path(command): Path<String>,
@@ -656,15 +676,26 @@ async fn dispatch_command(
             let file_name = payload.get("fileName").and_then(Value::as_str).unwrap_or("").to_owned();
             let _remote_path = payload.get("remotePath").and_then(Value::as_str).unwrap_or("").to_owned();
             let force = payload.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let explicit_number = payload.get("number").and_then(Value::as_str).unwrap_or("").trim().to_owned();
             let app = app.clone();
             let res: Result<crate::jav_scraper::MovieMetadata, String> = async move {
                 let conn = four_domains::open_v2(&app)?;
-                let number = crate::jav_scraper::extract_jav_number(&file_name)
-                    .or_else(|| crate::jav_scraper::extract_jav_number(&asset_id))
-                    .ok_or_else(|| format!("无法从文件名【{}】提取有效日本商业番号", file_name))?;
+                // Titles are display data, not stable scraper identities. New clients
+                // pass number explicitly; old directory clients can still use fileName.
+                let number = if !explicit_number.is_empty() {
+                    crate::jav_scraper::normalize_jav_number(&explicit_number)
+                } else {
+                    crate::jav_scraper::extract_jav_number(&file_name)
+                }
+                    .ok_or_else(|| format!("无法识别有效番号，请提供明确番号或原始文件名【{}】", file_name))?;
 
                 if !force {
-                    if let Ok(Some(existing)) = crate::jav_scraper::get_movie_metadata(&conn, &number) {
+                    if let Ok(Some(mut existing)) = crate::jav_scraper::get_movie_metadata(&conn, &number) {
+                        if !asset_id.is_empty() {
+                            crate::jav_scraper::bind_movie_asset(&conn, &number, &asset_id)
+                                .map_err(|e| format!("绑定视频资产失败：{e}"))?;
+                            existing.asset_id = Some(asset_id.clone());
+                        }
                         return Ok(existing);
                     }
                 }
@@ -672,6 +703,10 @@ async fn dispatch_command(
                 meta.asset_id = if asset_id.is_empty() { None } else { Some(asset_id) };
                 crate::jav_scraper::save_movie_metadata(&conn, &meta)
                     .map_err(|e| format!("保存元数据到数据库失败：{e}"))?;
+                if let Some(id) = meta.asset_id.as_deref() {
+                    crate::jav_scraper::bind_movie_asset(&conn, &number, id)
+                        .map_err(|e| format!("绑定视频资产失败：{e}"))?;
+                }
                 Ok(meta)
             }.await;
             result_response(res)
@@ -2064,7 +2099,6 @@ async fn proxy_scraper_image(
     }
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
-        .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::limited(4))
         .build()
     {
@@ -2095,13 +2129,20 @@ async fn proxy_scraper_image(
         Err(err) => return (StatusCode::BAD_GATEWAY, format!("Upstream request failed: {err}")).into_response(),
     };
 
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // Never cache an anti-bot page or expired response as a valid cover.
+    let content_type = upstream.headers().get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+    if !status.is_success() || content_type.contains("text/html")
+        || content_type.contains("application/json") || content_type.contains("text/xml") {
+        return (StatusCode::BAD_GATEWAY, [(CACHE_CONTROL, "no-store")], "Image source unavailable").into_response();
+    }
     let mut builder = Response::builder().status(status);
 
     for (k, v) in upstream.headers() {
         if matches!(
             k.as_str(),
-            "content-type" | "content-length" | "cache-control" | "etag" | "last-modified"
+            "content-type" | "content-length" | "etag" | "last-modified"
         ) {
             builder = builder.header(k, v);
         }

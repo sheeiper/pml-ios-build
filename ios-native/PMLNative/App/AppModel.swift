@@ -108,10 +108,16 @@ final class AppModel: ObservableObject {
     /// 服务器模式优先走 AList `/d`。视频经本地代理转发 Range；若直链映射失败则回退服务器代理兜底。
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         if settings.mode == .server {
-            var direct: URL?
-            if let remotePath {
-                direct = alistDirectURL(remotePath: remotePath)
+            // relay 明确绕过 AList 直连；direct/auto 才尝试映射。
+            if settings.routeMode == .relay {
+                if let client = apiClient, let assetId,
+                   let url = try? await client.mediaSourceURL(assetId: assetId) {
+                    return PlaybackSource(url: url, fallbackURL: nil, label: "服务器中转")
+                }
+                return nil
             }
+            var direct: URL?
+            if let remotePath { direct = alistDirectURL(remotePath: remotePath) }
             if let direct {
                 var fallback: URL? = nil
                 if let client = apiClient, let assetId {
@@ -122,6 +128,8 @@ final class AppModel: ObservableObject {
                         return PlaybackSource(url: proxied, fallbackURL: fallback, label: "AList 直连")
                     }
                 }
+                // auto/direct both use direct URL; direct is intentionally not preflighted
+                // because probing consumes a Range and breaks some signed CDN URLs.
                 return PlaybackSource(url: direct, fallbackURL: fallback, label: "AList 直连")
             }
             // 兜底：如果 remotePath 缺失或 AList 映射失败，向服务端申请中转流地址
@@ -174,12 +182,17 @@ final class AppModel: ObservableObject {
         var alistPrefix = settings.alistPrefix.trimmingCharacters(in: .whitespaces)
         while cd2Prefix.count > 1 && cd2Prefix.hasSuffix("/") { cd2Prefix.removeLast() }
         while alistPrefix.count > 1 && alistPrefix.hasSuffix("/") { alistPrefix.removeLast() }
-        guard !cd2Prefix.isEmpty, remotePath.hasPrefix(cd2Prefix) else { return nil }
+        guard !cd2Prefix.isEmpty,
+              remotePath == cd2Prefix || remotePath.hasPrefix(cd2Prefix + "/") else { return nil }
 
         let mapped = alistPrefix + String(remotePath.dropFirst(cd2Prefix.count))
+        // Encode each path segment; leave '/' separators intact while escaping '?'/'#'
+        // so filenames cannot accidentally become query/fragment delimiters.
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "?#")
         let encoded = mapped
             .split(separator: "/", omittingEmptySubsequences: false)
-            .map { String($0).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .map { String($0).addingPercentEncoding(withAllowedCharacters: allowed) ?? String($0) }
             .joined(separator: "/")
         return URL(string: base.absoluteString + "/d" + encoded)
     }

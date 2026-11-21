@@ -7625,7 +7625,8 @@ async fn open_proxy_upstream(
     let mut attempts = Vec::new();
     while let Some(candidate) = candidates.pop_front() {
         match open_proxy_upstream_for_url(source, &candidate, method, range, if_range).await {
-            Ok(response) if response_is_usable(&response, source) => return Ok(response),
+            Ok(response) if response_is_usable(&response, source)
+                || matches!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::METHOD_NOT_ALLOWED) => return Ok(response),
             Ok(response) => {
                 attempts.push(proxy_response_summary(&response));
             }
@@ -7895,18 +7896,9 @@ async fn open_proxy_upstream_for_url(
     range: Option<&str>,
     if_range: Option<&str>,
 ) -> Result<reqwest::Response, String> {
-    let response = open_proxy_upstream_request(source, url, method, range, if_range).await?;
-    if range.is_some()
-        && method == "GET"
-        && matches!(
-            response.status(),
-            StatusCode::METHOD_NOT_ALLOWED
-                | StatusCode::RANGE_NOT_SATISFIABLE
-        )
-    {
-        return open_proxy_upstream_request(source, url, method, None, None).await;
-    }
-    Ok(response)
+    // Preserve the client's Range semantics. A 405/416 is meaningful and must not
+    // be converted into an unbounded 200 by silently retrying without Range.
+    open_proxy_upstream_request(source, url, method, range, if_range).await
 }
 
 async fn open_proxy_upstream_request(
@@ -7984,6 +7976,46 @@ fn parse_content_range(val: &str) -> Option<(u64, u64, u64)> {
     Some((start, end, total))
 }
 
+fn parse_local_range(range_header: Option<&str>, file_size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(raw) = range_header else { return Ok(None); };
+    let spec = raw.trim().strip_prefix("bytes=").ok_or(())?;
+    let (a, b) = spec.split_once('-').ok_or(())?;
+    let a = a.trim();
+    let b = b.trim();
+    if file_size == 0 { return Err(()); }
+    let (start, end) = if a.is_empty() {
+        let n = b.parse::<u64>().map_err(|_| ())?;
+        if n == 0 { return Err(()); }
+        (file_size.saturating_sub(n), file_size - 1)
+    } else {
+        let start = a.parse::<u64>().map_err(|_| ())?;
+        if start >= file_size { return Err(()); }
+        let end = if b.is_empty() { file_size - 1 } else { b.parse::<u64>().map_err(|_| ())? };
+        if end < start { return Err(()); }
+        (start, end.min(file_size - 1))
+    };
+    Ok(Some((start, end)))
+}
+
+#[cfg(test)]
+mod media_proxy_tests {
+    use super::parse_local_range;
+
+    #[test]
+    fn local_ranges_clamp_and_reject_unsatisfiable() {
+        assert_eq!(parse_local_range(None, 100).unwrap(), None);
+        assert_eq!(parse_local_range(Some("bytes=10-19"), 100).unwrap(), Some((10, 19)));
+        assert_eq!(parse_local_range(Some("bytes=90-"), 100).unwrap(), Some((90, 99)));
+        assert_eq!(parse_local_range(Some("bytes=-5"), 100).unwrap(), Some((95, 99)));
+        assert_eq!(parse_local_range(Some("bytes=100-"), 100), Err(()));
+        assert_eq!(parse_local_range(Some("bytes=20-10"), 100), Err(()));
+        assert_eq!(parse_local_range(Some("bytes=-0"), 100), Err(()));
+        assert_eq!(parse_local_range(Some("bytes=1-2,4-5"), 100), Err(()));
+        assert_eq!(parse_local_range(Some("bytes=18446744073709551616-"), 100), Err(()));
+        assert_eq!(parse_local_range(Some("bytes=0-18446744073709551616"), 100), Err(()));
+    }
+}
+
 fn parse_range_header_bounds(range_header: Option<&str>) -> Option<(u64, Option<u64>)> {
     let spec = range_header?.trim().strip_prefix("bytes=")?;
     let (start_str, end_str) = spec.split_once('-')?;
@@ -8002,49 +8034,14 @@ fn parse_range_header_bounds(range_header: Option<&str>) -> Option<(u64, Option<
 }
 
 fn acquire_video_stream_slot(
-    source: &ProxySource,
-    method: &str,
-    range_header: Option<&str>,
+    _source: &ProxySource,
+    _method: &str,
+    _range_header: Option<&str>,
 ) -> Option<(u64, VideoStreamPreemption)> {
-    if method != "GET" || !source.content_type.starts_with("video/") {
-        return None;
-    }
-    let asset_id = source.asset_id.as_ref()?;
-    let file_size = ASSET_SIZE_CACHE
-        .lock()
-        .ok()
-        .and_then(|g| g.get(asset_id).copied())
-        .unwrap_or(0);
-    if let Some((start, end_opt)) = parse_range_header_bounds(range_header) {
-        // Browsers often issue a concurrent tail-range request (within the last 8MB of the file)
-        // to read the MP4 moov atom while the initial bytes=0- stream is still active, or issue
-        // a tiny probe (< 64KB). Do not let metadata probes preempt main playback or vice-versa.
-        let is_tail_probe =
-            file_size > 16 * 1024 * 1024 && start >= file_size.saturating_sub(8 * 1024 * 1024);
-        let is_tiny_probe = end_opt.is_some_and(|end| end >= start && (end - start) <= 65536);
-        if is_tail_probe || is_tiny_probe {
-            return None;
-        }
-    }
-    let Ok(mut map) = ACTIVE_VIDEO_STREAMS.lock() else {
-        return None;
-    };
-    if map.len() > 2048 {
-        map.clear();
-    }
-    let entry = map
-        .entry(asset_id.clone())
-        .or_insert_with(|| VideoStreamPreemption {
-            seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            notify: Arc::new(tokio::sync::Notify::new()),
-        })
-        .clone();
-    let my_seq = entry
-        .seq
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        + 1;
-    entry.notify.notify_waiters();
-    Some((my_seq, entry))
+    // Never preempt another request for the same asset. Browsers legitimately issue
+    // concurrent initial/tail ranges, and multiple devices may watch the same video.
+    // A body stops naturally when its client disconnects, avoiding truncated ranges.
+    None
 }
 
 struct PartFileCleanupGuard {
@@ -8083,45 +8080,17 @@ async fn serve_local_file_range_axum(
         return Err("缓存文件大小为0".into());
     }
 
-    let mut start = 0u64;
-    let mut end = file_size - 1;
-    let mut is_range = false;
-
-    if let Some(range_val) = range_header {
-        let range_val = range_val.trim();
-        if let Some(spec) = range_val.strip_prefix("bytes=") {
-            let parts: Vec<&str> = spec.split('-').collect();
-            if parts.len() == 2 {
-                let p0 = parts[0].trim();
-                let p1 = parts[1].trim();
-                if !p0.is_empty() && !p1.is_empty() {
-                    if let (Ok(s), Ok(e)) = (p0.parse::<u64>(), p1.parse::<u64>()) {
-                        if s <= e && s < file_size {
-                            start = s;
-                            end = e.min(file_size - 1);
-                            is_range = true;
-                        }
-                    }
-                } else if !p0.is_empty() && p1.is_empty() {
-                    if let Ok(s) = p0.parse::<u64>() {
-                        if s < file_size {
-                            start = s;
-                            end = file_size - 1;
-                            is_range = true;
-                        }
-                    }
-                } else if p0.is_empty() && !p1.is_empty() {
-                    if let Ok(suffix_len) = p1.parse::<u64>() {
-                        if suffix_len > 0 {
-                            start = file_size.saturating_sub(suffix_len);
-                            end = file_size - 1;
-                            is_range = true;
-                        }
-                    }
-                }
-            }
-        }
+    let parsed = parse_local_range(range_header, file_size);
+    if parsed.is_err() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, HeaderValue::from_str(&format!("bytes */{}", file_size)).unwrap());
+        headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        return Ok((AxumStatusCode::RANGE_NOT_SATISFIABLE, headers).into_response());
     }
+    let (start, end, is_range) = match parsed.unwrap() {
+        Some((s, e)) => (s, e, true),
+        None => (0, file_size - 1, false),
+    };
 
     let length = end - start + 1;
     let mut out_headers = HeaderMap::new();
@@ -8145,10 +8114,6 @@ async fn serve_local_file_range_axum(
         HeaderValue::from_static("Content-Length, Content-Range, Content-Type, Accept-Ranges"),
     );
 
-    if *method == axum::http::Method::HEAD {
-        return Ok((AxumStatusCode::OK, out_headers).into_response());
-    }
-
     let status = if is_range {
         if let Ok(cr) = HeaderValue::from_str(&format!("bytes {start}-{end}/{file_size}")) {
             out_headers.insert(CONTENT_RANGE, cr);
@@ -8157,6 +8122,10 @@ async fn serve_local_file_range_axum(
     } else {
         AxumStatusCode::OK
     };
+
+    if *method == axum::http::Method::HEAD {
+        return Ok((status, out_headers).into_response());
+    }
 
     if start > 0 {
         file.seek(tokio::io::SeekFrom::Start(start))
@@ -8285,7 +8254,7 @@ pub async fn serve_media_axum(
         if let Some(direct_cdn_url) = direct_cdn_url {
             if let Ok(parsed_url) = Url::parse(&direct_cdn_url) {
                 match open_proxy_upstream_for_url(&source, &parsed_url, method_str, range.as_deref(), if_range.as_deref()).await {
-                    Ok(resp) if resp.status().is_success() => {
+                    Ok(resp) if response_is_usable(&resp, &source) => {
                         alist_response = Some(resp);
                     }
                     _other => {
@@ -8295,7 +8264,7 @@ pub async fn serve_media_axum(
                         if let Some(fresh_cdn_url) = fetch_fresh_alist_direct_url(app, &source).await {
                             if let Ok(fresh_url) = Url::parse(&fresh_cdn_url) {
                                 match open_proxy_upstream_for_url(&source, &fresh_url, method_str, range.as_deref(), if_range.as_deref()).await {
-                                    Ok(retry_resp) if retry_resp.status().is_success() => {
+                                    Ok(retry_resp) if response_is_usable(&retry_resp, &source) => {
                                         alist_response = Some(retry_resp);
                                     }
                                     _ => {
@@ -8347,7 +8316,9 @@ pub async fn serve_media_axum(
             out_headers.insert(header_name, val.clone());
         }
     }
-    if !out_headers.contains_key(ACCEPT_RANGES) {
+    // Preserve the upstream capability declaration; do not advertise byte ranges
+    // when an upstream 200 response did not support the requested range.
+    if !out_headers.contains_key(ACCEPT_RANGES) && status == AxumStatusCode::PARTIAL_CONTENT {
         out_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     }
     out_headers.insert(
@@ -8569,9 +8540,6 @@ async fn pipe_proxy_response(
         {
             header.push_str(&format!("{}: {}\r\n", header_name.as_str(), value));
         }
-    }
-    if !headers.contains_key(ACCEPT_RANGES) {
-        header.push_str("Accept-Ranges: bytes\r\n");
     }
     header.push_str("Cache-Control: private, max-age=300\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: Content-Length, Content-Range, Content-Type, ETag, Accept-Ranges\r\nConnection: close\r\n\r\n");
     stream

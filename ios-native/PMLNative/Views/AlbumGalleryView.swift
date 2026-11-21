@@ -149,29 +149,7 @@ public struct AlbumGalleryView: View {
                 ForEach(Array(album.items.enumerated()), id: \.offset) { idx, item in
                     ZStack {
                         Color.black.ignoresSafeArea()
-                        if let url = appModel.alistDirectURL(remotePath: item.remotePath) {
-                            AsyncImage(url: url) { phase in
-                                switch phase {
-                                case .success(let image):
-                                    image
-                                        .resizable()
-                                        .scaledToFit()
-                                case .failure:
-                                    AssetThumbnailView(assetId: item.assetId, contentMode: .fit) {
-                                        Image(systemName: "photo")
-                                            .foregroundStyle(.secondary)
-                                    }
-                                case .empty:
-                                    ProgressView().tint(.white)
-                                @unknown default:
-                                    EmptyView()
-                                }
-                            }
-                        } else {
-                            AssetThumbnailView(assetId: item.assetId, contentMode: .fit) {
-                                ProgressView().tint(.white)
-                            }
-                        }
+                        AlbumOriginalImageView(item: item).environmentObject(appModel)
                     }
                     .tag(idx)
                 }
@@ -205,5 +183,46 @@ public struct AlbumGalleryView: View {
 
     private func formatBytes(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+}
+
+private struct AlbumOriginalImageView: View {
+    let item: AlbumItem
+    @EnvironmentObject private var model: AppModel
+    @State private var originalURL: URL?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let originalURL {
+                AsyncImage(url: originalURL) { phase in
+                    if let image = phase.image { image.resizable().scaledToFit() }
+                    else if phase.error != nil {
+                        fallback
+                            .task {
+                                guard !failed else { return }
+                                failed = true
+                                if let url = try? await model.apiClient?.mediaSourceURL(assetId: item.assetId) {
+                                    originalURL = url
+                                }
+                            }
+                    }
+                    else { ProgressView().tint(.white) }
+                }
+            } else { fallback }
+        }
+        .task(id: item.assetId) {
+            originalURL = model.alistDirectURL(remotePath: item.remotePath)
+            guard originalURL == nil else { return }
+            if let client = model.apiClient {
+                originalURL = try? await client.mediaSourceURL(assetId: item.assetId)
+            }
+        }
+    }
+
+    private var fallback: some View {
+        AssetThumbnailView(assetId: item.assetId, contentMode: .fit) {
+            Image(systemName: "photo").foregroundStyle(.secondary)
+        }
     }
 }

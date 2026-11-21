@@ -15,6 +15,7 @@ public struct MovieDetailSheet: View {
     @State private var metadata: MovieMetadata?
     @State private var relatedMovies: [MovieMetadata] = []
     @State private var selectedSampleURL: String?
+    @State private var currentNumber: String?
 
     public init(
         number: String? = nil,
@@ -278,6 +279,7 @@ public struct MovieDetailSheet: View {
                                         ForEach(relatedMovies) { rel in
                                             Button {
                                                 metadata = rel
+                                                currentNumber = rel.number
                                                 Task {
                                                     relatedMovies = (try? await appModel.apiClient?.getRelatedMovies(number: rel.number, limit: 8)) ?? []
                                                 }
@@ -347,6 +349,7 @@ public struct MovieDetailSheet: View {
                 }
             }
             .task {
+                currentNumber = number
                 await loadData()
             }
         }
@@ -361,14 +364,16 @@ public struct MovieDetailSheet: View {
         errorMessage = nil
         do {
             var meta: MovieMetadata?
-            if let num = number, !force {
+            let requestedNumber = currentNumber ?? number
+            if let num = requestedNumber, !force {
                 meta = try? await client.getMovieMetadata(number: num)
             }
             if meta == nil {
                 meta = try await client.scrapeAsset(
                     assetId: assetId ?? "",
-                    fileName: fileName ?? number,
+                    fileName: fileName ?? requestedNumber,
                     remotePath: remotePath,
+                    number: requestedNumber,
                     force: force
                 )
             }
