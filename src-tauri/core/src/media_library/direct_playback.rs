@@ -32,7 +32,7 @@ fn validated_download_url(body: &serde_json::Value, provider: &Url, path: &str) 
     url.set_path(&route_path);
     url.set_query(None);
     url.set_fragment(None);
-    Ok(url)
+    Ok(url.to_string())
 }
 
 pub async fn resolve_direct_playback(
