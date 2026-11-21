@@ -226,14 +226,18 @@ struct ComicFolderReaderView: View {
 
     private func ensureURL(_ entry: RemoteBrowserEntry) async {
         guard urls[entry.path] == nil else { return }
-        guard let assetId = entry.assetId else {
-            await MainActor.run { errorText = "图片页缺少媒体资产标识，无法加载" }
+        if let assetId = entry.assetId,
+           let source = await model.imageSource(assetId: assetId, remotePath: entry.path) {
+            urls[entry.path] = source.url
             return
         }
-        if let source = await model.imageSource(assetId: assetId, remotePath: entry.path) {
-            urls[entry.path] = source.url
-        } else {
-            await MainActor.run { errorText = "图片页加载失败，请重试或检查服务器连接" }
+        // Older remote indexes may not have attached asset IDs to every page.
+        // Keep the configured AList image route as a direct-only fallback so
+        // those pages remain readable without making a video relay request.
+        if let direct = model.alistDirectURL(remotePath: entry.path) {
+            urls[entry.path] = direct
+            return
         }
+        await MainActor.run { errorText = "图片页加载失败，请重试或检查服务器连接" }
     }
 }
