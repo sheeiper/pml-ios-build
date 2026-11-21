@@ -203,7 +203,7 @@ private struct AlbumOriginalImageView: View {
                                 guard !failed else { return }
                                 failed = true
                                 if let url = try? await model.apiClient?.mediaSourceURL(assetId: item.assetId) {
-                                    originalURL = url
+                                    self.originalURL = url
                                 }
                             }
                     }
