@@ -141,15 +141,12 @@ final class AppModel: ObservableObject {
     /// 兼容旧播放器调用；视频请求绝不附带应用 Basic Auth 或 AList 管理凭证。
     func playbackHeaders(for url: URL) -> [String: String] { [:] }
 
-    /// 图片/漫画保留原有映射与服务器媒体行为，与视频严格直链策略隔离。
+    /// 图片/漫画走已鉴权的服务器图片通道；只有视频严格走 AList 直链。
+    /// 这样画册不会受手机到 AList 公网端口、游客权限或签名策略影响。
     func imageSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
-        if settings.mode == .server, settings.routeMode != .relay,
-           let remotePath, let direct = alistDirectURL(remotePath: remotePath) {
-            return PlaybackSource(url: direct, fallbackURL: nil, label: nil)
-        }
         guard let client = apiClient, let assetId,
               let url = try? await client.mediaSourceURL(assetId: assetId) else { return nil }
-        return PlaybackSource(url: url, fallbackURL: nil, label: nil)
+        return PlaybackSource(url: url, fallbackURL: nil, label: "服务器图片")
     }
 
     func proxyScraperImageURL(rawUrl: String) -> URL? {

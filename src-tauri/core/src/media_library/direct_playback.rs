@@ -32,6 +32,19 @@ fn validated_download_url(body: &serde_json::Value, provider: &Url, path: &str) 
     url.set_path(&route_path);
     url.set_query(None);
     url.set_fragment(None);
+
+    // Some AList builds protect /d with a short-lived `sign` returned next to
+    // the route. Keep that signature on the direct URL; dropping it makes the
+    // otherwise-correct anonymous AVPlayer request fail with 401/403. Only
+    // carry the scalar sign value, never arbitrary query data from the API.
+    if let Some(sign) = body
+        .pointer("/data/sign")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        url.query_pairs_mut().append_pair("sign", sign);
+    }
     Ok(url.to_string())
 }
 

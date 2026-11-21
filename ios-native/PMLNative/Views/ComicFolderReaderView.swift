@@ -175,8 +175,7 @@ struct ComicFolderReaderView: View {
     }
 
     private func resolvedURL(for entry: RemoteBrowserEntry) -> URL? {
-        if let cached = urls[entry.path] { return cached }
-        return model.alistDirectURL(remotePath: entry.path)
+        urls[entry.path]
     }
 
     @ViewBuilder
@@ -227,13 +226,14 @@ struct ComicFolderReaderView: View {
 
     private func ensureURL(_ entry: RemoteBrowserEntry) async {
         guard urls[entry.path] == nil else { return }
-        if let direct = model.alistDirectURL(remotePath: entry.path) {
-            urls[entry.path] = direct
+        guard let assetId = entry.assetId else {
+            await MainActor.run { errorText = "图片页缺少媒体资产标识，无法加载" }
             return
         }
-        guard let assetId = entry.assetId else { return }
         if let source = await model.imageSource(assetId: assetId, remotePath: entry.path) {
             urls[entry.path] = source.url
+        } else {
+            await MainActor.run { errorText = "图片页加载失败，请重试或检查服务器连接" }
         }
     }
 }
