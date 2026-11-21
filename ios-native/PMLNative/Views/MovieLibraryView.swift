@@ -76,7 +76,7 @@ public struct MovieLibraryView: View {
         }
         .task { await reload() }
         .task(id: searchQuery) {
-            guard !searchQuery.isEmpty else { return }
+            // Debounce both typing and clearing the search field so an empty query reloads the full server page.
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
             await reload()
@@ -117,11 +117,11 @@ public struct MovieLibraryView: View {
                             }
                         }
                     case .issues:
-                        ForEach(issues) { issue in issueCell(issue) }
+                        ForEach(issues) { issue in issueCell(issue).onAppear { loadMoreIfNeeded(issue) } }
                     case .unrecognized:
-                        ForEach(unrecognized) { item in unrecognizedCell(item) }
+                        ForEach(unrecognized) { item in unrecognizedCell(item).onAppear { loadMoreIfNeeded(item) } }
                     case .performers:
-                        ForEach(performers) { person in performerCell(person) }
+                        ForEach(performers) { person in performerCell(person).onAppear { loadMoreIfNeeded(person) } }
                     }
                     if loadingMore { ProgressView().padding() }
                 }
@@ -221,14 +221,32 @@ public struct MovieLibraryView: View {
         }.buttonStyle(.plain)
     }
 
-    private func loadMoreIfNeeded(_ movie: MovieMetadata) {
-        guard let index = pageItems.firstIndex(of: movie), index >= pageItems.count - 5, pageItems.count < total, !loadingMore else { return }
+    private func requestMore() {
+        guard !loadingMore else { return }
+        loadingMore = true
         Task { await loadPage(reset: false) }
+    }
+    private func loadMoreIfNeeded(_ movie: MovieMetadata) {
+        guard let index = pageItems.firstIndex(of: movie), index >= pageItems.count - 5, pageItems.count < total else { return }
+        requestMore()
+    }
+    private func loadMoreIfNeeded(_ issue: ScrapeIssue) {
+        guard let index = issues.firstIndex(of: issue), index >= issues.count - 5, issues.count < issueTotal else { return }
+        requestMore()
+    }
+    private func loadMoreIfNeeded(_ item: UnrecognizedVideo) {
+        guard let index = unrecognized.firstIndex(of: item), index >= unrecognized.count - 5, unrecognized.count < unrecognizedTotal else { return }
+        requestMore()
+    }
+    private func loadMoreIfNeeded(_ person: MoviePerformer) {
+        guard let index = performers.firstIndex(of: person), index >= performers.count - 5, performers.count < performerTotal else { return }
+        requestMore()
     }
     private func resetAndLoad() { Task { await reload() } }
     private func reload() async {
         requestVersion += 1
         offset = 0; pageItems = []; issues = []; unrecognized = []; performers = []; errorMessage = nil
+        loading = true; loadingMore = false
         await loadPage(reset: true)
     }
     private func loadPage(reset: Bool) async {

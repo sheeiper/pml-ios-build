@@ -70,8 +70,9 @@ public struct MovieDetailSheet: View {
                     } else if let meta = metadata {
                         // Hero section
                         HStack(alignment: .top, spacing: 16) {
-                            CachedImageView(url: meta.coverUrl.flatMap { appModel.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fill, minHeight: 195, maxPixel: 900)
-                                .frame(width: 140, height: 195)
+                            CachedImageView(url: meta.coverUrl.flatMap { appModel.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fill, minHeight: 90, maxPixel: 900)
+                                .aspectRatio(16 / 9, contentMode: .fit)
+                                .frame(width: 160, height: 90)
                                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                 .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 3)
 

@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import UIKit
 
 /// Candidate detail intentionally keeps identity confirmation separate from profile editing.
 struct MoviePerformerDetailSheet: View {
@@ -12,6 +13,7 @@ struct MoviePerformerDetailSheet: View {
     @State private var errorMessage: String?
     @State private var showEditor = false
     @State private var showConfirmAlert = false
+    @State private var selectedMovie: MovieMetadata?
     @State private var avatarItem: PhotosPickerItem?
 
     var body: some View {
@@ -35,6 +37,10 @@ struct MoviePerformerDetailSheet: View {
                             Button("撤销人工确认", role: .destructive) { Task { await setStatus("unconfirmed") } }.buttonStyle(.bordered)
                         }
                         Text("关联作品 (\(detail?.total ?? person.movieCount))") .font(.headline)
+                        if (detail?.total ?? person.movieCount) > (detail?.movies.count ?? 0) {
+                            Text("仅显示前 \(detail?.movies.count ?? 0) 部；服务端详情上限为 100 部。总数为本地已验证番号计数。")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
                         if let movies = detail?.movies, !movies.isEmpty {
                             LazyVStack(alignment: .leading, spacing: 10) { ForEach(movies) { movie in movieRow(movie) } }
                         } else { Text("暂无已验证关联作品").foregroundStyle(.secondary) }
@@ -49,6 +55,10 @@ struct MoviePerformerDetailSheet: View {
                 MoviePerformerEditor(person: detail?.person ?? performer) { await save($0) }
                     .environmentObject(model)
             }
+            .sheet(item: $selectedMovie) { movie in
+                MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil)
+                    .environmentObject(model)
+            }
             .alert("确认身份？", isPresented: $showConfirmAlert) {
                 Button("确认") { Task { await setStatus("confirmed") } }
                 Button("取消", role: .cancel) {}
@@ -60,7 +70,7 @@ struct MoviePerformerDetailSheet: View {
 
     private func profileHeader(_ person: MoviePerformer) -> some View {
         HStack(spacing: 14) {
-            CachedImageView(url: avatarURL(person.avatarUrl), contentMode: .fill, minHeight: 76, maxPixel: 360)
+            PerformerAvatarView(value: person.avatarUrl, proxy: avatarURL(person.avatarUrl))
                 .frame(width: 76, height: 76).clipShape(Circle())
             VStack(alignment: .leading, spacing: 5) {
                 Text(person.name).font(.title2.bold())
@@ -70,12 +80,14 @@ struct MoviePerformerDetailSheet: View {
         }
     }
     private func movieRow(_ movie: MovieMetadata) -> some View {
-        HStack(spacing: 10) {
-            CachedImageView(url: movie.coverUrl.flatMap { model.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fill, minHeight: 54, maxPixel: 300)
-                .frame(width: 96, height: 54).clipShape(RoundedRectangle(cornerRadius: 6))
-            VStack(alignment: .leading) { Text(movie.number).font(.caption.bold()); Text(movie.title).font(.caption).lineLimit(2) }
-            Spacer()
-        }
+        Button { selectedMovie = movie } label: {
+            HStack(spacing: 10) {
+                CachedImageView(url: movie.coverUrl.flatMap { model.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fill, minHeight: 54, maxPixel: 300)
+                    .frame(width: 96, height: 54).clipShape(RoundedRectangle(cornerRadius: 6))
+                VStack(alignment: .leading) { Text(movie.number).font(.caption.bold()); Text(movie.title).font(.caption).lineLimit(2) }
+                Spacer(); Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+            }
+        }.buttonStyle(.plain)
     }
     private func avatarURL(_ value: String?) -> URL? {
         guard let value, !value.isEmpty else { return nil }
@@ -94,6 +106,19 @@ struct MoviePerformerDetailSheet: View {
     private func save(_ input: MoviePerformerEditor.Input) async {
         guard let client = model.apiClient else { return }; saving = true; defer { saving = false }
         do { let person = try await client.updateMoviePerformer(id: performer.id, name: input.name, aliases: input.aliases, avatarURL: input.avatarURL, profileURL: input.profileURL); detail = MoviePerformerDetail(person: person, movies: detail?.movies ?? [], total: detail?.total ?? person.movieCount); showEditor = false } catch { errorMessage = error.localizedDescription }
+    }
+}
+
+private struct PerformerAvatarView: View {
+    let value: String?
+    let proxy: URL?
+    var body: some View {
+        if let value, value.hasPrefix("data:image/"), let comma = value.firstIndex(of: ","),
+           let data = Data(base64Encoded: String(value[value.index(after: comma)...])), let image = UIImage(data: data) {
+            Image(uiImage: image).resizable().scaledToFill()
+        } else {
+            CachedImageView(url: proxy, contentMode: .fill, minHeight: 76, maxPixel: 360)
+        }
     }
 }
 
