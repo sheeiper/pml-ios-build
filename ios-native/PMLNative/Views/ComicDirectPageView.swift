@@ -9,7 +9,10 @@ struct ComicDirectPageView: View {
     @EnvironmentObject private var model: AppModel
     @State private var image: UIImage?
     @State private var failed = false
-    @State private var sourceLabel: String?
+
+    private var serverPageURL: URL? {
+        model.apiClient?.comicPageURL(assetId: assetId, pageIndex: page.index)
+    }
 
     private var displayImage: UIImage? {
         if let image { return image }
@@ -23,8 +26,13 @@ struct ComicDirectPageView: View {
                     .resizable()
                     .scaledToFit()
                     .frame(maxWidth: .infinity)
+            } else if failed, let serverPageURL {
+                // Direct AList ZIP range is preferred, but the authenticated
+                // comic-page route keeps legacy ZIP/ZIP64/encrypted archives
+                // readable without sending credentials to AList/CDN.
+                CachedImageView(url: serverPageURL, contentMode: .fit, minHeight: 360, maxPixel: 2400)
             } else if failed {
-                ContentUnavailableView("这一页无法直连", systemImage: "wifi.exclamationmark", description: Text("不会改走服务器。可返回后重试。"))
+                ContentUnavailableView("这一页无法打开", systemImage: "wifi.exclamationmark", description: Text("直链和服务器图片接口都不可用，请检查服务连接后重试。"))
                     .frame(maxWidth: .infinity, minHeight: 360)
             } else {
                 ProgressView()

@@ -189,34 +189,36 @@ public struct AlbumGalleryView: View {
 private struct AlbumOriginalImageView: View {
     let item: AlbumItem
     @EnvironmentObject private var model: AppModel
-    @State private var originalURL: URL?
+    @State private var image: UIImage?
+    @State private var loading = true
     @State private var failed = false
 
     var body: some View {
         Group {
-            if let originalURL {
-                AsyncImage(url: originalURL) { phase in
-                    if let image = phase.image { image.resizable().scaledToFit() }
-                    else if phase.error != nil {
-                        fallback
-                            .task {
-                                guard !failed else { return }
-                                failed = true
-                                if let url = try? await model.apiClient?.mediaSourceURL(assetId: item.assetId) {
-                                    self.originalURL = url
-                                }
-                            }
-                    }
-                    else { ProgressView().tint(.white) }
-                }
-            } else { fallback }
+            if let image {
+                Image(uiImage: image).resizable().scaledToFit()
+            } else if loading {
+                ProgressView().tint(.white)
+            } else if failed {
+                fallback
+            } else {
+                fallback
+            }
         }
         .task(id: item.assetId) {
-            originalURL = model.alistDirectURL(remotePath: item.remotePath)
-            guard originalURL == nil else { return }
-            if let client = model.apiClient {
-                originalURL = try? await client.mediaSourceURL(assetId: item.assetId)
+            loading = true
+            failed = false
+            image = nil
+            let serverURL = try? await model.apiClient?.mediaSourceURL(assetId: item.assetId)
+            let directURL = model.alistDirectURL(remotePath: item.remotePath)
+            if let serverURL, let loaded = await ImageCache.shared.cachedOrLoad(serverURL, maxPixel: 2400) {
+                image = loaded
+            } else if let directURL, let loaded = await ImageCache.shared.cachedOrLoad(directURL, maxPixel: 2400) {
+                image = loaded
+            } else {
+                failed = true
             }
+            loading = false
         }
     }
 

@@ -42,6 +42,9 @@ struct SettingsView: View {
                 }
             }
             mediaSourceLink
+            if model.settings.mode == .server {
+                accelSection
+            }
             cleanupSection
             scanSection
             cacheSection

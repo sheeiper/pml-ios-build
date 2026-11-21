@@ -1149,7 +1149,7 @@ struct PendingProjectDetailView: View {
             } else if result.status == "SKIPPED_EXIST" {
                 errorText = "目标目录已存在同名文件，跳过移动"
             } else {
-                errorText = result.status ?? "移动失败"
+                errorText = result.message.isEmpty ? (result.status.isEmpty ? "移动失败" : result.status) : result.message
             }
         } catch {
             errorText = error.localizedDescription
