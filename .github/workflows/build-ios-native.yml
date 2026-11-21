@@ -1,15 +1,7 @@
-name: Build iOS Native
+﻿name: Build iOS Native
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - 'ios-native/**'
-      - 'src-tauri/**'
-      - 'src/**'
-      - '.github/workflows/build-ios-native.yml'
 
 permissions:
   contents: read
@@ -18,7 +10,7 @@ jobs:
   build-native:
     name: Build Native SwiftUI App (.ipa)
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -40,30 +32,17 @@ jobs:
             fi
           done
           xcodebuild -version
-          xcodebuild -showsdks | grep -E "iphoneos" || true
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-
-      - name: Install NPM Dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Build Web Frontend
-        run: npm run build
+      - name: Test strict direct playback policy
+        run: |
+          swiftc ios-native/PMLNative/Support/DirectPlaybackPolicy.swift tests/direct-playback-policy.swift -o "/direct-playback-policy"
+          "/direct-playback-policy"
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: |
             aarch64-apple-ios
-
-      - name: Cache Cargo Dependencies
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: 'src-tauri -> target'
 
       - name: Build Rust Core for iOS
         run: |
@@ -75,7 +54,7 @@ jobs:
         run: |
           mkdir -p ios-native/Vendor
           rm -f ios-native/Vendor/*.a
-          cp src-tauri/target/aarch64-apple-ios/release/libpersonal_media_library_core.a \
+          cp src-tauri/core/target/aarch64-apple-ios/release/libpersonal_media_library_core.a \
              ios-native/Vendor/libpersonal_media_library_core.a
           ls -lh ios-native/Vendor/
 
@@ -106,7 +85,6 @@ jobs:
             echo "ERROR: compiled .app bundle not found"
             exit 1
           fi
-          echo "APP bundle: $APP_PATH"
           mkdir -p "$RUNNER_TEMP/ipa_out/Payload"
           cp -R "$APP_PATH" "$RUNNER_TEMP/ipa_out/Payload/"
           cd "$RUNNER_TEMP/ipa_out"
@@ -119,3 +97,4 @@ jobs:
           name: personal-media-library-native-ios
           path: ${{ runner.temp }}/personal-media-library-native-unsigned.ipa
           retention-days: 14
+
