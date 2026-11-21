@@ -25,9 +25,14 @@ struct DirectPlaybackPolicyTests {
         check("https://user:password@cdn.example/video.mp4", false)
         check("file:///tmp/video.mp4", false)
         check("ftp://cdn.example/video.mp4", false)
+        check("https://alist.example:5244/d/115/movie.mp4", true)
         check("https://cdn.example/dav/video.mp4", false)
+        check("https://cdn.example/p/video.mp4", false)
         check("https://cdn.example/api/telegram_user_stream", false)
         precondition(!DirectPlaybackPolicy.allows(URL(string:"https://PML.EXAMPLE:443/other")!, serverURL: URL(string:"https://pml.example")!, coreURL: nil))
+        let sameOriginAlist = URL(string: "https://pml.example:18080/alist")!
+        precondition(DirectPlaybackPolicy.allows(URL(string: "https://pml.example:18080/alist/d/video.mp4")!, serverURL: server, coreURL: nil, alistURL: sameOriginAlist))
+        precondition(!DirectPlaybackPolicy.allows(URL(string: "https://pml.example:18080/alist/media/video.mp4")!, serverURL: server, coreURL: nil, alistURL: sameOriginAlist))
         precondition(DirectPlaybackPolicy.failureMessage.contains("不会切换服务器中转"))
         print("DirectPlaybackPolicy: \(checked + 2) assertions passed")
     }

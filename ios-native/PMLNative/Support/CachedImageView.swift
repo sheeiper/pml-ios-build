@@ -31,6 +31,11 @@ struct CachedImageView: View {
                 Image(uiImage: current)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
+            } else if url == nil {
+                Image(systemName: "photo")
+                    .frame(maxWidth: .infinity, minHeight: minHeight)
+                    .foregroundStyle(.secondary)
+                    .background(Color.secondary.opacity(0.12))
             } else if failed {
                 VStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle")
@@ -52,6 +57,11 @@ struct CachedImageView: View {
         .task(id: currentKey) {
             guard let url else { return }
             let key = currentKey
+            // Lazy grids reuse view state. Reset state before loading a new URL so
+            // an old failure/image cannot remain visible for the next movie.
+            image = nil
+            loadedKey = nil
+            failed = false
             if let hit = ImageCache.shared.cached(url, maxPixel: maxPixel) {
                 image = hit
                 loadedKey = key

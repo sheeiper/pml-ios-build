@@ -115,7 +115,7 @@ final class AppModel: ObservableObject {
             return nil
         }
         do {
-            let url = try await client.directPlaybackURL(assetId: assetId, remotePath: remotePath)
+            let url = try await client.directPlaybackURL(assetId: assetId, remotePath: remotePath, alistURL: settings.normalizedAlistURL)
             guard allowsDirectPlayback(url) else {
                 playbackError = "解析结果不是安全的媒体直链，已拒绝服务器中转"
                 return nil
@@ -130,7 +130,12 @@ final class AppModel: ObservableObject {
     }
 
     func allowsDirectPlayback(_ url: URL) -> Bool {
-        DirectPlaybackPolicy.allows(url, serverURL: settings.normalizedServerURL, coreURL: coreBaseURL)
+        DirectPlaybackPolicy.allows(
+            url,
+            serverURL: settings.normalizedServerURL,
+            coreURL: coreBaseURL,
+            alistURL: settings.normalizedAlistURL
+        )
     }
 
     /// 兼容旧播放器调用；视频请求绝不附带应用 Basic Auth 或 AList 管理凭证。

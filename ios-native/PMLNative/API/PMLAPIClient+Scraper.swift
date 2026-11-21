@@ -47,9 +47,19 @@ extension PMLAPIClient {
     }
 
     func proxyScraperImageURL(rawUrl: String) -> URL? {
-        guard var components = URLComponents(url: configuration.baseURL, resolvingAgainstBaseURL: false) else { return nil }
+        guard !rawUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              var components = URLComponents(url: configuration.baseURL, resolvingAgainstBaseURL: false) else { return nil }
+        // Keep the upstream URL out of the request target. Besides avoiding reserved
+        // query characters being reinterpreted by intermediaries, this matches the
+        // web client and the server's preferred URL-safe `source` transport.
+        let source = Data(rawUrl.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        guard !source.isEmpty else { return nil }
         components.path = "/api/scraper/proxy-image"
-        components.queryItems = [URLQueryItem(name: "url", value: rawUrl)]
+        components.queryItems = [URLQueryItem(name: "source", value: source)]
         return components.url
     }
 

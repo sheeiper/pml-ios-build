@@ -323,17 +323,28 @@ public struct MovieDetailSheet: View {
         errorMessage = nil
         do {
             var meta: MovieMetadata?
-            let requestedNumber = currentNumber ?? number
-            if let num = requestedNumber, !force {
+            let requestedNumber = (currentNumber ?? number)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let num = requestedNumber, !num.isEmpty, !force {
                 meta = try? await client.getMovieMetadata(number: num)
             }
-            if meta == nil, force {
+            // Directory entries have no number yet. Resolve them on first open;
+            // otherwise the sheet stays on an empty spinner until the user guesses
+            // that the refresh button is required. Existing records still use the
+            // cheap metadata lookup and never trigger a network scrape implicitly.
+            if meta == nil, (force || requestedNumber == nil || requestedNumber?.isEmpty == true) {
+                let sourceName = fileName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard assetId != nil || !(sourceName?.isEmpty ?? true) else {
+                    metadata = nil
+                    errorMessage = "缺少视频资产或文件名，无法刮削详情。"
+                    loading = false
+                    return
+                }
                 meta = try await client.scrapeAsset(
                     assetId: assetId ?? "",
-                    fileName: fileName ?? requestedNumber,
+                    fileName: sourceName ?? requestedNumber,
                     remotePath: remotePath,
                     number: requestedNumber,
-                    force: true
+                    force: force
                 )
             }
             metadata = meta
