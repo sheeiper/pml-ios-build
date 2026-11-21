@@ -1,4 +1,4 @@
-﻿name: Build iOS Native
+name: Build iOS Native
 
 on:
   workflow_dispatch:
@@ -35,8 +35,8 @@ jobs:
 
       - name: Test strict direct playback policy
         run: |
-          swiftc ios-native/PMLNative/Support/DirectPlaybackPolicy.swift tests/direct-playback-policy.swift -o "/direct-playback-policy"
-          "/direct-playback-policy"
+          swiftc ios-native/PMLNative/Support/DirectPlaybackPolicy.swift tests/direct-playback-policy.swift -o "$RUNNER_TEMP/direct-playback-policy"
+          "$RUNNER_TEMP/direct-playback-policy"
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
