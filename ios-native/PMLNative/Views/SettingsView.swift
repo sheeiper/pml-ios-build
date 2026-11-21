@@ -9,11 +9,11 @@ struct SettingsView: View {
     @State private var showAddRoot = false
     @State private var accel = AlistAccelConfig(
         enabled: false,
-        apiUrl: "",
-        username: "",
+        apiUrl: "http://103.119.1.41:45112",
+        username: "admin",
         password: nil,
         cd2Prefix: "/115open",
-        alistPrefix: "/115open"
+        alistPrefix: "/115"
     )
     @State private var accelMessage = ""
     @State private var cacheMessage = ""

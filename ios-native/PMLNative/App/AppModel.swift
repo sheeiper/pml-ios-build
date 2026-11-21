@@ -123,7 +123,12 @@ final class AppModel: ObservableObject {
             return PlaybackSource(url: url, fallbackURL: nil, label: "严格直连")
         } catch {
             if !Task.isCancelled {
-                playbackError = "直链解析失败，请检查服务端 AList 配置及存储登录状态；不会回退中转。"
+                // Keep the server's actionable configuration/login diagnostic;
+                // resolver errors never contain credentials or signed URLs.
+                let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                playbackError = detail.isEmpty
+                    ? "直链解析失败，请检查服务端 AList 配置及存储登录状态；不会回退中转。"
+                    : "直链解析失败：\(detail)；不会回退中转。"
             }
             return nil
         }
