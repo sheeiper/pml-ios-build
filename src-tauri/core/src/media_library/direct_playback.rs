@@ -1,5 +1,19 @@
 //! Strict playback resolver: control-plane JSON only, never registers or opens a media stream.
 use super::*;
+use std::{collections::HashMap, sync::{Mutex as StdMutex, OnceLock}};
+use std::time::{Duration, Instant};
+
+static DIRECT_TOKEN_CACHE: OnceLock<StdMutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+static DIRECT_URL_CACHE: OnceLock<StdMutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+static DIRECT_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+});
+const DIRECT_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const DIRECT_URL_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +88,8 @@ pub async fn resolve_direct_playback(
         let endpoint = Url::parse(config.api_url.trim()).map_err(|_| "Invalid AList service URL".to_string())?;
         let path = mapped_path(&path, &config.cd2_prefix, &config.alist_prefix)?;
         // Use an isolated, no-redirect client below so API credentials cannot follow redirects.
+        // Reuse the short-lived control-plane token: opening a file should not log in to AList
+        // again, especially when the user quickly scrubs through a playlist.
         let token = direct_login(&endpoint, &config.username, config.password.as_deref().unwrap_or_default()).await?;
         (endpoint, token, path)
     } else {
@@ -83,11 +99,20 @@ pub async fn resolve_direct_playback(
         }
         (session.endpoint, session.api_token, path)
     };
-    let client = direct_client()?;
-    let response = client
+    let cache_key = format!("{}|{}", provider, path);
+    if let Some(cached) = DIRECT_URL_CACHE
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock().ok()
+        .and_then(|mut guard| guard.get(&cache_key).cloned().and_then(|(url, at)| {
+            if at.elapsed() < DIRECT_URL_TTL { Some(url) } else { guard.remove(&cache_key); None }
+        }))
+    {
+        return Ok(DirectPlaybackSource { url: cached });
+    }
+    let response = DIRECT_CLIENT
         .post(alist_api_url(&provider, "fs/get")?)
         .header(AUTHORIZATION, token)
-        .json(&serde_json::json!({"path": path, "password": "", "refresh": true}))
+        .json(&serde_json::json!({"path": path, "password": "", "refresh": false}))
         .send()
         .await
         .map_err(|_| "AList direct-link resolution connection failed".to_string())?;
@@ -98,22 +123,38 @@ pub async fn resolve_direct_playback(
         .json()
         .await
         .map_err(|_| "Invalid AList direct-link resolution response".to_string())?;
-    Ok(DirectPlaybackSource { url: validated_download_url(&body, &provider, &path)? })
+    let url = validated_download_url(&body, &provider, &path)?;
+    // AList may attach a short-lived sign; never retain that credential beyond
+    // this response. Unsigned /d paths are stable and safe to reuse briefly.
+    if !url.contains("?sign=") && !url.contains("&sign=") {
+        if let Ok(mut guard) = DIRECT_URL_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+            guard.insert(cache_key, (url.clone(), Instant::now()));
+        }
+    }
+    Ok(DirectPlaybackSource { url })
 }
 
-fn direct_client() -> Result<Client, String> {
-    Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|_| "Unable to initialize direct-link client".to_string())
+fn direct_client() -> &'static Client {
+    &DIRECT_CLIENT
 }
 
 async fn direct_login(endpoint: &Url, username: &str, password: &str) -> Result<String, String> {
     if !matches!(endpoint.scheme(), "http" | "https") || !endpoint.username().is_empty() || endpoint.password().is_some() {
         return Err("Invalid AList service URL".into());
     }
-    let response = direct_client()?
+    // Include a one-way password fingerprint so changing credentials cannot
+    // reuse a token issued for the previous password without logging secrets.
+    let password_fingerprint = format!("{:x}", Sha256::digest(password.as_bytes()));
+    let cache_key = format!("{}|{}|{}", endpoint, username, password_fingerprint);
+    if let Ok(mut guard) = DIRECT_TOKEN_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+        if let Some((token, created)) = guard.get(&cache_key).cloned() {
+            if created.elapsed() < DIRECT_TOKEN_TTL {
+                return Ok(token);
+            }
+            guard.remove(&cache_key);
+        }
+    }
+    let response = direct_client()
         .post(alist_api_url(endpoint, "auth/login")?)
         .json(&serde_json::json!({"username": username, "password": password}))
         .send()
@@ -126,11 +167,15 @@ async fn direct_login(endpoint: &Url, username: &str, password: &str) -> Result<
         .json()
         .await
         .map_err(|_| "Invalid AList login response".to_string())?;
-    body.pointer("/data/token")
+    let token = body.pointer("/data/token")
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| "AList login failed; check username and password".to_string())
+        .ok_or_else(|| "AList login failed; check username and password".to_string())?;
+    if let Ok(mut guard) = DIRECT_TOKEN_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+        guard.insert(cache_key, (token.clone(), Instant::now()));
+    }
+    Ok(token)
 }
 
 #[cfg(test)]

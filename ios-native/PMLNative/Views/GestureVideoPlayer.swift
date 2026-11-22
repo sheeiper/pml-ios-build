@@ -64,6 +64,8 @@ struct GestureVideoPlayerSheet: View {
     @State private var seekTask: Task<Void, Never>?
     @State private var seekRequestID = 0
     @State private var seekWatchdog: Task<Void, Never>?
+    @State private var startupTask: Task<Void, Never>?
+    @State private var resumeTask: Task<Void, Never>?
     @State private var playbackGeneration = 0
     @State private var isRecovering = false
     @State private var stallRecoveryTask: Task<Void, Never>?
@@ -528,7 +530,7 @@ struct GestureVideoPlayerSheet: View {
             if let item = player.currentItem, item.status == .failed {
                 handlePlaybackFailure()
             } else if isPlaying && player.timeControlStatus == .paused {
-                player.playImmediately(atRate: rate)
+                player.play()
             }
         }
         if let existing = endObserver {
@@ -649,13 +651,14 @@ struct GestureVideoPlayerSheet: View {
         let target = total > 0 ? min(max(0, seconds), max(0, total)) : max(0, seconds)
         currentTime = target
         let time = CMTime(seconds: target, preferredTimescale: 600)
-        // 使用关键帧容差（1.2s），避免直连网络下精确逐帧解码整个 GOP 导致拖动进度条卡顿
-        let tolerance = CMTime(seconds: 1.2, preferredTimescale: 600)
+        // 使用更宽的关键帧容差，避免直连网络下为精确逐帧位置反复
+        // 拉取并解码长 GOP；松手后快速落到最近关键帧，再继续播放。
+        let tolerance = CMTime(seconds: 2.5, preferredTimescale: 600)
         _ = await player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance)
         guard !Task.isCancelled, request == seekRequestID else { return }
         if resume {
             isPlaying = true
-            player.playImmediately(atRate: rate)
+            player.play()
             scheduleHideControls()
         } else {
             player.pause()
@@ -674,15 +677,20 @@ struct GestureVideoPlayerSheet: View {
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
         let isMOV = url.pathExtension.lowercased() == "mov"
-        // 赋予充足的前向预缓冲时长（MOV 取 6 秒，其余高码率/大视频取 30 秒），提供充足吸震区，根治千兆局域网播放时的间歇性卡顿
-        item.preferredForwardBufferDuration = isMOV ? 6.0 : 30.0
-        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        // 直链通常需要经过 AList 的一次重定向；过大的预缓冲会让 AVPlayer
+        // 在打开和拖动时先等待很久，也会放大弱网抖动。保持小吸震区，交给
+        // AVPlayer 按可用带宽动态扩展，避免“点开慢、滑块慢、播放抽搐”。
+        item.preferredForwardBufferDuration = isMOV ? 4.0 : 8.0
         return item
     }
 
     private func loadCurrent(trackResume: Bool) {
         seekTask?.cancel()
         seekWatchdog?.cancel()
+        startupTask?.cancel()
+        startupTask = nil
+        resumeTask?.cancel()
+        resumeTask = nil
         stallRecoveryTask?.cancel()
         isSeeking = false
         isScrubbing = false
@@ -696,6 +704,9 @@ struct GestureVideoPlayerSheet: View {
         }
         let item = makePlayerItem(currentURL)
         observeItemStatus(item)
+        // Keep AVPlayer's adaptive anti-stall decision enabled. With the
+        // reduced 8-second item buffer this avoids the old long startup wait
+        // without forcing playback onto an underfilled direct HTTP range.
         player.automaticallyWaitsToMinimizeStalling = true
         player.replaceCurrentItem(with: item)
 
@@ -717,7 +728,8 @@ struct GestureVideoPlayerSheet: View {
         if trackResume && startAt <= 1 {
             let initialSeekID = seekRequestID
             let loadingAssetId = currentAssetId
-            Task {
+            resumeTask?.cancel()
+            resumeTask = Task { @MainActor in
                 await checkResume(expectedAssetId: loadingAssetId, initialSeekID: initialSeekID)
             }
         }
@@ -735,7 +747,10 @@ struct GestureVideoPlayerSheet: View {
         resumeSeconds = saved
         resumeToastSeconds = saved
         showResumeToast = true
-        requestSeek(to: saved, resume: isPlaying, debounce: false)
+        // Reuse the single startup seek/play path. This pauses the initial
+        // zero-position autoplay before seeking, avoiding a second competing
+        // Range request when the progress RPC returns.
+        begin(from: saved)
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 6_000_000_000)
             showResumeToast = false
@@ -785,6 +800,8 @@ struct GestureVideoPlayerSheet: View {
         // 先立即取消当前播放流与挂起任务、更新标题状态，做到 0 延迟响应
         seekTask?.cancel()
         seekWatchdog?.cancel()
+        startupTask?.cancel()
+        resumeTask?.cancel()
         stallRecoveryTask?.cancel()
         player.pause()
         currentIndex = index
@@ -818,20 +835,54 @@ struct GestureVideoPlayerSheet: View {
 
     private func begin(from seconds: Double) {
         resumeVisible = false
-        isPlaying = true
-        player.playImmediately(atRate: rate)
-        scheduleHideControls()
+        // Do not start decoding from zero and then immediately seek. On a direct
+        // HTTP source that creates two competing range requests and visible
+        // judder. Resolve the initial position first, then start exactly once.
         if seconds > 1 {
-            Task { @MainActor in
-                guard await waitUntilReady() else { return }
+            isPlaying = false
+            startupTask?.cancel()
+            // Reserve a seek generation before the async readiness wait so the
+            // background resume lookup cannot enqueue a second seek.
+            seekRequestID += 1
+            let request = seekRequestID
+            let generation = playbackGeneration
+            let assetID = currentAssetId
+            startupTask = Task { @MainActor in
+                guard await waitUntilReady(), !Task.isCancelled,
+                      generation == playbackGeneration,
+                      assetID == currentAssetId else { return }
                 let total = player.currentItem?.duration.seconds ?? 0
                 let target = (total.isFinite && total > 5 && seconds > total - 3) ? 0 : seconds
-                requestSeek(to: target, resume: true, debounce: false)
+                if target > 0 {
+                    guard let item = player.currentItem else { return }
+                    item.cancelPendingSeeks()
+                    _ = await player.seek(
+                        to: CMTime(seconds: target, preferredTimescale: 600),
+                        toleranceBefore: CMTime(seconds: 2.5, preferredTimescale: 600),
+                        toleranceAfter: CMTime(seconds: 2.5, preferredTimescale: 600)
+                    )
+                    guard request == seekRequestID,
+                          generation == playbackGeneration,
+                          assetID == currentAssetId,
+                          !Task.isCancelled else { return }
+                    currentTime = target
+                }
+                guard !playbackFailed,
+                      generation == playbackGeneration,
+                      assetID == currentAssetId,
+                      !Task.isCancelled else { return }
+                isPlaying = true
+                player.play()
+                scheduleHideControls()
                 if target == 0 {
                     resumeToastSeconds = 0
                     showResumeToast = false
                 }
             }
+        } else {
+            isPlaying = true
+            player.play()
+            scheduleHideControls()
         }
     }
 
@@ -861,7 +912,7 @@ struct GestureVideoPlayerSheet: View {
             controlsTask?.cancel()
         } else {
             isPlaying = true
-            player.playImmediately(atRate: rate)
+            player.play()
             scheduleHideControls()
         }
     }
@@ -1119,6 +1170,8 @@ struct GestureVideoPlayerSheet: View {
         playbackFailed = true
         seekTask?.cancel()
         seekWatchdog?.cancel()
+        startupTask?.cancel()
+        resumeTask?.cancel()
         stallRecoveryTask?.cancel()
         player.pause()
         isPlaying = false
@@ -1140,6 +1193,8 @@ struct GestureVideoPlayerSheet: View {
     private func teardown() {
         seekTask?.cancel()
         seekWatchdog?.cancel()
+        startupTask?.cancel()
+        resumeTask?.cancel()
         stallRecoveryTask?.cancel()
         controlsTask?.cancel()
         hudTask?.cancel()
