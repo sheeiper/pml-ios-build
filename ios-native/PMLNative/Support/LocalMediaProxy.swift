@@ -102,6 +102,33 @@ final class LocalMediaProxy: NSObject {
         return URL(string: "http://127.0.0.1:\(port)/p/\(token).\(ext)")
     }
 
+    /// 仅认可当前本地代理监听端口上、且已登记有效直链 token 的本机加速 URL，
+    /// 绝不会把服务端中转或嵌入式内核的 `127.0.0.1` 端口误判为合法直连。
+    func isRegisteredLocalProxyURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "http",
+              url.host == "127.0.0.1",
+              let urlPort = url.port,
+              url.path.hasPrefix("/p/") else { return false }
+        guard let token = url.path.split(separator: "/").last.map(String.init) else { return false }
+        let stem = token.split(separator: ".").first.map(String.init) ?? token
+        lock.lock()
+        defer { lock.unlock() }
+        guard let activePort = port, activePort > 0, Int(activePort) == urlPort else { return false }
+        return streamsByToken[stem] != nil
+    }
+
+    /// 播放失败时清除缓存的 302 CDN 地址，确保下次重新播放时重新向 AList `/d` 获取最新直链。
+    func invalidateResolvedURL(for proxyURL: URL) {
+        guard let token = proxyURL.path.split(separator: "/").last.map(String.init) else { return }
+        let stem = token.split(separator: ".").first.map(String.init) ?? token
+        lock.lock()
+        if let entry = streamsByToken[stem] {
+            entry.resolvedURL = nil
+            entry.resolvedAt = nil
+        }
+        lock.unlock()
+    }
+
     private func upsertToken(for directURL: URL) -> String {
         let key = directURL.absoluteString
         lock.lock()

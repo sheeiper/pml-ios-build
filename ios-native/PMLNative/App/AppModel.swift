@@ -10,6 +10,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var settingsRevision = 0
     @Published var playbackError: String?
 
+    /// 客户端短 TTL 直链解析缓存（45s），避免短时间内重复打开/切集反复阻塞等服务端 `resolve_direct_playback`。
+    private var directURLCache: [String: (url: URL, fetchedAt: Date)] = [:]
+    private static let directURLCacheTTL: TimeInterval = 45
+
     init(corePort: Int32, coreError: String?, settings: RuntimeSettings = .load()) {
         self.corePort = corePort > 0 ? Int(corePort) : nil
         self.coreError = corePort > 0 ? nil : coreError
@@ -58,6 +62,7 @@ final class AppModel: ObservableObject {
     func updateSettings(_ newValue: RuntimeSettings) {
         settings = newValue
         newValue.save()
+        directURLCache.removeAll()
         configureImageAuth()
         settingsRevision += 1
     }
@@ -106,21 +111,50 @@ final class AppModel: ObservableObject {
 
     // MARK: - 播放地址解析
 
-    /// 视频一律严格直链（包括旧 relay 设置、本地模式及只有 assetId 的影视入口）。
-    /// 控制面只返回 AList raw_url；不注册 /media，不预读视频，不通过 LocalMediaProxy。
+    /// 视频一律严格直链（包括旧 relay 设置、本地模式及只有 assetId 的影视入口）；绝不回退服务器中转。
+    /// 经 DirectPlaybackPolicy 校验通过后，交给手机本机 LocalMediaProxy 缓存 AList `/d` 302 后的真实 115 CDN 直链并复用连接池，
+    /// 解决 AVPlayer 每次 Range/拖动都重复走 AList 302 与重建 TLS 握手导致的加载慢。
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         playbackError = nil
         guard let client = apiClient else {
             playbackError = "无法连接直链解析服务；不会使用服务器中转"
             return nil
         }
+        let cacheKey = Self.directCacheKey(assetId: assetId, remotePath: remotePath)
         do {
-            let url = try await client.directPlaybackURL(assetId: assetId, remotePath: remotePath, alistURL: settings.normalizedAlistURL)
-            guard allowsDirectPlayback(url) else {
-                playbackError = "解析结果不是安全的媒体直链，已拒绝服务器中转"
-                return nil
+            let directURL: URL
+            if let cacheKey,
+               let cached = directURLCache[cacheKey],
+               Date().timeIntervalSince(cached.fetchedAt) < Self.directURLCacheTTL {
+                directURL = cached.url
+            } else {
+                let resolved = try await client.directPlaybackURL(
+                    assetId: assetId,
+                    remotePath: remotePath,
+                    alistURL: settings.normalizedAlistURL
+                )
+                guard DirectPlaybackPolicy.allows(
+                    resolved,
+                    serverURL: settings.normalizedServerURL,
+                    coreURL: coreBaseURL,
+                    alistURL: settings.normalizedAlistURL
+                ) else {
+                    playbackError = "解析结果不是安全的媒体直链，已拒绝服务器中转"
+                    return nil
+                }
+                if let cacheKey {
+                    if directURLCache.count > 128 {
+                        let cutoff = Date().addingTimeInterval(-Self.directURLCacheTTL)
+                        directURLCache = directURLCache.filter { $0.value.fetchedAt > cutoff }
+                    }
+                    directURLCache[cacheKey] = (resolved, Date())
+                }
+                directURL = resolved
             }
-            return PlaybackSource(url: url, fallbackURL: nil, label: "严格直连")
+            if let proxied = await LocalMediaProxy.shared.register(directURL: directURL) {
+                return PlaybackSource(url: proxied, fallbackURL: nil, label: "严格直连")
+            }
+            return PlaybackSource(url: directURL, fallbackURL: nil, label: "严格直连")
         } catch {
             if !Task.isCancelled {
                 // Keep the server's actionable configuration/login diagnostic;
@@ -134,13 +168,29 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func invalidatePlaybackCache(assetId: String?, remotePath: String? = nil, currentURL: URL? = nil) {
+        if let key = Self.directCacheKey(assetId: assetId, remotePath: remotePath) {
+            directURLCache.removeValue(forKey: key)
+        }
+        if let currentURL {
+            LocalMediaProxy.shared.invalidateResolvedURL(for: currentURL)
+        }
+    }
+
+    private static func directCacheKey(assetId: String?, remotePath: String?) -> String? {
+        if let assetId, !assetId.isEmpty { return "id:\(assetId)" }
+        if let remotePath, !remotePath.isEmpty { return "path:\(remotePath)" }
+        return nil
+    }
+
     func allowsDirectPlayback(_ url: URL) -> Bool {
-        DirectPlaybackPolicy.allows(
-            url,
-            serverURL: settings.normalizedServerURL,
-            coreURL: coreBaseURL,
-            alistURL: settings.normalizedAlistURL
-        )
+        LocalMediaProxy.shared.isRegisteredLocalProxyURL(url)
+            || DirectPlaybackPolicy.allows(
+                url,
+                serverURL: settings.normalizedServerURL,
+                coreURL: coreBaseURL,
+                alistURL: settings.normalizedAlistURL
+            )
     }
 
     /// 兼容旧播放器调用；视频请求绝不附带应用 Basic Auth 或 AList 管理凭证。

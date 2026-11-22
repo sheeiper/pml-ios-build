@@ -84,20 +84,20 @@ pub async fn resolve_direct_playback(
             .ok_or_else(|| "A valid video path is required".to_string())?
     };
     let config = get_alist_accel_config(app.clone())?;
-    let (provider, token, path) = if config.enabled {
+    let (provider, token, path, token_cache_key) = if config.enabled {
         let endpoint = Url::parse(config.api_url.trim()).map_err(|_| "Invalid AList service URL".to_string())?;
         let path = mapped_path(&path, &config.cd2_prefix, &config.alist_prefix)?;
         // Use an isolated, no-redirect client below so API credentials cannot follow redirects.
         // Reuse the short-lived control-plane token: opening a file should not log in to AList
         // again, especially when the user quickly scrubs through a playlist.
-        let token = direct_login(&endpoint, &config.username, config.password.as_deref().unwrap_or_default()).await?;
-        (endpoint, token, path)
+        let (token, cache_key) = direct_login(&endpoint, &config.username, config.password.as_deref().unwrap_or_default(), false).await?;
+        (endpoint, token, path, Some(cache_key))
     } else {
         let session = require_session(&state).await?;
         if session.provider != ProviderKind::Alist {
             return Err("Strict direct playback requires an enabled AList direct-link configuration; relay fallback is disabled".into());
         }
-        (session.endpoint, session.api_token, path)
+        (session.endpoint, session.api_token, path, None)
     };
     let cache_key = format!("{}|{}", provider, path);
     if let Some(cached) = DIRECT_URL_CACHE
@@ -109,27 +109,64 @@ pub async fn resolve_direct_playback(
     {
         return Ok(DirectPlaybackSource { url: cached });
     }
-    let response = DIRECT_CLIENT
-        .post(alist_api_url(&provider, "fs/get")?)
+    let fs_get_url = alist_api_url(&provider, "fs/get")?;
+    let payload = serde_json::json!({"path": path, "password": "", "refresh": false});
+    let mut response = DIRECT_CLIENT
+        .post(fs_get_url.clone())
         .header(AUTHORIZATION, token)
-        .json(&serde_json::json!({"path": path, "password": "", "refresh": false}))
+        .json(&payload)
         .send()
         .await
         .map_err(|_| "AList direct-link resolution connection failed".to_string())?;
-    if !response.status().is_success() {
+    let mut body: Option<serde_json::Value> = None;
+    let needs_reauth = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        true
+    } else if response.status().is_success() {
+        let parsed: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| "Invalid AList direct-link resolution response".to_string())?;
+        let is_401 = parsed.get("code").and_then(|v| v.as_i64()) == Some(401);
+        body = Some(parsed);
+        is_401
+    } else {
         return Err("AList direct-link resolution request failed; relay fallback is disabled".into());
-    }
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|_| "Invalid AList direct-link resolution response".to_string())?;
-    let url = validated_download_url(&body, &provider, &path)?;
-    // AList may attach a short-lived sign; never retain that credential beyond
-    // this response. Unsigned /d paths are stable and safe to reuse briefly.
-    if !url.contains("?sign=") && !url.contains("&sign=") {
-        if let Ok(mut guard) = DIRECT_URL_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
-            guard.insert(cache_key, (url.clone(), Instant::now()));
+    };
+    if needs_reauth {
+        if let Some(ref key) = token_cache_key {
+            if let Ok(mut guard) = DIRECT_TOKEN_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+                guard.remove(key);
+            }
+            let (fresh_token, _) = direct_login(&provider, &config.username, config.password.as_deref().unwrap_or_default(), true).await?;
+            response = DIRECT_CLIENT
+                .post(fs_get_url)
+                .header(AUTHORIZATION, fresh_token)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|_| "AList direct-link resolution connection failed".to_string())?;
+            if !response.status().is_success() {
+                return Err("AList direct-link resolution request failed; relay fallback is disabled".into());
+            }
+            body = Some(
+                response
+                    .json()
+                    .await
+                    .map_err(|_| "Invalid AList direct-link resolution response".to_string())?,
+            );
+        } else {
+            return Err("AList direct-link resolution request failed; relay fallback is disabled".into());
         }
+    }
+    let body = body.ok_or_else(|| "Invalid AList direct-link resolution response".to_string())?;
+    let url = validated_download_url(&body, &provider, &path)?;
+    // Cache resolved /d download URLs for 60s in memory (including signed /d links)
+    // to eliminate redundant AList fs/get round-trips on rapid opens and playlist switches.
+    if let Ok(mut guard) = DIRECT_URL_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+        if guard.len() >= 512 {
+            guard.retain(|_, (_, at)| at.elapsed() < DIRECT_URL_TTL);
+        }
+        guard.insert(cache_key, (url.clone(), Instant::now()));
     }
     Ok(DirectPlaybackSource { url })
 }
@@ -138,7 +175,7 @@ fn direct_client() -> &'static Client {
     &DIRECT_CLIENT
 }
 
-async fn direct_login(endpoint: &Url, username: &str, password: &str) -> Result<String, String> {
+async fn direct_login(endpoint: &Url, username: &str, password: &str, force_refresh: bool) -> Result<(String, String), String> {
     if !matches!(endpoint.scheme(), "http" | "https") || !endpoint.username().is_empty() || endpoint.password().is_some() {
         return Err("Invalid AList service URL".into());
     }
@@ -146,12 +183,14 @@ async fn direct_login(endpoint: &Url, username: &str, password: &str) -> Result<
     // reuse a token issued for the previous password without logging secrets.
     let password_fingerprint = format!("{:x}", Sha256::digest(password.as_bytes()));
     let cache_key = format!("{}|{}|{}", endpoint, username, password_fingerprint);
-    if let Ok(mut guard) = DIRECT_TOKEN_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
-        if let Some((token, created)) = guard.get(&cache_key).cloned() {
-            if created.elapsed() < DIRECT_TOKEN_TTL {
-                return Ok(token);
+    if !force_refresh {
+        if let Ok(mut guard) = DIRECT_TOKEN_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+            if let Some((token, created)) = guard.get(&cache_key).cloned() {
+                if created.elapsed() < DIRECT_TOKEN_TTL {
+                    return Ok((token, cache_key));
+                }
+                guard.remove(&cache_key);
             }
-            guard.remove(&cache_key);
         }
     }
     let response = direct_client()
@@ -173,9 +212,9 @@ async fn direct_login(endpoint: &Url, username: &str, password: &str) -> Result<
         .map(str::to_owned)
         .ok_or_else(|| "AList login failed; check username and password".to_string())?;
     if let Ok(mut guard) = DIRECT_TOKEN_CACHE.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
-        guard.insert(cache_key, (token.clone(), Instant::now()));
+        guard.insert(cache_key.clone(), (token.clone(), Instant::now()));
     }
-    Ok(token)
+    Ok((token, cache_key))
 }
 
 #[cfg(test)]

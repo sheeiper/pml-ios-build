@@ -530,7 +530,7 @@ struct GestureVideoPlayerSheet: View {
             if let item = player.currentItem, item.status == .failed {
                 handlePlaybackFailure()
             } else if isPlaying && player.timeControlStatus == .paused {
-                player.play()
+                player.playImmediately(atRate: rate)
             }
         }
         if let existing = endObserver {
@@ -651,14 +651,14 @@ struct GestureVideoPlayerSheet: View {
         let target = total > 0 ? min(max(0, seconds), max(0, total)) : max(0, seconds)
         currentTime = target
         let time = CMTime(seconds: target, preferredTimescale: 600)
-        // 使用更宽的关键帧容差，避免直连网络下为精确逐帧位置反复
-        // 拉取并解码长 GOP；松手后快速落到最近关键帧，再继续播放。
-        let tolerance = CMTime(seconds: 2.5, preferredTimescale: 600)
+        // 使用关键帧容差（1.5s），避免直连网络下为精确逐帧位置反复
+        // 拉取并解码长 GOP；松手后快速落到最近关键帧，并立即按当前倍速出画。
+        let tolerance = CMTime(seconds: 1.5, preferredTimescale: 600)
         _ = await player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance)
         guard !Task.isCancelled, request == seekRequestID else { return }
         if resume {
             isPlaying = true
-            player.play()
+            player.playImmediately(atRate: rate)
             scheduleHideControls()
         } else {
             player.pause()
@@ -677,10 +677,8 @@ struct GestureVideoPlayerSheet: View {
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
         let isMOV = url.pathExtension.lowercased() == "mov"
-        // 直链通常需要经过 AList 的一次重定向；过大的预缓冲会让 AVPlayer
-        // 在打开和拖动时先等待很久，也会放大弱网抖动。保持小吸震区，交给
-        // AVPlayer 按可用带宽动态扩展，避免“点开慢、滑块慢、播放抽搐”。
-        item.preferredForwardBufferDuration = isMOV ? 4.0 : 8.0
+        // 保持较小初始吸震区，加快起播与拖动恢复；播放稳定后由 AVPlayer 按可用带宽动态扩展缓冲。
+        item.preferredForwardBufferDuration = isMOV ? 4.0 : 5.0
         return item
     }
 
@@ -873,7 +871,7 @@ struct GestureVideoPlayerSheet: View {
                       assetID == currentAssetId,
                       !Task.isCancelled else { return }
                 isPlaying = true
-                player.play()
+                player.playImmediately(atRate: rate)
                 scheduleHideControls()
                 if target == 0 {
                     resumeToastSeconds = 0
@@ -882,7 +880,7 @@ struct GestureVideoPlayerSheet: View {
             }
         } else {
             isPlaying = true
-            player.play()
+            player.playImmediately(atRate: rate)
             scheduleHideControls()
         }
     }
@@ -913,7 +911,7 @@ struct GestureVideoPlayerSheet: View {
             controlsTask?.cancel()
         } else {
             isPlaying = true
-            player.play()
+            player.playImmediately(atRate: rate)
             scheduleHideControls()
         }
     }
@@ -1180,6 +1178,7 @@ struct GestureVideoPlayerSheet: View {
         isBuffering = false
         controlsVisible = true
         controlsTask?.cancel()
+        model.invalidatePlaybackCache(assetId: currentAssetId, currentURL: currentURL)
         // No alternate URL request, retry loop, proxy reset, or fallback registration.
         alistExpiredWarning = DirectPlaybackPolicy.failureMessage
     }
