@@ -840,6 +840,7 @@ struct GestureVideoPlayerSheet: View {
         // judder. Resolve the initial position first, then start exactly once.
         if seconds > 1 {
             isPlaying = false
+            player.pause()
             startupTask?.cancel()
             // Reserve a seek generation before the async readiness wait so the
             // background resume lookup cannot enqueue a second seek.
