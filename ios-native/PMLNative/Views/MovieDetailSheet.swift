@@ -20,6 +20,13 @@ public struct MovieDetailSheet: View {
     @State private var selectedSampleURL: String?
     @State private var selectedPerformer: MoviePerformer?
     @State private var currentNumber: String?
+    @State private var savedSubtitles: [SavedMovieSubtitle] = []
+    @State private var subtitleCandidates: [SubtitleSearchCandidate] = []
+    @State private var subtitleSearching = false
+    @State private var subtitleSearchDone = false
+    @State private var subtitleError: String?
+    @State private var subtitleDownloadingId: String?
+    @State private var subtitleDeletingId: String?
 
     public init(
         number: String? = nil,
@@ -151,6 +158,23 @@ public struct MovieDetailSheet: View {
                             .tint(.purple)
 
                             Button {
+                                Task { await searchSubtitles(for: meta.number) }
+                            } label: {
+                                if subtitleSearching {
+                                    ProgressView()
+                                        .padding(.vertical, 8)
+                                        .padding(.horizontal, 12)
+                                } else {
+                                    Label("字幕", systemImage: "captions.bubble")
+                                        .font(.subheadline.bold())
+                                        .padding(.vertical, 8)
+                                        .padding(.horizontal, 6)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(subtitleSearching)
+
+                            Button {
                                 Task { await loadData(force: true) }
                             } label: {
                                 Image(systemName: "arrow.clockwise")
@@ -159,6 +183,11 @@ public struct MovieDetailSheet: View {
                                     .padding(.horizontal, 14)
                             }
                             .buttonStyle(.bordered)
+                        }
+
+                        // Chinese Subtitle Management (zh-CN / zh-TW only)
+                        if !savedSubtitles.isEmpty || subtitleSearching || subtitleSearchDone || subtitleError != nil {
+                            subtitleSection(number: meta.number)
                         }
 
                         // Multi-part / local file switcher
@@ -465,10 +494,183 @@ public struct MovieDetailSheet: View {
 
     private func loadAux(for num: String) async {
         guard let client = appModel.apiClient else { return }
+        subtitleCandidates = []
+        subtitleSearchDone = false
+        subtitleError = nil
         async let fetchedParts = try? client.listMovieAssets(number: num)
         async let fetchedRelated = try? client.getRelatedMoviesGrouped(number: num, limitPerGroup: 8)
+        async let fetchedSubs = try? client.listMovieSubtitles(number: num)
         parts = (await fetchedParts) ?? []
         relatedGrouped = await fetchedRelated
+        savedSubtitles = (await fetchedSubs) ?? []
+    }
+
+    private func subtitleLangLabel(_ lang: String) -> String {
+        switch lang {
+        case "zh-CN": return "简体中文"
+        case "zh-TW": return "繁体中文"
+        default: return lang.isEmpty ? "中文" : lang
+        }
+    }
+
+    private func searchSubtitles(for num: String) async {
+        guard let client = appModel.apiClient, !subtitleSearching else { return }
+        subtitleSearching = true
+        subtitleSearchDone = false
+        subtitleError = nil
+        subtitleCandidates = []
+        do {
+            subtitleCandidates = try await client.searchMovieSubtitles(number: num)
+            subtitleSearchDone = true
+        } catch {
+            subtitleError = error.localizedDescription
+        }
+        subtitleSearching = false
+    }
+
+    private func downloadSubtitle(_ cand: SubtitleSearchCandidate, for num: String) async {
+        guard let client = appModel.apiClient, subtitleDownloadingId == nil else { return }
+        subtitleDownloadingId = cand.id
+        subtitleError = nil
+        do {
+            let saved = try await client.downloadMovieSubtitle(
+                number: num,
+                name: cand.title,
+                lang: cand.lang,
+                downloadUrl: cand.downloadUrl
+            )
+            savedSubtitles.removeAll(where: { $0.id == saved.id })
+            savedSubtitles.insert(saved, at: 0)
+        } catch {
+            subtitleError = error.localizedDescription
+        }
+        subtitleDownloadingId = nil
+    }
+
+    private func deleteSubtitle(_ sub: SavedMovieSubtitle) async {
+        guard let client = appModel.apiClient, subtitleDeletingId == nil else { return }
+        subtitleDeletingId = sub.id
+        subtitleError = nil
+        do {
+            try await client.deleteMovieSubtitle(id: sub.id)
+            savedSubtitles.removeAll(where: { $0.id == sub.id })
+        } catch {
+            subtitleError = error.localizedDescription
+        }
+        subtitleDeletingId = nil
+    }
+
+    @ViewBuilder
+    private func subtitleSection(number: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("中文字幕（简体 / 繁体）", systemImage: "captions.bubble.fill")
+                    .font(.footnote.bold())
+                    .foregroundStyle(.purple)
+                if !savedSubtitles.isEmpty {
+                    Text("已绑定 \(savedSubtitles.count)")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.green)
+                }
+                Spacer()
+                if subtitleSearchDone || subtitleError != nil {
+                    Button("重新搜索") {
+                        Task { await searchSubtitles(for: number) }
+                    }
+                    .font(.caption)
+                    .disabled(subtitleSearching)
+                }
+            }
+
+            ForEach(savedSubtitles) { sub in
+                HStack(spacing: 8) {
+                    Text(subtitleLangLabel(sub.lang))
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background((sub.lang == "zh-CN" ? Color.blue : Color.orange).opacity(0.2), in: Capsule())
+                        .foregroundStyle(sub.lang == "zh-CN" ? .blue : .orange)
+                    Text(sub.name)
+                        .font(.caption)
+                        .lineLimit(1)
+                    Spacer()
+                    Text("自动挂载")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                    Button(role: .destructive) {
+                        Task { await deleteSubtitle(sub) }
+                    } label: {
+                        if subtitleDeletingId == sub.id {
+                            ProgressView().scaleEffect(0.7)
+                        } else {
+                            Image(systemName: "trash")
+                                .font(.caption)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            if let err = subtitleError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            if subtitleSearching {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.8)
+                    Text("正在检索 \(number) 的简/繁体中文字幕...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if subtitleSearchDone {
+                if subtitleCandidates.isEmpty {
+                    Text("未在字幕源找到 \(number) 的简体/繁体中文字幕。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(subtitleCandidates) { cand in
+                        HStack(spacing: 8) {
+                            Text(cand.langLabel.isEmpty ? subtitleLangLabel(cand.lang) : cand.langLabel)
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background((cand.lang == "zh-CN" ? Color.blue : Color.orange).opacity(0.2), in: Capsule())
+                                .foregroundStyle(cand.lang == "zh-CN" ? .blue : .orange)
+                            Text(cand.title)
+                                .font(.caption)
+                                .lineLimit(1)
+                            Spacer()
+                            Button {
+                                Task { await downloadSubtitle(cand, for: number) }
+                            } label: {
+                                if subtitleDownloadingId == cand.id {
+                                    ProgressView().scaleEffect(0.75)
+                                } else {
+                                    Text("下载绑定")
+                                        .font(.caption2.bold())
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                            .disabled(subtitleDownloadingId != nil)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func loadData(force: Bool = false) async {

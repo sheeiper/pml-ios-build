@@ -87,4 +87,29 @@ extension PMLAPIClient {
     func stopPerformerEnrich() async throws -> PerformerEnrichProgress {
         try await command("stop_performer_enrich", as: PerformerEnrichProgress.self)
     }
+
+    func searchMovieSubtitles(number: String) async throws -> [SubtitleSearchCandidate] {
+        try await command("search_movie_subtitles", arguments: ["number": number], as: [SubtitleSearchCandidate].self)
+    }
+
+    func downloadMovieSubtitle(number: String, name: String, lang: String, downloadUrl: String) async throws -> SavedMovieSubtitle {
+        try await command(
+            "download_movie_subtitle",
+            arguments: [
+                "number": number,
+                "name": name,
+                "lang": lang,
+                "downloadUrl": downloadUrl
+            ],
+            as: SavedMovieSubtitle.self
+        )
+    }
+
+    func listMovieSubtitles(number: String) async throws -> [SavedMovieSubtitle] {
+        try await command("list_movie_subtitles", arguments: ["number": number], as: [SavedMovieSubtitle].self)
+    }
+
+    func deleteMovieSubtitle(id: String) async throws {
+        try await command("delete_movie_subtitle", arguments: ["id": id])
+    }
 }

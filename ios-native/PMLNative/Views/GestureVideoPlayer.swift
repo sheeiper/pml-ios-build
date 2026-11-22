@@ -19,9 +19,13 @@ struct GestureVideoPlayerSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var player = AVPlayer()
+    @StateObject private var vlcEngine = VLCPlaybackEngine()
+    @State private var useVLC = false
+    @State private var vlcFallbackAttempted = false
     @State private var currentURL: URL
     @State private var currentTitle: String
     @State private var currentAssetId: String?
+    @State private var currentRemotePath: String?
     @State private var currentIndex: Int?
     @State private var accelLabel: String?
     @State private var currentSourceLabel: String?
@@ -105,6 +109,7 @@ struct GestureVideoPlayerSheet: View {
         _currentURL = State(initialValue: url)
         _currentTitle = State(initialValue: title)
         _currentAssetId = State(initialValue: assetId)
+        _currentRemotePath = State(initialValue: remotePath)
         _currentIndex = State(initialValue: playlistIndex)
         // fallbackURL is retained only for source compatibility; never used for video.
         _currentSourceLabel = State(initialValue: sourceLabel)
@@ -115,8 +120,13 @@ struct GestureVideoPlayerSheet: View {
         GeometryReader { geo in
             ZStack {
                 Color.black.ignoresSafeArea()
-                PlayerLayerContainer(player: player, gravity: videoGravity)
-                    .ignoresSafeArea()
+                if useVLC {
+                    VLCPlayerContainer(engine: vlcEngine)
+                        .ignoresSafeArea()
+                } else {
+                    PlayerLayerContainer(player: player, gravity: videoGravity)
+                        .ignoresSafeArea()
+                }
 
                 Color.clear
                     .contentShape(Rectangle())
@@ -210,7 +220,31 @@ struct GestureVideoPlayerSheet: View {
                                 .padding(.vertical, 4)
                                 .background(.ultraThinMaterial, in: Capsule())
                         }
+                        if PlaybackEngineSelector.isVLCAvailable {
+                            Button {
+                                switchEngine(toVLC: !useVLC, preserveTime: true)
+                            } label: {
+                                Text(useVLC ? "VLC" : "AV")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(useVLC ? Color.orange : Color.white.opacity(0.9))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(.ultraThinMaterial, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
                         Menu {
+                            if PlaybackEngineSelector.isVLCAvailable {
+                                Button {
+                                    switchEngine(toVLC: !useVLC, preserveTime: true)
+                                } label: {
+                                    Label(
+                                        useVLC ? "切换原生内核 (AVPlayer)" : "切换兼容内核 (VLC，解决黑屏/抽搐)",
+                                        systemImage: useVLC ? "play.rectangle" : "cpu"
+                                    )
+                                }
+                                Divider()
+                            }
                             Button {
                                 Task { await captureCurrentFrameAsCover() }
                             } label: {
@@ -247,6 +281,7 @@ struct GestureVideoPlayerSheet: View {
                             Button {
                                 muted.toggle()
                                 player.isMuted = muted
+                                vlcEngine.setMuted(muted)
                             } label: {
                                 Label(muted ? "取消静音" : "静音", systemImage: muted ? "speaker.wave.2" : "speaker.slash")
                             }
@@ -636,6 +671,20 @@ struct GestureVideoPlayerSheet: View {
 
     @MainActor
     private func performSeek(to seconds: Double, resume: Bool, request: Int) async {
+        if useVLC {
+            let target = duration > 0 ? min(max(0, seconds), max(0, duration)) : max(0, seconds)
+            currentTime = target
+            vlcEngine.seek(to: target)
+            if resume {
+                isPlaying = true
+                vlcEngine.play()
+                scheduleHideControls()
+            } else {
+                vlcEngine.pause()
+                isPlaying = false
+            }
+            return
+        }
         guard let item = player.currentItem, request == seekRequestID else { return }
         isSeeking = true
         defer {
@@ -677,9 +726,84 @@ struct GestureVideoPlayerSheet: View {
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
         let isMOV = url.pathExtension.lowercased() == "mov"
-        // 保持较小初始吸震区，加快起播与拖动恢复；播放稳定后由 AVPlayer 按可用带宽动态扩展缓冲。
-        item.preferredForwardBufferDuration = isMOV ? 4.0 : 5.0
+        // 适当放大缓冲窗口，吸收高码率 FC2 与直链网络的瞬时波动，降低画面抖动。
+        item.preferredForwardBufferDuration = isMOV ? 8.0 : 15.0
         return item
+    }
+
+    private func bindVLCCallbacks() {
+        vlcEngine.onTimeUpdate = { [self] secs, total in
+            guard useVLC else { return }
+            if !isScrubbing, !isSeeking, pendingSeek == nil {
+                currentTime = secs
+            }
+            if total > 0 {
+                duration = total
+            }
+            if currentTime - lastSavedAt >= 5 {
+                lastSavedAt = currentTime
+                saveProgress()
+            }
+        }
+        vlcEngine.onPlayingChanged = { [self] playing in
+            guard useVLC else { return }
+            isPlaying = playing
+        }
+        vlcEngine.onBufferingChanged = { [self] buffering in
+            guard useVLC else { return }
+            isBuffering = buffering
+        }
+        vlcEngine.onEnded = { [self] in
+            guard useVLC, !didReachEnd else { return }
+            didReachEnd = true
+            handlePlaybackEnd()
+        }
+        vlcEngine.onFailed = { [self] in
+            guard useVLC, !playbackFailed else { return }
+            handlePlaybackFailure()
+        }
+    }
+
+    @MainActor
+    private func switchEngine(toVLC: Bool, preserveTime: Bool, automatic: Bool = false) {
+        guard PlaybackEngineSelector.isVLCAvailable || !toVLC else { return }
+        guard model.allowsDirectPlayback(currentURL) else {
+            handlePlaybackFailure()
+            return
+        }
+        let targetTime = preserveTime ? max(0, currentTime) : 0
+        playbackFailed = false
+        alistExpiredWarning = nil
+        seekTask?.cancel()
+        seekWatchdog?.cancel()
+        startupTask?.cancel()
+        stallRecoveryTask?.cancel()
+        isSeeking = false
+        isScrubbing = false
+        pendingSeek = nil
+
+        if toVLC {
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+            useVLC = true
+            vlcFallbackAttempted = true
+            isBuffering = true
+            bindVLCCallbacks()
+            vlcEngine.load(url: currentURL, startAt: targetTime, rate: rate, volume: volume, muted: muted)
+            showHUD(automatic ? "已自动切换兼容内核 (VLC)" : "已切换兼容内核 (VLC)", seconds: 2.0)
+        } else {
+            vlcEngine.stop()
+            useVLC = false
+            isBuffering = true
+            let item = makePlayerItem(currentURL)
+            observeItemStatus(item)
+            player.automaticallyWaitsToMinimizeStalling = true
+            player.replaceCurrentItem(with: item)
+            player.isMuted = muted
+            player.volume = volume
+            begin(from: targetTime)
+            showHUD("已切换原生内核 (AVPlayer)", seconds: 1.8)
+        }
     }
 
     private func loadCurrent(trackResume: Bool) {
@@ -695,22 +819,16 @@ struct GestureVideoPlayerSheet: View {
         pendingSeek = nil
 
         playbackFailed = false
+        alistExpiredWarning = nil
         guard model.allowsDirectPlayback(currentURL) else {
+            vlcEngine.stop()
             player.replaceCurrentItem(with: nil)
             handlePlaybackFailure()
             return
         }
-        let item = makePlayerItem(currentURL)
-        observeItemStatus(item)
-        // Keep AVPlayer's adaptive anti-stall decision enabled. With the
-        // reduced 8-second item buffer this avoids the old long startup wait
-        // without forcing playback onto an underfilled direct HTTP range.
-        player.automaticallyWaitsToMinimizeStalling = true
-        player.replaceCurrentItem(with: item)
 
-        player.isMuted = muted
-        player.volume = volume
-        currentTime = max(0, startAt)
+        let initialTime = trackResume ? max(0, startAt) : 0
+        currentTime = initialTime
         duration = 0
         resumeVisible = false
         resumeChecked = !trackResume
@@ -720,8 +838,36 @@ struct GestureVideoPlayerSheet: View {
         subtitleCues = []
         subtitleTitle = nil
 
-        // 立即启动播放与缓冲，不阻塞等待远程历史进度 RPC，大幅提升起播速度
-        begin(from: trackResume ? startAt : 0)
+        let preferVLC = PlaybackEngineSelector.shouldPreferVLC(
+            url: currentURL,
+            title: currentTitle,
+            remotePath: currentRemotePath
+        )
+
+        if preferVLC {
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+            useVLC = true
+            vlcFallbackAttempted = true
+            isBuffering = true
+            bindVLCCallbacks()
+            vlcEngine.load(url: currentURL, startAt: initialTime, rate: rate, volume: volume, muted: muted)
+            showHUD("兼容内核 (VLC) 播放", seconds: 1.6)
+        } else {
+            vlcEngine.stop()
+            useVLC = false
+            vlcFallbackAttempted = false
+            let item = makePlayerItem(currentURL)
+            observeItemStatus(item)
+            // Keep AVPlayer's adaptive anti-stall decision enabled.
+            player.automaticallyWaitsToMinimizeStalling = true
+            player.replaceCurrentItem(with: item)
+
+            player.isMuted = muted
+            player.volume = volume
+            // 立即启动播放与缓冲，不阻塞等待远程历史进度 RPC，大幅提升起播速度
+            begin(from: initialTime)
+        }
 
         if trackResume && startAt <= 1 {
             let initialSeekID = seekRequestID
@@ -802,9 +948,11 @@ struct GestureVideoPlayerSheet: View {
         resumeTask?.cancel()
         stallRecoveryTask?.cancel()
         player.pause()
+        vlcEngine.stop()
         currentIndex = index
         currentTitle = item.title
         currentAssetId = assetId
+        currentRemotePath = item.remotePath
         showPlaylist = false
         isBuffering = true
 
@@ -904,6 +1052,19 @@ struct GestureVideoPlayerSheet: View {
             alistExpiredWarning = DirectPlaybackPolicy.failureMessage
             return
         }
+        if useVLC {
+            if isPlaying {
+                vlcEngine.pause()
+                isPlaying = false
+                controlsVisible = true
+                controlsTask?.cancel()
+            } else {
+                isPlaying = true
+                vlcEngine.play()
+                scheduleHideControls()
+            }
+            return
+        }
         if isPlaying && player.timeControlStatus != .paused {
             player.pause()
             isPlaying = false
@@ -926,7 +1087,11 @@ struct GestureVideoPlayerSheet: View {
 
     private func setRate(_ value: Float) {
         rate = value
-        if isPlaying { player.rate = value }
+        if useVLC {
+            vlcEngine.setRate(value)
+        } else if isPlaying {
+            player.rate = value
+        }
         showHUD(String(format: "%.2gx", value))
     }
 
@@ -1010,7 +1175,11 @@ struct GestureVideoPlayerSheet: View {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard !Task.isCancelled, dragMode == nil else { return }
                 isBoosting = true
-                player.rate = 2
+                if useVLC {
+                    vlcEngine.setRate(2)
+                } else {
+                    player.rate = 2
+                }
                 showHUD("2x 快进", seconds: 5)
             }
             return
@@ -1070,6 +1239,7 @@ struct GestureVideoPlayerSheet: View {
             let next = min(max(0, dragBaseVolume + Float(ratio) * 0.9), 1)
             volume = next
             player.volume = next
+            vlcEngine.setVolume(next)
             showHUD("音量 \(Int(next * 100))%", seconds: 6)
         case .none:
             break
@@ -1086,7 +1256,11 @@ struct GestureVideoPlayerSheet: View {
         pressTask = nil
         if isBoosting {
             isBoosting = false
-            player.rate = rate
+            if useVLC {
+                vlcEngine.setRate(rate)
+            } else {
+                player.rate = rate
+            }
             hideHUD()
             dragMode = nil
             seekPreview = nil
@@ -1125,6 +1299,7 @@ struct GestureVideoPlayerSheet: View {
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
             queue: .main
         ) { time in
+            guard !useVLC else { return }
             if !isScrubbing, !isSeeking, pendingSeek == nil {
                 currentTime = time.seconds.isFinite ? time.seconds : 0
             }
@@ -1140,9 +1315,23 @@ struct GestureVideoPlayerSheet: View {
                 if seconds.isFinite && seconds > 0 {
                     duration = seconds
                 }
+                // 检测“有声无画”：播放超过 2 秒仍无任何可解码视频轨时，自动切换至 VLC 兼容内核。
+                if !vlcFallbackAttempted,
+                   PlaybackEngineSelector.isVLCAvailable,
+                   item.status == .readyToPlay,
+                   time.seconds > 2.0,
+                   item.presentationSize == .zero {
+                    switchEngine(toVLC: true, preserveTime: true, automatic: true)
+                    return
+                }
             }
             if player.currentItem?.status == .failed, !playbackFailed {
-                handlePlaybackFailure()
+                if !vlcFallbackAttempted && PlaybackEngineSelector.isVLCAvailable {
+                    switchEngine(toVLC: true, preserveTime: true, automatic: true)
+                } else {
+                    handlePlaybackFailure()
+                }
+                return
             }
             isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
             if currentTime - lastSavedAt >= 5 {
@@ -1156,8 +1345,13 @@ struct GestureVideoPlayerSheet: View {
         itemStatusObserver?.invalidate()
         itemStatusObserver = item.observe(\.status, options: [.initial, .new]) { [self] observedItem, _ in
             DispatchQueue.main.async {
+                guard !useVLC else { return }
                 if observedItem === player.currentItem, observedItem.status == .failed {
-                    handlePlaybackFailure()
+                    if !vlcFallbackAttempted && PlaybackEngineSelector.isVLCAvailable {
+                        switchEngine(toVLC: true, preserveTime: true, automatic: true)
+                    } else {
+                        handlePlaybackFailure()
+                    }
                 }
             }
         }
@@ -1173,6 +1367,7 @@ struct GestureVideoPlayerSheet: View {
         resumeTask?.cancel()
         stallRecoveryTask?.cancel()
         player.pause()
+        vlcEngine.stop()
         isPlaying = false
         isSeeking = false
         isBuffering = false
@@ -1185,7 +1380,7 @@ struct GestureVideoPlayerSheet: View {
 
     private func saveProgress() {
         guard let currentAssetId, let client = model.apiClient else { return }
-        let seconds = player.currentTime().seconds
+        let seconds = useVLC ? currentTime : player.currentTime().seconds
         guard seconds.isFinite, seconds > 0 else { return }
         Task { try? await client.setPlaybackProgress(assetId: currentAssetId, seconds: seconds) }
     }
@@ -1218,6 +1413,7 @@ struct GestureVideoPlayerSheet: View {
         }
         endObserver = nil
         saveProgress()
+        vlcEngine.stop()
         player.pause()
         player.replaceCurrentItem(with: nil)
         UIScreen.main.brightness = baseBrightness
@@ -1248,16 +1444,20 @@ final class VideoLayerUIView: UIView {
 
     private var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
     private var readyObservation: NSKeyValueObservation?
+    private var revealWorkItem: DispatchWorkItem?
+    private var forceRevealed = false
 
     var player: AVPlayer? {
         get { playerLayer.player }
         set {
             guard playerLayer.player !== newValue else { return }
+            forceRevealed = false
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             playerLayer.player = newValue
             updateVisibility()
             CATransaction.commit()
+            scheduleSafetyReveal()
         }
     }
 
@@ -1319,8 +1519,19 @@ final class VideoLayerUIView: UIView {
         NSNull()
     }
 
+    private func scheduleSafetyReveal() {
+        revealWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.forceRevealed = true
+            self.updateVisibility()
+        }
+        revealWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
     private func updateVisibility() {
-        let shouldShow = playerLayer.isReadyForDisplay && bounds.width > 10 && bounds.height > 10
+        let shouldShow = (playerLayer.isReadyForDisplay || forceRevealed) && bounds.width > 10 && bounds.height > 10
         let targetOpacity: Float = shouldShow ? 1.0 : 0.0
         if playerLayer.opacity != targetOpacity {
             CATransaction.begin()

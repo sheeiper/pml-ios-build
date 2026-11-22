@@ -65,7 +65,17 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE TABLE IF NOT EXISTS scrape_ignored_assets (
             asset_id TEXT PRIMARY KEY,
             created_at INTEGER NOT NULL
-        );"
+        );
+        CREATE TABLE IF NOT EXISTS movie_subtitles (
+            id TEXT PRIMARY KEY,
+            number TEXT NOT NULL,
+            name TEXT NOT NULL,
+            lang TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'SubtitleCat',
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_movie_subtitles_number ON movie_subtitles(number);"
     )?;
     let has_version = {
         let mut stmt = conn.prepare("PRAGMA table_info(movie_metadata)")?;
@@ -155,6 +165,270 @@ pub fn ignore_unrecognized_video(conn: &Connection, asset_id: &str) -> Result<()
         params![id, chrono::Utc::now().timestamp()],
     )?;
     Ok(())
+}
+
+// ===== 中文字幕搜索与本地存储（简体中文 zh-CN / 繁体中文 zh-TW） =====
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleSearchCandidate {
+    pub title: String,
+    pub lang: String,
+    pub lang_label: String,
+    pub download_url: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedMovieSubtitle {
+    pub id: String,
+    pub number: String,
+    pub name: String,
+    pub lang: String,
+    pub source: String,
+    pub created_at: i64,
+}
+
+fn subtitlecat_client() -> Result<reqwest::Client, String> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(c) = CLIENT.get() { return Ok(c.clone()); }
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(6))
+        .timeout(std::time::Duration::from_secs(12))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("初始化字幕客户端失败：{e}"))?;
+    let _ = CLIENT.set(client.clone());
+    Ok(client)
+}
+
+/// Search SubtitleCat for Simplified Chinese (zh-CN) and Traditional Chinese (zh-TW) SRT subtitles.
+pub async fn search_movie_subtitles(number: &str) -> Result<Vec<SubtitleSearchCandidate>, String> {
+    let query = number.trim();
+    if query.is_empty() { return Err("番号不能为空".into()); }
+    let client = subtitlecat_client()?;
+    let mut search_url = reqwest::Url::parse("https://www.subtitlecat.com/index.php")
+        .map_err(|e| e.to_string())?;
+    search_url.query_pairs_mut().append_pair("search", query);
+
+    let html = client
+        .get(search_url)
+        .send()
+        .await
+        .map_err(|e| format!("连接字幕源失败：{e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("读取字幕搜索结果失败：{e}"))?;
+
+    // Extract top 4 matching detail page links `href="subs/..."`
+    let mut detail_links: Vec<String> = Vec::new();
+    for seg in html.split("href=\"").skip(1) {
+        let Some((href, _)) = seg.split_once('"') else { continue; };
+        if (href.starts_with("subs/") || href.starts_with("/subs/")) && href.ends_with(".html") {
+            let full = if href.starts_with('/') {
+                format!("https://www.subtitlecat.com{href}")
+            } else {
+                format!("https://www.subtitlecat.com/{href}")
+            };
+            if !detail_links.contains(&full) {
+                detail_links.push(full);
+                if detail_links.len() >= 4 { break; }
+            }
+        }
+    }
+
+    if detail_links.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Fetch up to 4 detail pages concurrently and extract ONLY zh-CN and zh-TW .srt downloads
+    let futures = detail_links.into_iter().map(|page_url| {
+        let c = client.clone();
+        async move {
+            let text = match c.get(&page_url).send().await {
+                Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+                _ => return Vec::new(),
+            };
+            let page_title = page_url
+                .rsplit('/')
+                .next()
+                .unwrap_or("subtitle")
+                .trim_end_matches(".html")
+                .replace("%20", " ");
+            let mut found = Vec::new();
+            for seg in text.split("href=\"").skip(1) {
+                let Some((href, _)) = seg.split_once('"') else { continue; };
+                if !href.to_ascii_lowercase().ends_with(".srt") { continue; }
+                let (lang, lang_label) = if href.contains("-zh-CN.srt") || href.contains("_zh-CN.srt") {
+                    ("zh-CN", "简体中文")
+                } else if href.contains("-zh-TW.srt") || href.contains("_zh-TW.srt") {
+                    ("zh-TW", "繁体中文")
+                } else {
+                    continue;
+                };
+                let download_url = if href.starts_with("http://") || href.starts_with("https://") {
+                    href.to_string()
+                } else if href.starts_with('/') {
+                    format!("https://www.subtitlecat.com{href}")
+                } else {
+                    format!("https://www.subtitlecat.com/{href}")
+                };
+                found.push(SubtitleSearchCandidate {
+                    title: format!("{page_title} [{lang_label}]"),
+                    lang: lang.to_string(),
+                    lang_label: lang_label.to_string(),
+                    download_url,
+                    source: "SubtitleCat".to_string(),
+                });
+            }
+            found
+        }
+    });
+
+    let mut all: Vec<SubtitleSearchCandidate> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for batch in futures_util::future::join_all(futures).await {
+        for item in batch {
+            if seen.insert(item.download_url.clone()) {
+                all.push(item);
+            }
+        }
+    }
+    // Prefer Simplified Chinese first, then Traditional Chinese
+    all.sort_by_key(|c| if c.lang == "zh-CN" { 0 } else { 1 });
+    Ok(all)
+}
+
+pub async fn download_and_save_subtitle(
+    number: &str,
+    name: &str,
+    lang: &str,
+    download_url: &str,
+) -> Result<(String, String, String, String, String), String> {
+    let parsed = reqwest::Url::parse(download_url.trim()).map_err(|_| "无效的字幕下载地址".to_string())?;
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    if parsed.scheme() != "https" || !(host == "subtitlecat.com" || host == "www.subtitlecat.com") {
+        return Err("仅允许从已验证的 SubtitleCat 下载字幕".into());
+    }
+    let client = subtitlecat_client()?;
+    let resp = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| format!("下载字幕失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("字幕下载返回异常状态：HTTP {}", resp.status().as_u16()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| format!("读取字幕内容失败：{e}"))?;
+    if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
+        return Err("字幕文件为空或超过 4MB 限制".into());
+    }
+    let raw_text = String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').to_string();
+    if !raw_text.contains("-->") {
+        return Err("下载到的文件不是有效的 SRT 字幕".into());
+    }
+    let clean_num = normalize_jav_number(number).unwrap_or_else(|| number.trim().to_uppercase());
+    let clean_name = if name.trim().is_empty() { format!("{clean_num}.{lang}.srt") } else { name.trim().to_string() };
+    let clean_lang = if lang.trim().is_empty() { "zh-CN".to_string() } else { lang.trim().to_string() };
+    let id = format!(
+        "sub_{}_{}",
+        clean_num.to_ascii_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), ""),
+        chrono::Utc::now().timestamp_millis()
+    );
+    Ok((id, clean_num, clean_name, clean_lang, raw_text))
+}
+
+pub fn save_movie_subtitle_row(
+    conn: &Connection,
+    id: &str,
+    number: &str,
+    name: &str,
+    lang: &str,
+    source: &str,
+    content: &str,
+) -> Result<SavedMovieSubtitle, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT OR REPLACE INTO movie_subtitles(id, number, name, lang, source, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, number, name, lang, source, content, now],
+    )?;
+    Ok(SavedMovieSubtitle {
+        id: id.to_string(),
+        number: number.to_string(),
+        name: name.to_string(),
+        lang: lang.to_string(),
+        source: source.to_string(),
+        created_at: now,
+    })
+}
+
+pub fn list_movie_subtitles(conn: &Connection, number: &str) -> Result<Vec<SavedMovieSubtitle>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let upper = normalize_jav_number(number).unwrap_or_else(|| number.trim().to_uppercase());
+    let mut stmt = conn.prepare(
+        "SELECT id, number, name, lang, source, created_at FROM movie_subtitles
+         WHERE number = ?1 ORDER BY created_at DESC"
+    )?;
+    let rows = stmt.query_map(params![upper], |r| {
+        Ok(SavedMovieSubtitle {
+            id: r.get(0)?,
+            number: r.get(1)?,
+            name: r.get(2)?,
+            lang: r.get(3)?,
+            source: r.get(4)?,
+            created_at: r.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn list_subtitles_for_asset(conn: &Connection, asset_id: &str) -> Result<Vec<SavedMovieSubtitle>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let number: Option<String> = conn
+        .query_row(
+            "SELECT number FROM movie_asset_bindings WHERE asset_id = ?1
+             UNION SELECT number FROM movie_metadata WHERE asset_id = ?1
+             LIMIT 1",
+            params![asset_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(num) = number else { return Ok(Vec::new()); };
+    list_movie_subtitles(conn, &num)
+}
+
+pub fn get_movie_subtitle_content(conn: &Connection, id: &str) -> Result<Option<(String, String)>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    conn.query_row(
+        "SELECT name, content FROM movie_subtitles WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
+pub fn delete_movie_subtitle(conn: &Connection, id: &str) -> Result<(), rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    conn.execute("DELETE FROM movie_subtitles WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Convert SRT subtitle text to WebVTT for native HTML5 `<video><track>` playback.
+pub fn srt_to_webvtt(srt: &str) -> String {
+    let mut out = String::with_capacity(srt.len() + 16);
+    out.push_str("WEBVTT\n\n");
+    for line in srt.replace("\r\n", "\n").lines() {
+        if line.contains("-->") {
+            out.push_str(&line.replace(',', "."));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Extract a JAV/FC2 number from file_name first, falling back to up to 2 ancestor folder

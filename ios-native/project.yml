@@ -6,6 +6,11 @@ options:
     iOS: "26.0"
   createIntermediateGroups: true
 
+packages:
+  VLCKitSPM:
+    url: https://github.com/tylerjonesio/vlckit-spm
+    from: 3.6.0
+
 settings:
   base:
     SWIFT_VERSION: "5.0"
@@ -22,6 +27,8 @@ targets:
       - path: PMLNative
         excludes:
           - Info.plist
+    dependencies:
+      - package: VLCKitSPM
     info:
       path: PMLNative/Info.plist
       properties:

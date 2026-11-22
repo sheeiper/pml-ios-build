@@ -124,3 +124,21 @@ public struct RemoteSyncReport: Codable {
     public let pendingNewCount: Int
     public let pendingNewNumbers: [String]
 }
+
+public struct SubtitleSearchCandidate: Codable, Identifiable, Hashable {
+    public var id: String { downloadUrl }
+    public let title: String
+    public let lang: String
+    public let langLabel: String
+    public let downloadUrl: String
+    public let source: String
+}
+
+public struct SavedMovieSubtitle: Codable, Identifiable, Hashable {
+    public let id: String
+    public let number: String
+    public let name: String
+    public let lang: String
+    public let source: String
+    public let createdAt: Int64
+}

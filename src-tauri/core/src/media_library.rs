@@ -10884,7 +10884,25 @@ pub async fn find_asset_subtitles(
     state: State<'_, MediaLibraryState>,
     asset_id: String,
 ) -> Result<Vec<SubtitleTrack>, String> {
-    let (remote_path, parent_path): (String, String) = {
+    let mut tracks: Vec<SubtitleTrack> = Vec::new();
+    if let Ok(v2_conn) = crate::four_domains::open_v2(&app) {
+        if let Ok(saved) = crate::jav_scraper::list_subtitles_for_asset(&v2_conn, &asset_id) {
+            for sub in saved {
+                let lang_tag = match sub.lang.as_str() {
+                    "zh-CN" => "简体中文",
+                    "zh-TW" => "繁体中文",
+                    other => other,
+                };
+                tracks.push(SubtitleTrack {
+                    name: format!("[{lang_tag}] {}", sub.name),
+                    path: format!("pml-sub://{}", sub.id),
+                    format: "srt".to_string(),
+                });
+            }
+        }
+    }
+
+    let remote_lookup = {
         let connection = open_media_database(&app)?;
         connection
             .query_row(
@@ -10894,13 +10912,34 @@ pub async fn find_asset_subtitles(
             )
             .optional()
             .map_err(database_error)?
-            .ok_or_else(|| "找不到该视频的索引".to_string())?
     };
-    let session = require_session(&state).await?;
-    let entries = list_directory(&session, &parent_path).await?;
+    let Some((remote_path, parent_path)) = remote_lookup else {
+        if !tracks.is_empty() {
+            return Ok(tracks);
+        }
+        return Err("找不到该视频的索引".to_string());
+    };
+    let session = match require_session(&state).await {
+        Ok(s) => s,
+        Err(err) => {
+            if !tracks.is_empty() {
+                return Ok(tracks);
+            }
+            return Err(err);
+        }
+    };
+    let entries = match list_directory(&session, &parent_path).await {
+        Ok(e) => e,
+        Err(err) => {
+            if !tracks.is_empty() {
+                return Ok(tracks);
+            }
+            return Err(err);
+        }
+    };
     let video_name = pml_subtitle_file_name(&remote_path);
     let base = pml_subtitle_stem(video_name).to_lowercase();
-    let mut tracks: Vec<SubtitleTrack> = Vec::new();
+    let mut remote_tracks: Vec<SubtitleTrack> = Vec::new();
     for entry in entries {
         if entry.is_collection {
             continue;
@@ -10919,13 +10958,14 @@ pub async fn find_asset_subtitles(
         if !same_base {
             continue;
         }
-        tracks.push(SubtitleTrack {
+        remote_tracks.push(SubtitleTrack {
             name: name.to_string(),
             path: entry.remote_path.clone(),
             format: ext.to_string(),
         });
     }
-    tracks.sort_by(|a, b| a.name.cmp(&b.name));
+    remote_tracks.sort_by(|a, b| a.name.cmp(&b.name));
+    tracks.extend(remote_tracks);
     Ok(tracks)
 }
 #[derive(Clone, Debug, Serialize)]

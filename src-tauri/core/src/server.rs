@@ -382,6 +382,7 @@ fn build_router(state: ServerState, static_dir: String) -> Router {
         .route("/api/telegram-user-stream/{chat_id}/{message_id}", get(proxy_telegram_user_stream).head(proxy_telegram_user_stream))
         .route("/api/telegram-user-thumb/{chat_id}/{message_id}", get(proxy_telegram_user_thumb).head(proxy_telegram_user_thumb))
         .route("/api/scraper/proxy-image", get(proxy_scraper_image).head(proxy_scraper_image))
+        .route("/api/movie-subtitles/{id}", get(serve_movie_subtitle).head(serve_movie_subtitle))
         // A 2 MiB avatar expands to ~2.7 MiB base64; keep a bounded JSON envelope.
         .route("/api/{command}", post(dispatch_command).layer(axum::extract::DefaultBodyLimit::max(3 * 1024 * 1024)))
         .route("/media/{token}", get(proxy_media).head(proxy_media))
@@ -435,6 +436,7 @@ async fn auth_middleware(
         || path.starts_with("/api/telegram-user-stream/")
         || path.starts_with("/api/telegram-user-thumb/")
         || path.starts_with("/api/scraper/proxy-image")
+        || path.starts_with("/api/movie-subtitles/")
     {
         return next.run(request).await;
     }
@@ -968,6 +970,56 @@ async fn dispatch_command(
                 crate::jav_scraper::list_movie_assets(&conn, &number)
                     .map_err(|e| format!("获取影片分片失败：{e}"))
             }).await
+        }
+        "search_movie_subtitles" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            result_response(crate::jav_scraper::search_movie_subtitles(&number).await)
+        }
+        "download_movie_subtitle" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let name = payload.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+            let lang = payload.get("lang").and_then(Value::as_str).unwrap_or("zh-CN").to_owned();
+            let download_url = payload.get("downloadUrl").and_then(Value::as_str).unwrap_or("").to_owned();
+            let downloaded = match crate::jav_scraper::download_and_save_subtitle(&number, &name, &lang, &download_url).await {
+                Ok(v) => v,
+                Err(e) => return error_response(&e),
+            };
+            let app = app.clone();
+            blocking_result_response(move || {
+                let (id, clean_num, clean_name, clean_lang, content) = downloaded;
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::save_movie_subtitle_row(
+                    &conn,
+                    &id,
+                    &clean_num,
+                    &clean_name,
+                    &clean_lang,
+                    "subtitlecat",
+                    &content,
+                )
+                .map_err(|e| format!("保存字幕失败：{e}"))
+            })
+            .await
+        }
+        "list_movie_subtitles" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::list_movie_subtitles(&conn, &number)
+                    .map_err(|e| format!("读取已保存字幕失败：{e}"))
+            })
+            .await
+        }
+        "delete_movie_subtitle" => {
+            let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::delete_movie_subtitle(&conn, &id)
+                    .map_err(|e| format!("删除字幕失败：{e}"))
+            })
+            .await
         }
         "get_related_movies_grouped" => {
             let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -1649,6 +1701,9 @@ async fn dispatch_command(
                 Some(value) => value.to_owned(),
                 None => return error_response("缺少 remotePath 参数"),
             };
+            if let Some(sub_id) = remote_path.strip_prefix("pml-sub://") {
+                return result_response(Ok::<String, String>(format!("/api/movie-subtitles/{sub_id}")));
+            }
             result_response(rewrite_media_url(
                 media_library::open_raw_media_source(
                     app.clone(),
@@ -2442,6 +2497,42 @@ struct ScraperProxyQuery {
 }
 
 const SCRAPER_IMAGE_MAX_SOURCE_LEN: usize = 16384;
+
+#[derive(Deserialize, Default)]
+struct MovieSubtitleQuery {
+    format: Option<String>,
+}
+
+async fn serve_movie_subtitle(
+    AxumState(context): AxumState<ServerState>,
+    Path(id): Path<String>,
+    Query(query): Query<MovieSubtitleQuery>,
+) -> Response {
+    let app = context.app.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>, String> {
+        let conn = four_domains::open_v2(&app)?;
+        crate::jav_scraper::get_movie_subtitle_content(&conn, &id)
+            .map_err(|e| format!("读取字幕失败：{e}"))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some((_name, content)))) => {
+            let as_vtt = query.format.as_deref().map(|f| f.eq_ignore_ascii_case("vtt")).unwrap_or(false);
+            let (body, mime) = if as_vtt {
+                (crate::jav_scraper::srt_to_webvtt(&content), "text/vtt; charset=utf-8")
+            } else {
+                (content, "text/plain; charset=utf-8")
+            };
+            let mut resp = Response::new(Body::from(body));
+            resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(mime));
+            resp.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("private, max-age=3600"));
+            resp
+        }
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "Subtitle not found").into_response(),
+        Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Subtitle task failed").into_response(),
+    }
+}
 
 fn decode_scraper_image_source(query: ScraperProxyQuery) -> Result<String, &'static str> {
     // A present source always wins; malformed input must not fall back to url.
