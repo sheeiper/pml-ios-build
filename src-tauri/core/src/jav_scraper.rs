@@ -61,6 +61,10 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             path TEXT PRIMARY KEY,
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS scrape_ignored_assets (
+            asset_id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL
         );"
     )?;
     let has_version = {
@@ -74,7 +78,113 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         // Preserve legacy metadata, but quarantine unverified search-first results.
         conn.execute("ALTER TABLE movie_metadata ADD COLUMN verification_version INTEGER NOT NULL DEFAULT 0", [])?;
     }
+    // Normalize FC2/legacy slash dates (e.g. 2026/07/15 -> 2026-07-15) so release_date
+    // lexicographical sorting matches true chronological order across all providers.
+    let _ = conn.execute(
+        "UPDATE movie_metadata SET release_date = replace(release_date, '/', '-') WHERE release_date LIKE '%/%'",
+        [],
+    );
     Ok(())
+}
+
+/// Normalize release dates like `2026/7/5`, `2026/07/05`, `2026.07.05` into `YYYY-MM-DD`.
+pub fn normalize_release_date(raw: Option<&str>) -> Option<String> {
+    let text = raw?.trim();
+    if text.is_empty() { return None; }
+    let unified = text.replace('/', "-").replace('.', "-");
+    let parts: Vec<&str> = unified.split('-').filter(|s| !s.is_empty()).collect();
+    if parts.len() == 3
+        && parts[0].len() == 4
+        && parts[0].bytes().all(|b| b.is_ascii_digit())
+        && parts[1].bytes().all(|b| b.is_ascii_digit())
+        && parts[2].bytes().all(|b| b.is_ascii_digit())
+    {
+        if let (Ok(m), Ok(d)) = (parts[1].parse::<u32>(), parts[2].parse::<u32>()) {
+            if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                return Some(format!("{}-{:02}-{:02}", parts[0], m, d));
+            }
+        }
+    }
+    Some(unified)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieAssetPart {
+    pub asset_id: String,
+    pub file_name: String,
+    pub remote_path: String,
+    pub size_bytes: i64,
+    pub duration_seconds: Option<f64>,
+}
+
+/// Return all non-missing video assets (parts / editions) bound to a movie number,
+/// ordered naturally by file name so multi-part FC2/JAV releases can switch parts cleanly.
+pub fn list_movie_assets(conn: &Connection, number: &str) -> Result<Vec<MovieAssetPart>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let upper = normalize_jav_number(number).unwrap_or_else(|| number.to_string());
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT a.id, a.file_name, a.remote_path, COALESCE(a.size_bytes, 0), a.duration_seconds
+         FROM assets a
+         WHERE a.missing = 0 AND a.media_type = 'video'
+           AND (
+             a.id IN (SELECT asset_id FROM movie_asset_bindings WHERE number = ?1)
+             OR a.id IN (SELECT asset_id FROM movie_metadata WHERE number = ?1 AND asset_id IS NOT NULL)
+           )
+         ORDER BY a.file_name COLLATE NOCASE ASC, a.id ASC"
+    )?;
+    let rows = stmt.query_map(params![upper], |r| {
+        Ok(MovieAssetPart {
+            asset_id: r.get(0)?,
+            file_name: r.get(1)?,
+            remote_path: r.get(2)?,
+            size_bytes: r.get(3)?,
+            duration_seconds: r.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Mark a non-JAV / non-movie video asset as ignored so it no longer clutters the unrecognized list.
+pub fn ignore_unrecognized_video(conn: &Connection, asset_id: &str) -> Result<(), rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let id = asset_id.trim();
+    if id.is_empty() { return Ok(()); }
+    conn.execute(
+        "INSERT OR REPLACE INTO scrape_ignored_assets(asset_id, created_at) VALUES (?1, ?2)",
+        params![id, chrono::Utc::now().timestamp()],
+    )?;
+    Ok(())
+}
+
+/// Extract a JAV/FC2 number from file_name first, falling back to up to 2 ancestor folder
+/// names when the video file itself is named generically (e.g. `/FC2-PPV-4833053/HD/01.mp4`).
+pub fn extract_jav_number_with_path(file_name: &str, remote_path: &str) -> Option<String> {
+    if let Some(num) = extract_jav_number(file_name) {
+        return Some(num);
+    }
+    let normalized = remote_path.replace('\\', "/");
+    let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    let generic_dir = |s: &str| {
+        let lower = s.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "fc2" | "jav" | "videos" | "video" | "movies" | "movie" | "115" | "115open"
+                | "云下载" | "暂存文件" | "未分类" | "{未分类}" | "文件" | "漫画" | "downloads"
+                | "hd" | "fhd" | "4k" | "uhd" | "sd" | "正片" | "特典" | "无码" | "有码" | "中字" | "字幕"
+        )
+    };
+    for depth in 2..=3 {
+        if segments.len() >= depth {
+            let folder = segments[segments.len() - depth];
+            if !generic_dir(folder) {
+                if let Some(num) = extract_jav_number(folder) {
+                    return Some(num);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Bind an existing movie to each real file; duplicated editions/parts do not
@@ -88,17 +198,65 @@ pub fn bind_movie_asset(conn: &Connection, number: &str, asset_id: &str) -> Resu
     Ok(())
 }
 
-/// Extract an identity from a filename, never from a movie title or parent directory.
+fn strip_promo_domains(upper: &str) -> String {
+    let mut out = upper.to_string();
+    for tld in [".COM", ".NET", ".ORG", ".ME", ".TV", ".CC", ".XYZ", ".INFO", ".BIZ", ".LA", ".IO", ".PW", ".TOP", ".SITE", ".VIP"] {
+        while let Some(pos) = out.find(tld) {
+            let mut start = pos;
+            let bytes = out.as_bytes();
+            while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'-' | b'.')) {
+                start -= 1;
+            }
+            let mut end = pos + tld.len();
+            while end < bytes.len() && matches!(bytes[end], b'@' | b'-' | b'_' | b' ' | b']' | b')') {
+                end += 1;
+            }
+            out.replace_range(start..end, " ");
+        }
+    }
+    out
+}
+
+fn valid_number_tail(upper: &str, pos: usize) -> bool {
+    let bytes = upper.as_bytes();
+    if pos >= bytes.len() || !bytes[pos].is_ascii_alphanumeric() {
+        return true;
+    }
+    if bytes[pos].is_ascii_digit() {
+        return false;
+    }
+    // Allow common directly-attached release suffixes (C, CH, UC, U, A, B, K, R, Z, X)
+    for suffix in ["CH", "UC", "C", "U", "A", "B", "K", "R", "Z", "X"] {
+        if upper[pos..].starts_with(suffix) {
+            let after = pos + suffix.len();
+            if after == bytes.len() || !bytes[after].is_ascii_alphanumeric() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Extract an identity from a filename, stripping promotional domain prefixes and common noise tags.
 /// Date identities retain their delimiter: 1pondo uses `_`, Caribbeancom uses `-`.
 pub fn extract_jav_number(raw_name: &str) -> Option<String> {
     let name = raw_name.rsplit(['/', '\\']).next()?.trim();
     let name = match name.rsplit_once('.') {
-        Some((stem, ext)) if ["mp4", "mkv", "avi", "wmv", "mov", "m4v", "ts", "webm", "iso"].contains(&ext.to_ascii_lowercase().as_str()) => stem,
+        Some((stem, ext)) if ["mp4", "mkv", "avi", "wmv", "mov", "m4v", "ts", "webm", "iso", "flv", "rmvb"].contains(&ext.to_ascii_lowercase().as_str()) => stem,
         _ => name,
     };
-    let upper = name.to_ascii_uppercase();
+    let upper = strip_promo_domains(&name.to_ascii_uppercase());
     let bytes = upper.as_bytes();
     let mut candidates = std::collections::BTreeSet::new();
+    const NOISE_PREFIXES: &[&str] = &[
+        "FHD", "HD", "UHD", "SD", "MP", "MKV", "MP4", "AVI", "WMV", "MOV",
+        "CH", "CHS", "CHT", "SUB", "H264", "H265", "X264", "X265", "HEVC", "AVC",
+        "AAC", "DTS", "FLAC", "FPS", "BIT", "PPV", "CARIB", "PART", "CD", "DISC",
+        "DISK", "VOL", "EP", "UNCENSORED", "LEAK", "LEAKED", "RAW", "FULL", "SAMPLE",
+        "TRAILER", "BONUS", "VER", "EDITION", "CUT", "UNCUT", "VR", "HDR", "SDR",
+        "WEB", "WEBRIP", "BDRIP", "DVDRIP", "BLURAY", "REMUX", "RIP", "ENC",
+    ];
+
     for start in 0..bytes.len() {
         if !upper.is_char_boundary(start) { continue; }
         if start > 0 && bytes[start - 1].is_ascii_alphanumeric() { continue; }
@@ -109,18 +267,42 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
             while i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ') { i += 1; }
             let n = i;
             while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
-            if (5..=8).contains(&(i - n)) && (i == bytes.len() || !bytes[i].is_ascii_alphanumeric()) {
+            if (5..=8).contains(&(i - n)) && valid_number_tail(&upper, i) {
                 candidates.insert(format!("FC2-{}", &upper[n..i]));
             }
             continue;
         }
         if bytes[start].is_ascii_digit() {
+            // 1) Date-style IDs (6 digits + '-'/'_' + 3 digits, e.g. 010126-123 / 010126_123)
             let end = start + 10;
             if end <= bytes.len() && bytes[start..start + 6].iter().all(u8::is_ascii_digit)
                 && matches!(bytes[start + 6], b'-' | b'_')
                 && bytes[start + 7..end].iter().all(u8::is_ascii_digit)
-                && (end == bytes.len() || !bytes[end].is_ascii_alphanumeric()) {
+                && valid_number_tail(&upper, end) {
                 candidates.insert(upper[start..end].to_string());
+                continue;
+            }
+            // 2) Digit-prefixed studio IDs (e.g. 300MIUM-123, 259LUXU-1234, 200GANA-1234, 420STH-123)
+            let mut d = start;
+            while d < bytes.len() && bytes[d].is_ascii_digit() { d += 1; }
+            let d_len = d - start;
+            if (2..=3).contains(&d_len) && d < bytes.len() && bytes[d].is_ascii_alphabetic() {
+                let mut l = d;
+                while l < bytes.len() && bytes[l].is_ascii_alphabetic() { l += 1; }
+                let l_len = l - d;
+                if (2..=6).contains(&l_len) {
+                    let prefix = &upper[start..l];
+                    let letters_only = &upper[d..l];
+                    if !NOISE_PREFIXES.contains(&letters_only) {
+                        let mut i = l;
+                        if i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ') { i += 1; }
+                        let n = i;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                        if (2..=5).contains(&(i - n)) && valid_number_tail(&upper, i) {
+                            candidates.insert(format!("{}-{}", prefix, &upper[n..i]));
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -128,16 +310,38 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
         let mut i = start;
         while i < bytes.len() && bytes[i].is_ascii_alphabetic() { i += 1; }
         let letters = &upper[start..i];
-        if !(2..=7).contains(&letters.len()) || ["FHD", "HD", "UHD", "MP", "MKV", "CH", "H264", "H265", "X264", "X265", "PPV", "CARIB"].contains(&letters) { continue; }
+        // Support alphanumeric studio prefixes like T28-123, S2MBD-123, M2G-123
+        if letters.len() == 1 && i < bytes.len() && bytes[i].is_ascii_digit() {
+            let mut p = i;
+            while p < bytes.len() && bytes[p].is_ascii_alphanumeric() { p += 1; }
+            let prefix = &upper[start..p];
+            if (2..=6).contains(&prefix.len()) && p < bytes.len() && matches!(bytes[p], b'-' | b'_') {
+                let n = p + 1;
+                let mut k = n;
+                while k < bytes.len() && bytes[k].is_ascii_digit() { k += 1; }
+                if (2..=5).contains(&(k - n)) && valid_number_tail(&upper, k) {
+                    candidates.insert(format!("{}-{}", prefix, &upper[n..k]));
+                    continue;
+                }
+            }
+        }
+        if !(2..=7).contains(&letters.len()) || NOISE_PREFIXES.contains(&letters) { continue; }
         if i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ') { i += 1; }
         let n = i;
         while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
-        if (2..=6).contains(&(i - n)) && (i == bytes.len() || !bytes[i].is_ascii_alphabetic() || upper[i..].starts_with("CH")) {
+        if (2..=6).contains(&(i - n)) && valid_number_tail(&upper, i) {
             candidates.insert(format!("{}-{}", letters, &upper[n..i]));
         }
     }
-    // Multiple different identities are ambiguous; do not silently choose the first.
-    if candidates.len() == 1 { candidates.into_iter().next() } else { None }
+    if candidates.len() == 1 {
+        return candidates.into_iter().next();
+    }
+    // If FC2-xxxx was detected alongside a secondary noise match, prefer the unambiguous FC2 ID.
+    let fc2_hits: Vec<String> = candidates.iter().filter(|c| c.starts_with("FC2-")).cloned().collect();
+    if fc2_hits.len() == 1 {
+        return fc2_hits.into_iter().next();
+    }
+    None
 }
 
 /// Strict API identity validation (unlike filename extraction, rejects extra text).
@@ -679,18 +883,24 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         }
     }
 
-    // Parse Maker (片商)
+    // Parse Maker (片商 / FC2 卖家)
     let mut maker = None;
-    if let Some(start) = html.find("<strong>片商:</strong>") {
-        let rest = html_window(&html, start, start + 300);
-        if let Some(a_start) = rest.find("<a ") {
-            if let Some(txt_start) = rest[a_start..].find('>') {
-                let txt_rest = &rest[a_start + txt_start + 1..];
-                if let Some(txt_end) = txt_rest.find("</a>") {
-                    maker = Some(txt_rest[..txt_end].trim().to_string());
+    for label in ["<strong>片商:</strong>", "<strong>賣家:</strong>", "<strong>卖家:</strong>"] {
+        if let Some(start) = html.find(label) {
+            let rest = html_window(&html, start, start + 300);
+            if let Some(a_start) = rest.find("<a ") {
+                if let Some(txt_start) = rest[a_start..].find('>') {
+                    let txt_rest = &rest[a_start + txt_start + 1..];
+                    if let Some(txt_end) = txt_rest.find("</a>") {
+                        let m = txt_rest[..txt_end].trim().to_string();
+                        if !m.is_empty() { maker = Some(m); break; }
+                    }
                 }
             }
         }
+    }
+    if maker.is_none() && number.starts_with("FC2-") {
+        maker = Some("FC2".to_string());
     }
 
     // Parse Series (系列)
@@ -1024,8 +1234,14 @@ pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
             if number.contains('_') { scrape_from_1pondo(&number).await }
             else { scrape_from_caribbeancom(&number).await }
         } else if number.starts_with("FC2-") {
-            // FC2 has an official public detail page; prefer it over generic JAV indexes.
-            scrape_from_fc2(&number).await
+            // Prefer FC2 official page; automatically fall back to JavDB when the seller
+            // delisted the item on FC2 (404 / soft-404) so archived FC2 titles still scrape.
+            match scrape_from_fc2(&number).await {
+                Ok(meta) => Ok(meta),
+                Err(fc2_err) => scrape_from_javdb(&number)
+                    .await
+                    .map_err(|db_err| format!("{fc2_err}; JavDB: {db_err}")),
+            }
         } else {
             // Direct detail source is faster. Start the second source after a short hedge,
             // returning the first *validated* success, not the first HTTP 200.
@@ -1064,6 +1280,7 @@ pub fn save_movie_metadata(conn: &Connection, meta: &MovieMetadata) -> Result<()
     let samples_json = serde_json::to_string(&meta.sample_images).unwrap_or_else(|_| "[]".to_string());
     let tags_json = serde_json::to_string(&meta.tags).unwrap_or_else(|_| "[]".to_string());
 
+    let normalized_date = normalize_release_date(meta.release_date.as_deref());
     conn.execute(
         "INSERT INTO movie_metadata (
             number, asset_id, title, original_title, actors_json, maker, label, series,
@@ -1097,7 +1314,7 @@ pub fn save_movie_metadata(conn: &Connection, meta: &MovieMetadata) -> Result<()
             meta.label,
             meta.series,
             meta.director,
-            meta.release_date,
+            normalized_date,
             meta.duration_minutes,
             meta.cover_url,
             samples_json,
@@ -1278,8 +1495,14 @@ pub fn query_movie_library(conn: &Connection, query: &str, maker: &str, actor: &
     let order_sql = match sort.trim().to_ascii_lowercase().as_str() {
         "number" | "number_asc" => "number ASC, updated_at DESC",
         "title" | "title_asc" => "title COLLATE NOCASE ASC, number ASC",
-        "date" | "release_date" | "release_date_desc" => "release_date DESC, number ASC",
-        "updated_at_asc" => "updated_at ASC, number ASC",
+        "date" | "release_date" | "release_date_desc" => {
+            "CASE WHEN release_date IS NULL OR trim(release_date) = '' THEN 1 ELSE 0 END ASC, replace(release_date, '/', '-') DESC, updated_at DESC, number ASC"
+        }
+        "release_date_asc" => {
+            "CASE WHEN release_date IS NULL OR trim(release_date) = '' THEN 1 ELSE 0 END ASC, replace(release_date, '/', '-') ASC, updated_at DESC, number ASC"
+        }
+        "updated_at" | "updated_at_desc" | "added" | "added_desc" => "updated_at DESC, number ASC",
+        "updated_at_asc" | "added_asc" => "updated_at ASC, number ASC",
         _ => "updated_at DESC, number ASC",
     };
     let sql = format!("SELECT number, asset_id, title, original_title, actors_json, maker, label, series, director, release_date, duration_minutes, cover_url, sample_images_json, tags_json, source, updated_at FROM movie_metadata{where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?");
@@ -1300,6 +1523,168 @@ pub struct ScrapeIssue {
     pub category: String,
     pub retryable: bool,
     pub updated_at: i64,
+    #[serde(default)]
+    pub files: Vec<UnrecognizedVideo>,
+}
+
+/// Return a random pool of verified movies across the entire library for the Hero recommendation banner.
+pub fn get_random_featured_movies(conn: &Connection, limit: u32) -> Result<Vec<MovieMetadata>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let cap = limit.clamp(1, 30);
+    let mut stmt = conn.prepare(
+        "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
+                director, release_date, duration_minutes, cover_url, sample_images_json,
+                tags_json, source, updated_at
+         FROM movie_metadata
+         WHERE verification_version = 1
+           AND source NOT IN ('javdb_not_found','not_found','')
+           AND cover_url IS NOT NULL AND cover_url != ''
+         ORDER BY CASE WHEN sample_images_json IS NOT NULL AND sample_images_json != '[]' THEN 0 ELSE 1 END ASC,
+                  RANDOM()
+         LIMIT ?1"
+    )?;
+    let rows = stmt.query_map(params![cap], metadata_from_row)?;
+    rows.collect()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSyncReport {
+    pub scanned_dirs: usize,
+    pub added_files: i64,
+    pub updated_files: i64,
+    pub removed_files: i64,
+    pub unbound_missing_assets: usize,
+    pub rebound_existing_movies: usize,
+    pub cleaned_stale_failures: usize,
+    pub pending_new_count: usize,
+    pub pending_new_numbers: Vec<String>,
+}
+
+/// Collect the distinct immediate parent directory paths of all current failure-related files
+/// and unrecognized whitelisted videos, so targeted remote refresh finishes in ~1 second.
+pub fn issue_and_unrecognized_parent_dirs(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let whitelist = get_scrape_whitelist(conn)?;
+    let mut fail_numbers = std::collections::HashSet::<String>::new();
+    {
+        let mut stmt = conn.prepare("SELECT number FROM scrape_failures")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for r in rows.flatten() {
+            fail_numbers.insert(r);
+        }
+    }
+    let mut dirs = std::collections::BTreeSet::<String>::new();
+    let mut stmt = conn.prepare("SELECT file_name, remote_path, parent_path FROM assets WHERE missing = 0 AND media_type = 'video'")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+    for row in rows.flatten() {
+        let (file_name, remote_path, parent_path) = row;
+        if !whitelist.iter().any(|p| path_under(&remote_path, p)) { continue; }
+        let matched = match extract_jav_number_with_path(&file_name, &remote_path) {
+            None => true,
+            Some(num) => fail_numbers.contains(&num),
+        };
+        if matched {
+            let p = parent_path.trim().trim_end_matches('/');
+            if !p.is_empty() {
+                dirs.insert(p.to_string());
+            }
+        }
+    }
+    Ok(dirs.into_iter().collect())
+}
+
+/// Reconcile local scraper bindings and failure records after a remote provider directory scan:
+/// Wrapped in a single SQLite transaction so hundreds/thousands of rebinds complete in milliseconds.
+pub fn reconcile_movie_library_changes(
+    conn: &Connection,
+    scanned_dirs: usize,
+    added_files: i64,
+    updated_files: i64,
+    removed_files: i64,
+) -> Result<RemoteSyncReport, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let (_, number_assets) = whitelisted_number_assets(conn)?;
+
+    let tx = conn.unchecked_transaction()?;
+    let unbound_missing_assets = tx.execute(
+        "DELETE FROM movie_asset_bindings
+         WHERE NOT EXISTS (SELECT 1 FROM assets a WHERE a.id = movie_asset_bindings.asset_id AND a.missing = 0)",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE movie_metadata
+         SET asset_id = (
+             SELECT b.asset_id FROM movie_asset_bindings b
+             JOIN assets a ON a.id = b.asset_id AND a.missing = 0
+             WHERE b.number = movie_metadata.number
+             ORDER BY a.file_name COLLATE NOCASE ASC, a.id ASC
+             LIMIT 1
+         )
+         WHERE asset_id IS NULL
+            OR NOT EXISTS (SELECT 1 FROM assets a WHERE a.id = movie_metadata.asset_id AND a.missing = 0)",
+        [],
+    )?;
+
+    let mut verified_numbers = std::collections::HashSet::<String>::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT number FROM movie_metadata WHERE verification_version = 1 AND source NOT IN ('javdb_not_found','not_found','') AND cover_url IS NOT NULL AND cover_url != ''"
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for r in rows.flatten() {
+            verified_numbers.insert(r);
+        }
+    }
+
+    let mut rebound_existing_movies = 0usize;
+    let mut pending_new_numbers = Vec::new();
+    for (number, assets) in &number_assets {
+        if verified_numbers.contains(number) {
+            for asset_id in assets {
+                tx.execute(
+                    "INSERT INTO movie_asset_bindings(asset_id, number) VALUES (?1, ?2)
+                     ON CONFLICT(asset_id) DO UPDATE SET number = excluded.number",
+                    params![asset_id, number],
+                )?;
+                tx.execute(
+                    "UPDATE movie_metadata SET asset_id = COALESCE(asset_id, ?2) WHERE number = ?1",
+                    params![number, asset_id],
+                )?;
+                rebound_existing_movies += 1;
+            }
+        } else {
+            pending_new_numbers.push(number.clone());
+        }
+    }
+
+    let fail_numbers: Vec<String> = {
+        let mut fail_stmt = tx.prepare("SELECT number FROM scrape_failures")?;
+        let rows = fail_stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut cleaned_stale_failures = 0usize;
+    for num in fail_numbers {
+        if !number_assets.contains_key(&num) {
+            cleaned_stale_failures += tx.execute("DELETE FROM scrape_failures WHERE number = ?1", params![num])?;
+        }
+    }
+    tx.commit()?;
+
+    let pending_new_count = pending_new_numbers.len();
+    pending_new_numbers.truncate(30);
+
+    Ok(RemoteSyncReport {
+        scanned_dirs,
+        added_files,
+        updated_files,
+        removed_files,
+        unbound_missing_assets,
+        rebound_existing_movies,
+        cleaned_stale_failures,
+        pending_new_count,
+        pending_new_numbers,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1328,7 +1713,12 @@ fn classify_scrape_error(number: &str, error: &str) -> (&'static str, bool) {
         && (lower.contains("404") || lower.contains("未找到") || lower.contains("not found") || lower.contains("不匹配") || lower.contains("身份")) {
         return ("padding_candidate", false);
     }
-    if lower.contains("fc2") && (lower.contains("404") || lower.contains("未找到") || lower.contains("软404") || lower.contains("not found")) { ("fc2_missing", false) }
+    if lower.contains("fc2") && (lower.contains("404") || lower.contains("未找到") || lower.contains("软404") || lower.contains("not found")) {
+        // Legacy FC2-only failures (before JavDB fallback existed) are retryable so "仅重试失败项"
+        // automatically rescues delisted FC2 titles via JavDB.
+        let retryable = !lower.contains("javdb");
+        ("fc2_missing", retryable)
+    }
     else if lower.contains("身份") || lower.contains("不匹配") || lower.contains("核验") || lower.contains("番号格式") { ("identity", false) }
     else if lower.contains("404") || lower.contains("未找到") || lower.contains("not found") || lower.contains("not_found") { ("not_found", false) }
     else if lower.contains("验证") || lower.contains("captcha") || lower.contains("cloudflare") || lower.contains("driver-verify") || lower.contains("challenge") { ("blocked", true) }
@@ -1338,6 +1728,18 @@ fn classify_scrape_error(number: &str, error: &str) -> (&'static str, bool) {
 
 pub fn list_scrape_issues(conn: &Connection, kind: &str, query: &str, limit: u32, offset: u32) -> Result<ScrapeIssuePage, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
+    let whitelist = get_scrape_whitelist(conn)?;
+    let mut files_by_number = std::collections::HashMap::<String, Vec<UnrecognizedVideo>>::new();
+    if let Ok(mut asset_stmt) = conn.prepare("SELECT id, file_name, remote_path FROM assets WHERE missing = 0 AND media_type = 'video' ORDER BY file_name COLLATE NOCASE ASC, id ASC") {
+        if let Ok(asset_rows) = asset_stmt.query_map([], |r| Ok(UnrecognizedVideo { id: r.get(0)?, file_name: r.get(1)?, remote_path: r.get(2)? })) {
+            for item in asset_rows.flatten() {
+                if !whitelist.iter().any(|prefix| path_under(&item.remote_path, prefix)) { continue; }
+                if let Some(num) = extract_jav_number_with_path(&item.file_name, &item.remote_path) {
+                    files_by_number.entry(num).or_default().push(item);
+                }
+            }
+        }
+    }
     let mut stmt = conn.prepare("SELECT number, error, updated_at FROM scrape_failures ORDER BY updated_at DESC, number ASC")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
     let kind = kind.trim().to_ascii_lowercase();
@@ -1346,8 +1748,10 @@ pub fn list_scrape_issues(conn: &Connection, kind: &str, query: &str, limit: u32
     for row in rows {
         let (number, error, updated_at) = row?;
         let (category, retryable) = classify_scrape_error(&number, &error);
-        if !query.is_empty() && !format!("{} {} {}", number, error, category).to_ascii_lowercase().contains(&query) { continue; }
-        candidates.push(ScrapeIssue { number, error, category: category.to_string(), retryable, updated_at });
+        let files = files_by_number.get(&number).cloned().unwrap_or_default();
+        let file_haystack: String = files.iter().map(|f| format!("{} {}", f.file_name, f.remote_path)).collect::<Vec<_>>().join(" ");
+        if !query.is_empty() && !format!("{} {} {} {}", number, error, category, file_haystack).to_ascii_lowercase().contains(&query) { continue; }
+        candidates.push(ScrapeIssue { number, error, category: category.to_string(), retryable, updated_at, files });
     }
     // Counts represent every category matching the text query, independent of
     // the selected category chip; total/items honor the selected kind.
@@ -1375,12 +1779,17 @@ pub struct UnrecognizedVideoPage { pub items: Vec<UnrecognizedVideo>, pub total:
 pub fn list_unrecognized_videos(conn: &Connection, limit: u32, offset: u32) -> Result<UnrecognizedVideoPage, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
     let whitelist = get_scrape_whitelist(conn)?;
-    let mut stmt = conn.prepare("SELECT id, file_name, remote_path FROM assets WHERE missing = 0 AND media_type = 'video' ORDER BY id ASC")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, file_name, remote_path FROM assets
+         WHERE missing = 0 AND media_type = 'video'
+           AND id NOT IN (SELECT asset_id FROM scrape_ignored_assets)
+         ORDER BY id ASC"
+    )?;
     let rows = stmt.query_map([], |r| Ok(UnrecognizedVideo { id: r.get(0)?, file_name: r.get(1)?, remote_path: r.get(2)? }))?;
     let mut all = Vec::new();
     for row in rows {
         let item = row?;
-        if whitelist.iter().any(|prefix| path_under(&item.remote_path, prefix)) && extract_jav_number(&item.file_name).is_none() { all.push(item); }
+        if whitelist.iter().any(|prefix| path_under(&item.remote_path, prefix)) && extract_jav_number_with_path(&item.file_name, &item.remote_path).is_none() { all.push(item); }
     }
     let total = all.len();
     let start = offset as usize;
@@ -1533,6 +1942,89 @@ pub fn get_related_movies(conn: &Connection, number: &str, limit: u32) -> Result
     Ok(related)
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelatedMoviesGrouped {
+    pub actor_names: Vec<String>,
+    pub by_actors: Vec<MovieMetadata>,
+    pub maker_name: Option<String>,
+    pub by_maker: Vec<MovieMetadata>,
+}
+
+/// Partitioned related recommendations: separates same-actor works from same-maker works.
+/// Movies without concrete actors (e.g. FC2) naturally return an empty `by_actors` and
+/// populate `by_maker` cleanly.
+pub fn get_related_movies_grouped(conn: &Connection, number: &str, limit_per_group: u32) -> Result<RelatedMoviesGrouped, rusqlite::Error> {
+    let current = match get_movie_metadata(conn, number)? {
+        Some(m) => m,
+        None => return Ok(RelatedMoviesGrouped::default()),
+    };
+    let cap = limit_per_group.clamp(1, 20) as usize;
+    let mut seen_numbers = std::collections::HashSet::new();
+    seen_numbers.insert(current.number.clone());
+
+    let mut by_actors = Vec::new();
+    let actor_names: Vec<String> = current.actors.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if !actor_names.is_empty() {
+        for actor in &actor_names {
+            if by_actors.len() >= cap { break; }
+            let pattern = format!("%\"{}\"%", escape_like_pattern(actor));
+            let mut stmt = conn.prepare(
+                "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
+                        director, release_date, duration_minutes, cover_url, sample_images_json,
+                        tags_json, source, updated_at
+                 FROM movie_metadata
+                 WHERE verification_version = 1
+                   AND source NOT IN ('javdb_not_found','not_found','')
+                   AND cover_url IS NOT NULL AND cover_url != ''
+                   AND actors_json LIKE ?1 ESCAPE '\\' AND number != ?2
+                 ORDER BY CASE WHEN release_date IS NULL OR trim(release_date) = '' THEN 1 ELSE 0 END ASC,
+                          replace(release_date, '/', '-') DESC, updated_at DESC, number ASC
+                 LIMIT ?3"
+            )?;
+            let rows = stmt.query_map(params![pattern, current.number, cap as u32], metadata_from_row)?;
+            for r in rows.flatten() {
+                if seen_numbers.insert(r.number.clone()) {
+                    by_actors.push(r);
+                    if by_actors.len() >= cap { break; }
+                }
+            }
+        }
+    }
+
+    let mut by_maker = Vec::new();
+    let maker_name = current.maker.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    if let Some(ref maker) = maker_name {
+        let mut stmt = conn.prepare(
+            "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
+                    director, release_date, duration_minutes, cover_url, sample_images_json,
+                    tags_json, source, updated_at
+             FROM movie_metadata
+             WHERE verification_version = 1
+               AND source NOT IN ('javdb_not_found','not_found','')
+               AND cover_url IS NOT NULL AND cover_url != ''
+               AND maker = ?1 AND number != ?2
+             ORDER BY CASE WHEN release_date IS NULL OR trim(release_date) = '' THEN 1 ELSE 0 END ASC,
+                      replace(release_date, '/', '-') DESC, updated_at DESC, number ASC
+             LIMIT ?3"
+        )?;
+        let rows = stmt.query_map(params![maker, current.number, (cap + by_actors.len()) as u32], metadata_from_row)?;
+        for r in rows.flatten() {
+            if seen_numbers.insert(r.number.clone()) {
+                by_maker.push(r);
+                if by_maker.len() >= cap { break; }
+            }
+        }
+    }
+
+    Ok(RelatedMoviesGrouped {
+        actor_names,
+        by_actors,
+        maker_name,
+        by_maker,
+    })
+}
+
 /// Whitelist management
 pub fn get_scrape_whitelist(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
@@ -1585,7 +2077,12 @@ pub fn is_path_whitelisted(conn: &Connection, path: &str) -> bool {
 
 fn whitelisted_number_assets(conn: &Connection) -> Result<(usize, std::collections::BTreeMap<String, Vec<String>>), rusqlite::Error> {
     let whitelist = get_scrape_whitelist(conn)?;
-    let mut stmt = conn.prepare("SELECT id, file_name, remote_path FROM assets WHERE missing = 0 AND media_type = 'video' ORDER BY id")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, file_name, remote_path FROM assets
+         WHERE missing = 0 AND media_type = 'video'
+           AND id NOT IN (SELECT asset_id FROM scrape_ignored_assets)
+         ORDER BY id"
+    )?;
     let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
     let mut total = 0;
     let mut numbers = std::collections::BTreeMap::<String, Vec<String>>::new();
@@ -1593,7 +2090,7 @@ fn whitelisted_number_assets(conn: &Connection) -> Result<(usize, std::collectio
         let (id, name, path) = row?;
         if !whitelist.iter().any(|p| path_under(&path, p)) { continue; }
         total += 1;
-        if let Some(number) = extract_jav_number(&name) { numbers.entry(number).or_default().push(id); }
+        if let Some(number) = extract_jav_number_with_path(&name, &path) { numbers.entry(number).or_default().push(id); }
     }
     Ok((total, numbers))
 }

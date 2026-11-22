@@ -1,8 +1,20 @@
 import Foundation
 
 extension PMLAPIClient {
-    func queryMovieLibrary(query: String = "", maker: String = "", actor: String = "", sort: String = "updated_at", limit: Int = 50, offset: Int = 0) async throws -> MovieLibraryPage {
+    func queryMovieLibrary(query: String = "", maker: String = "", actor: String = "", sort: String = "release_date_desc", limit: Int = 50, offset: Int = 0) async throws -> MovieLibraryPage {
         try await command("query_movie_library", arguments: ["query": query, "maker": maker, "actor": actor, "sort": sort, "limit": limit, "offset": offset], as: MovieLibraryPage.self)
+    }
+
+    func getRandomFeaturedMovies(limit: Int = 20) async throws -> [MovieMetadata] {
+        try await command("get_random_featured_movies", arguments: ["limit": limit], as: [MovieMetadata].self)
+    }
+
+    func getRelatedMoviesGrouped(number: String, limitPerGroup: Int = 8) async throws -> RelatedMoviesGrouped {
+        try await command("get_related_movies_grouped", arguments: ["number": number, "limitPerGroup": limitPerGroup], as: RelatedMoviesGrouped.self)
+    }
+
+    func listMovieAssets(number: String) async throws -> [MovieAssetPart] {
+        try await command("list_movie_assets", arguments: ["number": number], as: [MovieAssetPart].self)
     }
 
     func listScrapeIssues(category: String = "", query: String = "", limit: Int = 50, offset: Int = 0) async throws -> ScrapeIssuePage {
@@ -11,6 +23,18 @@ extension PMLAPIClient {
 
     func listUnrecognizedVideos(limit: Int = 50, offset: Int = 0) async throws -> UnrecognizedVideoPage {
         try await command("list_unrecognized_videos", arguments: ["limit": limit, "offset": offset], as: UnrecognizedVideoPage.self)
+    }
+
+    func ignoreUnrecognizedVideo(assetId: String) async throws {
+        try await command("ignore_unrecognized_video", arguments: ["assetId": assetId])
+    }
+
+    func syncRemoteAndReconcile(autoScrape: Bool = false, mode: String = "fast") async throws -> RemoteSyncReport {
+        try await command("sync_remote_and_reconcile", arguments: ["autoScrape": autoScrape, "mode": mode], as: RemoteSyncReport.self)
+    }
+
+    func startFailedBatchScrape() async throws {
+        try await command("start_batch_scrape_failed")
     }
 
     func listMoviePerformers(query: String = "", limit: Int = 50, offset: Int = 0) async throws -> MoviePerformerList {
@@ -34,5 +58,33 @@ extension PMLAPIClient {
 
     func previewMoviePerformerProfile(id: String, profileURL: String) async throws -> MovieProfileCandidate {
         try await command("preview_movie_performer_profile", arguments: ["id": id, "profileUrl": profileURL], as: MovieProfileCandidate.self)
+    }
+
+    func enrichMoviePerformer(id: String, force: Bool = false) async throws -> MoviePerformer {
+        try await command("enrich_movie_performer", arguments: ["id": id, "force": force], as: MoviePerformer.self)
+    }
+
+    func getPerformerEnrichStats() async throws -> PerformerEnrichStats {
+        try await command("get_performer_enrich_stats", as: PerformerEnrichStats.self)
+    }
+
+    func getPerformerEnrichProgress() async throws -> PerformerEnrichProgress {
+        try await command("get_performer_enrich_progress", as: PerformerEnrichProgress.self)
+    }
+
+    func startPerformerEnrich(forceAll: Bool = false) async throws -> PerformerEnrichProgress {
+        try await command("start_performer_enrich", arguments: ["forceAll": forceAll], as: PerformerEnrichProgress.self)
+    }
+
+    func pausePerformerEnrich() async throws -> PerformerEnrichProgress {
+        try await command("pause_performer_enrich", as: PerformerEnrichProgress.self)
+    }
+
+    func resumePerformerEnrich() async throws -> PerformerEnrichProgress {
+        try await command("resume_performer_enrich", as: PerformerEnrichProgress.self)
+    }
+
+    func stopPerformerEnrich() async throws -> PerformerEnrichProgress {
+        try await command("stop_performer_enrich", as: PerformerEnrichProgress.self)
     }
 }

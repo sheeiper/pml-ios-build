@@ -9,12 +9,16 @@ public struct MovieDetailSheet: View {
     public let fileName: String?
     public let remotePath: String?
     public let onPlay: ((String) -> Void)?
+    public let onFilterActor: ((String) -> Void)?
+    public let onFilterMaker: ((String) -> Void)?
 
     @State private var loading = false
     @State private var errorMessage: String?
     @State private var metadata: MovieMetadata?
-    @State private var relatedMovies: [MovieMetadata] = []
+    @State private var parts: [MovieAssetPart] = []
+    @State private var relatedGrouped: RelatedMoviesGrouped?
     @State private var selectedSampleURL: String?
+    @State private var selectedPerformer: MoviePerformer?
     @State private var currentNumber: String?
 
     public init(
@@ -22,13 +26,17 @@ public struct MovieDetailSheet: View {
         assetId: String? = nil,
         fileName: String? = nil,
         remotePath: String? = nil,
-        onPlay: ((String) -> Void)? = nil
+        onPlay: ((String) -> Void)? = nil,
+        onFilterActor: ((String) -> Void)? = nil,
+        onFilterMaker: ((String) -> Void)? = nil
     ) {
         self.number = number
         self.assetId = assetId
         self.fileName = fileName
         self.remotePath = remotePath
         self.onPlay = onPlay
+        self.onFilterActor = onFilterActor
+        self.onFilterMaker = onFilterMaker
     }
 
     public var body: some View {
@@ -39,9 +47,8 @@ public struct MovieDetailSheet: View {
                         HStack {
                             Spacer()
                             VStack(spacing: 12) {
-                                ProgressView()
-                                    .scaleEffect(1.2)
-                                Text("正在联网刮削日本影视百科与剧照...")
+                                ProgressView().scaleEffect(1.2)
+                                Text("正在联网刮削影视百科与剧照...")
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
                             }
@@ -68,76 +75,69 @@ public struct MovieDetailSheet: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 40)
                     } else if let meta = metadata {
-                        // Hero section
-                        HStack(alignment: .top, spacing: 16) {
-                            CachedImageView(url: meta.coverUrl.flatMap { appModel.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fill, minHeight: 90, maxPixel: 900)
-                                .aspectRatio(16 / 9, contentMode: .fit)
-                                .frame(width: 160, height: 90)
-                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 3)
+                        // Full-width 3:2 cover (contain so FC2 irregular covers never crop)
+                        ZStack {
+                            Color.black
+                            CachedImageView(
+                                url: meta.coverUrl.flatMap { appModel.proxyScraperImageURL(rawUrl: $0) },
+                                contentMode: .fit,
+                                minHeight: 200,
+                                maxPixel: 1200
+                            )
+                        }
+                        .aspectRatio(3 / 2, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .shadow(color: .black.opacity(0.32), radius: 10, x: 0, y: 4)
 
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack(spacing: 6) {
-                                    Text(meta.number)
-                                        .font(.caption.bold())
-                                        .padding(.horizontal, 7)
-                                        .padding(.vertical, 3)
-                                        .background(LinearGradient(colors: [.purple, .indigo], startPoint: .leading, endPoint: .trailing))
-                                        .foregroundStyle(.white)
-                                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                        // Title & Badges
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 6) {
+                                Text(meta.number)
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(LinearGradient(colors: [.purple, .pink], startPoint: .leading, endPoint: .trailing))
+                                    .foregroundStyle(.white)
+                                    .clipShape(RoundedRectangle(cornerRadius: 5))
 
-                                    if let date = meta.releaseDate {
-                                        Text(date)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-
-                                    if let duration = meta.durationMinutes, duration > 0 {
-                                        Text("\(duration) 分钟")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-
-                                Text(meta.title)
-                                    .font(.subheadline.bold())
-                                    .lineLimit(4)
-                                    .foregroundStyle(.primary)
-
-                                if let orig = meta.originalTitle, !orig.isEmpty, orig != meta.title {
-                                    Text(orig)
-                                        .font(.caption2)
+                                if let date = meta.releaseDate, !date.isEmpty {
+                                    Text(date)
+                                        .font(.caption)
                                         .foregroundStyle(.secondary)
-                                        .lineLimit(2)
                                 }
 
-                                if let maker = meta.maker {
-                                    HStack(spacing: 4) {
-                                        Text("片商:").font(.caption2).foregroundStyle(.secondary)
-                                        Text(maker).font(.caption.bold()).foregroundStyle(.primary)
-                                    }
+                                if let duration = meta.durationMinutes, duration > 0 {
+                                    Text("\(duration) 分钟")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
 
-                                if let series = meta.series {
-                                    HStack(spacing: 4) {
-                                        Text("系列:").font(.caption2).foregroundStyle(.secondary)
-                                        Text(series).font(.caption).foregroundStyle(.secondary)
-                                    }
+                                if parts.count > 1 {
+                                    Text("\(parts.count) 分片")
+                                        .font(.caption2.bold())
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.blue.opacity(0.16), in: Capsule())
+                                        .foregroundStyle(.blue)
                                 }
+                            }
 
-                                if let director = meta.director {
-                                    HStack(spacing: 4) {
-                                        Text("导演:").font(.caption2).foregroundStyle(.secondary)
-                                        Text(director).font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
+                            Text(meta.title)
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+
+                            if let orig = meta.originalTitle, !orig.isEmpty, orig != meta.title {
+                                Text(orig)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
                             }
                         }
 
                         // Play & Rescrape Buttons
                         HStack(spacing: 12) {
                             Button {
-                                if let targetId = meta.assetId ?? assetId {
+                                if let targetId = parts.first?.assetId ?? meta.assetId ?? assetId {
                                     dismiss()
                                     onPlay?(targetId)
                                 }
@@ -161,14 +161,88 @@ public struct MovieDetailSheet: View {
                             .buttonStyle(.bordered)
                         }
 
-                        // Actresses
+                        // Multi-part / local file switcher
+                        if !parts.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(parts.count > 1 ? "多分片视频（共 \(parts.count) 个文件）" : "关联本地视频")
+                                    .font(.footnote.bold())
+                                    .foregroundStyle(.secondary)
+                                ForEach(Array(parts.enumerated()), id: \.element.id) { idx, part in
+                                    Button {
+                                        dismiss()
+                                        onPlay?(part.assetId)
+                                    } label: {
+                                        HStack(spacing: 8) {
+                                            Image(systemName: "play.circle.fill")
+                                                .foregroundStyle(.purple)
+                                            if parts.count > 1 {
+                                                Text("P\(idx + 1)")
+                                                    .font(.caption2.bold())
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(Color.purple.opacity(0.2), in: RoundedRectangle(cornerRadius: 4))
+                                                    .foregroundStyle(.purple)
+                                            }
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(part.fileName)
+                                                    .font(.caption.weight(.semibold))
+                                                    .lineLimit(1)
+                                                    .foregroundStyle(.primary)
+                                                Text(part.remotePath)
+                                                    .font(.system(size: 10))
+                                                    .lineLimit(1)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            Spacer()
+                                            if part.sizeBytes > 0 {
+                                                Text(formatBytes(part.sizeBytes))
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        .padding(10)
+                                        .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 10))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+
+                        // Structured Metadata Specs
+                        let specs = buildSpecs(meta)
+                        if !specs.isEmpty {
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                ForEach(specs, id: \.label) { spec in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(spec.label).font(.caption2).foregroundStyle(.secondary)
+                                        if spec.isMaker, let maker = meta.maker, let onFilterMaker {
+                                            Button(maker) {
+                                                dismiss()
+                                                onFilterMaker(maker)
+                                            }
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.purple)
+                                        } else {
+                                            Text(spec.value)
+                                                .font(.caption.weight(.semibold))
+                                                .lineLimit(2)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(10)
+                                    .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 9))
+                                }
+                            }
+                        }
+
+                        // Clickable Actresses
                         if !meta.actors.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack(spacing: 4) {
-                                    Image(systemName: "heart.fill")
+                                    Image(systemName: "person.2.fill")
                                         .font(.caption2)
                                         .foregroundStyle(.pink)
-                                    Text("出演女优")
+                                    Text("主演阵容（点击查看档案）")
                                         .font(.footnote.bold())
                                         .foregroundStyle(.secondary)
                                 }
@@ -176,13 +250,18 @@ public struct MovieDetailSheet: View {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 8) {
                                         ForEach(meta.actors, id: \.self) { actress in
-                                            Label(actress, systemImage: "heart.fill")
-                                                .font(.caption.weight(.semibold))
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 5)
-                                                .background(Color.pink.opacity(0.14))
-                                                .foregroundStyle(Color.pink)
-                                                .clipShape(Capsule())
+                                            Button {
+                                                Task { await openPerformer(named: actress) }
+                                            } label: {
+                                                Label(actress, systemImage: "person.circle.fill")
+                                                    .font(.caption.weight(.semibold))
+                                                    .padding(.horizontal, 10)
+                                                    .padding(.vertical, 6)
+                                                    .background(Color.pink.opacity(0.14))
+                                                    .foregroundStyle(Color.pink)
+                                                    .clipShape(Capsule())
+                                            }
+                                            .buttonStyle(.plain)
                                         }
                                     }
                                 }
@@ -199,13 +278,13 @@ public struct MovieDetailSheet: View {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 6) {
                                         ForEach(meta.tags, id: \.self) { tag in
-                                            Text(tag)
+                                            Text("# \(tag)")
                                                 .font(.caption2)
                                                 .padding(.horizontal, 8)
                                                 .padding(.vertical, 4)
                                                 .background(Color.secondary.opacity(0.12))
                                                 .foregroundStyle(.secondary)
-                                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                                                .clipShape(Capsule())
                                         }
                                     }
                                 }
@@ -215,7 +294,7 @@ public struct MovieDetailSheet: View {
                         // Sample Images
                         if !meta.sampleImages.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("官方高清剧照 (\(meta.sampleImages.count))")
+                                Text("剧照画廊 (\(meta.sampleImages.count))")
                                     .font(.footnote.bold())
                                     .foregroundStyle(.secondary)
 
@@ -226,9 +305,9 @@ public struct MovieDetailSheet: View {
                                                 Button {
                                                     selectedSampleURL = sample
                                                 } label: {
-                                                    CachedImageView(url: url, contentMode: .fill, minHeight: 95, maxPixel: 480)
-                                                        .frame(width: 140, height: 95)
-                                                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                                                    CachedImageView(url: url, contentMode: .fill, minHeight: 100, maxPixel: 540)
+                                                        .frame(width: 150, height: 100)
+                                                        .clipShape(RoundedRectangle(cornerRadius: 8))
                                                 }
                                                 .buttonStyle(.plain)
                                             }
@@ -238,43 +317,27 @@ public struct MovieDetailSheet: View {
                             }
                         }
 
-                        // Related movies
-                        if !relatedMovies.isEmpty {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("库内关联推荐 (同女优 / 同厂牌)")
-                                    .font(.footnote.bold())
-                                    .foregroundStyle(.secondary)
-
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 10) {
-                                        ForEach(relatedMovies) { rel in
-                                            Button {
-                                                metadata = rel
-                                                currentNumber = rel.number
-                                                Task {
-                                                    relatedMovies = (try? await appModel.apiClient?.getRelatedMovies(number: rel.number, limit: 8)) ?? []
-                                                }
-                                            } label: {
-                                                VStack(alignment: .leading, spacing: 4) {
-                                                    if let cover = rel.coverUrl, let url = appModel.proxyScraperImageURL(rawUrl: cover) {
-                                                        CachedImageView(url: url, contentMode: .fill, minHeight: 75, maxPixel: 360)
-                                                            .frame(width: 110, height: 75)
-                                                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                                                    }
-                                                    Text(rel.number)
-                                                        .font(.caption2.bold())
-                                                        .foregroundStyle(.primary)
-                                                    Text(rel.title)
-                                                        .font(.system(size: 10))
-                                                        .foregroundStyle(.secondary)
-                                                        .lineLimit(1)
-                                                        .frame(width: 110, alignment: .leading)
-                                                }
-                                            }
-                                            .buttonStyle(.plain)
-                                        }
+                        // Partitioned Related Movies: Same Actors vs Same Maker
+                        if let grouped = relatedGrouped {
+                            if !grouped.byActors.isEmpty {
+                                relatedSection(
+                                    title: "同演员更多作品",
+                                    subtitle: grouped.actorNames.prefix(2).joined(separator: " · "),
+                                    items: grouped.byActors,
+                                    filterAction: grouped.actorNames.first.flatMap { name in
+                                        onFilterActor.map { handler in { dismiss(); handler(name) } }
                                     }
-                                }
+                                )
+                            }
+                            if !grouped.byMaker.isEmpty {
+                                relatedSection(
+                                    title: "同厂商推荐",
+                                    subtitle: grouped.makerName ?? "",
+                                    items: grouped.byMaker,
+                                    filterAction: grouped.makerName.flatMap { maker in
+                                        onFilterMaker.map { handler in { dismiss(); handler(maker) } }
+                                    }
+                                )
                             }
                         }
                     }
@@ -287,6 +350,17 @@ public struct MovieDetailSheet: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
                 }
+            }
+            .sheet(item: $selectedPerformer) { person in
+                MoviePerformerDetailSheet(
+                    performer: person,
+                    onFilterMovies: onFilterActor.map { handler in { actorName in dismiss(); handler(actorName) } },
+                    onPlay: { targetId, _ in
+                        dismiss()
+                        onPlay?(targetId)
+                    }
+                )
+                .environmentObject(appModel)
             }
             .sheet(item: Binding<SampleImageItem?>(
                 get: { selectedSampleURL.map { SampleImageItem(url: $0) } },
@@ -312,6 +386,89 @@ public struct MovieDetailSheet: View {
                 await loadData()
             }
         }
+    }
+
+    private func relatedSection(title: String, subtitle: String, items: [MovieMetadata], filterAction: (() -> Void)?) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title).font(.footnote.bold()).foregroundStyle(.secondary)
+                if !subtitle.isEmpty {
+                    Text(subtitle).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                }
+                Spacer()
+                if let filterAction {
+                    Button("查看全部", action: filterAction)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.purple)
+                }
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(items) { rel in
+                        Button {
+                            metadata = rel
+                            currentNumber = rel.number
+                            Task { await loadAux(for: rel.number) }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ZStack {
+                                    Color.black.opacity(0.85)
+                                    if let cover = rel.coverUrl, let url = appModel.proxyScraperImageURL(rawUrl: cover) {
+                                        CachedImageView(url: url, contentMode: .fit, minHeight: 84, maxPixel: 400)
+                                    }
+                                }
+                                .frame(width: 126, height: 84)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                                Text(rel.number)
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.primary)
+                                Text(rel.title)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .frame(width: 126, alignment: .leading)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    private struct SpecItem { let label: String; let value: String; var isMaker: Bool = false }
+
+    private func buildSpecs(_ meta: MovieMetadata) -> [SpecItem] {
+        var list: [SpecItem] = []
+        if let maker = meta.maker, !maker.isEmpty { list.append(SpecItem(label: "片商", value: maker, isMaker: true)) }
+        if let label = meta.label, !label.isEmpty { list.append(SpecItem(label: "发行厂牌", value: label)) }
+        if let series = meta.series, !series.isEmpty { list.append(SpecItem(label: "所属系列", value: series)) }
+        if let director = meta.director, !director.isEmpty { list.append(SpecItem(label: "导演", value: director)) }
+        list.append(SpecItem(label: "数据来源", value: meta.source.isEmpty ? "未知" : meta.source))
+        return list
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        let gb = Double(bytes) / 1_073_741_824.0
+        if gb >= 1.0 { return String(format: "%.2f GB", gb) }
+        return "\(bytes / 1_048_576) MB"
+    }
+
+    private func openPerformer(named name: String) async {
+        guard let client = appModel.apiClient else { return }
+        if let list = try? await client.listMoviePerformers(query: name, limit: 10, offset: 0) {
+            let exact = list.items.first(where: { $0.name == name || $0.aliases.contains(name) })
+            selectedPerformer = exact ?? list.items.first
+        }
+    }
+
+    private func loadAux(for num: String) async {
+        guard let client = appModel.apiClient else { return }
+        async let fetchedParts = try? client.listMovieAssets(number: num)
+        async let fetchedRelated = try? client.getRelatedMoviesGrouped(number: num, limitPerGroup: 8)
+        parts = (await fetchedParts) ?? []
+        relatedGrouped = await fetchedRelated
     }
 
     private func loadData(force: Bool = false) async {
@@ -349,7 +506,7 @@ public struct MovieDetailSheet: View {
             }
             metadata = meta
             if let num = meta?.number {
-                relatedMovies = (try? await client.getRelatedMovies(number: num, limit: 8)) ?? []
+                await loadAux(for: num)
             } else if !force {
                 errorMessage = "暂无已验证元数据；点击刷新才会执行一次手动刮削。"
             }

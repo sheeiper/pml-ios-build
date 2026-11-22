@@ -105,4 +105,5 @@ public struct BatchScrapeStats: Codable {
     public let distinctNumbers: Int
     public let alreadyScraped: Int
     public let remainingToScrape: Int
+    public let failedCount: Int?
 }

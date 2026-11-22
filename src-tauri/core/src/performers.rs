@@ -63,6 +63,24 @@ pub struct Performer {
     pub status: String,
     pub updated_at: i64,
     pub movie_count: u64,
+    #[serde(default)]
+    pub birth_date: Option<String>,
+    #[serde(default)]
+    pub height_cm: Option<i64>,
+    #[serde(default)]
+    pub measurements: Option<String>,
+    #[serde(default)]
+    pub hometown: Option<String>,
+    #[serde(default)]
+    pub hobby: Option<String>,
+    #[serde(default)]
+    pub bio: Option<String>,
+    #[serde(default)]
+    pub blood_type: Option<String>,
+    #[serde(default)]
+    pub debut_year: Option<String>,
+    #[serde(default)]
+    pub agency: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +125,19 @@ pub fn ensure_performer_schema(conn: &Connection) -> Result<(), PerformerError> 
             fingerprint TEXT NOT NULL
         );",
     )?;
+    for col in [
+        "ALTER TABLE performers ADD COLUMN birth_date TEXT",
+        "ALTER TABLE performers ADD COLUMN height_cm INTEGER",
+        "ALTER TABLE performers ADD COLUMN measurements TEXT",
+        "ALTER TABLE performers ADD COLUMN hometown TEXT",
+        "ALTER TABLE performers ADD COLUMN hobby TEXT",
+        "ALTER TABLE performers ADD COLUMN bio TEXT",
+        "ALTER TABLE performers ADD COLUMN blood_type TEXT",
+        "ALTER TABLE performers ADD COLUMN debut_year TEXT",
+        "ALTER TABLE performers ADD COLUMN agency TEXT",
+    ] {
+        let _ = conn.execute(col, []);
+    }
     Ok(())
 }
 
@@ -180,7 +211,7 @@ pub fn sync_performers(conn: &Connection) -> Result<(), PerformerError> {
             let id = candidate_id(&source, &raw_name);
             savepoint.execute(
                 "INSERT INTO performers(id,name,source,status,updated_at)
-                 VALUES (?1,?2,?3,'unconfirmed',?4) ON CONFLICT(id) DO NOTHING",
+                 VALUES (?1,?2,?3,'confirmed',?4) ON CONFLICT(id) DO NOTHING",
                 params![id, name, source, chrono::Utc::now().timestamp()],
             )?;
             savepoint.execute(
@@ -236,7 +267,8 @@ impl Drop for SyncSavepoint<'_> {
 fn person_select() -> String {
     format!("SELECT p.id,p.name,p.aliases_json,p.avatar_url,p.profile_url,p.source,p.status,p.updated_at,
         (SELECT COUNT(DISTINCT c.number) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number
-         WHERE c.person_id=p.id AND {VERIFIED}) AS movie_count FROM performers p")
+         WHERE c.person_id=p.id AND {VERIFIED}) AS movie_count,
+        p.birth_date,p.height_cm,p.measurements,p.hometown,p.hobby,p.bio,p.blood_type,p.debut_year,p.agency FROM performers p")
 }
 
 fn person_from_row(row: &Row<'_>) -> rusqlite::Result<Performer> {
@@ -246,6 +278,9 @@ fn person_from_row(row: &Row<'_>) -> rusqlite::Result<Performer> {
         aliases: serde_json::from_str(&json).unwrap_or_default(),
         avatar_url: row.get(3)?, profile_url: row.get(4)?, source: row.get(5)?,
         status: row.get(6)?, updated_at: row.get(7)?, movie_count: row.get(8)?,
+        birth_date: row.get(9)?, height_cm: row.get(10)?, measurements: row.get(11)?,
+        hometown: row.get(12)?, hobby: row.get(13)?, bio: row.get(14)?,
+        blood_type: row.get(15)?, debut_year: row.get(16)?, agency: row.get(17)?,
     })
 }
 
@@ -279,7 +314,7 @@ pub fn get_performer(conn: &Connection, id: &str) -> Result<Option<PerformerDeta
                 m.tags_json,m.source,m.updated_at
          FROM movie_metadata m WHERE {VERIFIED}
            AND EXISTS(SELECT 1 FROM movie_cast c WHERE c.number=m.number AND c.person_id=?1)
-         ORDER BY m.release_date DESC,m.updated_at DESC,m.number ASC LIMIT 100"
+         ORDER BY CASE WHEN m.release_date IS NULL OR trim(m.release_date) = '' THEN 1 ELSE 0 END ASC, replace(m.release_date, '/', '-') DESC, m.updated_at DESC, m.number ASC LIMIT 100"
     ))?;
     let movies = stmt.query_map([id], |row| {
         let actors: String = row.get(4)?;
@@ -701,6 +736,887 @@ fn parse_profile_candidate(original: &str, final_url: &str, expected_names: &[St
         || ![".jpg",".jpeg",".png",".webp"].iter().any(|ext| avatar.path().to_ascii_lowercase().ends_with(ext))
     { return Err("Portrait is not an allowlisted JavBus actress image".into()); }
     Ok(ProfileCandidate { avatar_url: avatar.to_string(), profile_url: base.to_string(), name: names[0].to_string() })
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrichedPerformerInfo {
+    pub avatar_url: Option<String>,
+    pub profile_url: Option<String>,
+    pub birth_date: Option<String>,
+    pub height_cm: Option<i64>,
+    pub measurements: Option<String>,
+    pub hometown: Option<String>,
+    pub hobby: Option<String>,
+    pub bio: Option<String>,
+    pub blood_type: Option<String>,
+    pub debut_year: Option<String>,
+    pub agency: Option<String>,
+    pub aliases: Vec<String>,
+}
+
+fn clean_html_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => { in_tag = true; out.push(' '); }
+            '>' => { in_tag = false; }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    decode_profile_entities(&out)
+        .unwrap_or(out)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn extract_attr_value(tag: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}");
+        if let Some((_, rest)) = tag.split_once(&needle) {
+            if let Some((val, _)) = rest.split_once(quote) {
+                return Some(val.replace("&amp;", "&"));
+            }
+        }
+    }
+    None
+}
+
+fn safe_utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn parse_javbus_star_page(base_url: &url::Url, html: &str) -> EnrichedPerformerInfo {
+    let mut info = EnrichedPerformerInfo {
+        profile_url: Some(base_url.to_string()),
+        ..Default::default()
+    };
+    if let Some((_, after_box)) = html.split_once("class=\"avatar-box\"") {
+        let box_slice = safe_utf8_prefix(after_box, 8192);
+        if let Some((_, after_frame)) = box_slice.split_once("class=\"photo-frame\"") {
+            if let Some((_, after_img)) = after_frame.split_once("<img") {
+                if let Some((img_tag, _)) = after_img.split_once('>') {
+                    if let Some(src) = extract_attr_value(img_tag, "src") {
+                        let lower = src.to_ascii_lowercase();
+                        if !lower.contains("nowprinting") && !lower.contains("default") {
+                            if let Ok(resolved) = base_url.join(src.trim()) {
+                                info.avatar_url = Some(resolved.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((_, after_info)) = box_slice.split_once("class=\"photo-info\"") {
+            let info_slice = after_info.split("</div>").next().unwrap_or(after_info);
+            let mut cup = String::new();
+            let mut bust = String::new();
+            let mut waist = String::new();
+            let mut hip = String::new();
+            for p_seg in info_slice.split("<p").skip(1) {
+                let Some((_, body)) = p_seg.split_once('>') else { continue; };
+                let body = body.split("</p>").next().unwrap_or(body);
+                let line = clean_html_text(body);
+                let (label, val) = match line.split_once(':').or_else(|| line.split_once('：')) {
+                    Some((k, v)) => (k.trim(), v.trim()),
+                    None => continue,
+                };
+                if val.is_empty() || val == "-" { continue; }
+                if label.contains("生日") {
+                    info.birth_date = Some(val.to_string());
+                } else if label.contains("身高") {
+                    let digits: String = val.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(cm) = digits.parse::<i64>() {
+                        if (120..=220).contains(&cm) { info.height_cm = Some(cm); }
+                    }
+                } else if label.contains("罩杯") {
+                    cup = val.to_string();
+                } else if label.contains("胸圍") || label.contains("胸围") {
+                    bust = val.replace("cm", "").trim().to_string();
+                } else if label.contains("腰圍") || label.contains("腰围") {
+                    waist = val.replace("cm", "").trim().to_string();
+                } else if label.contains("臀圍") || label.contains("臀围") {
+                    hip = val.replace("cm", "").trim().to_string();
+                } else if label.contains("出生地") {
+                    info.hometown = Some(val.to_string());
+                } else if label.contains("愛好") || label.contains("爱好") {
+                    info.hobby = Some(val.to_string());
+                }
+            }
+            let mut parts = Vec::new();
+            if !cup.is_empty() { parts.push(format!("{cup}罩杯")); }
+            if !bust.is_empty() || !waist.is_empty() || !hip.is_empty() {
+                parts.push(format!("B{bust} / W{waist} / H{hip}"));
+            }
+            if !parts.is_empty() {
+                info.measurements = Some(parts.join(" · "));
+            }
+        }
+    }
+    info
+}
+
+fn find_javbus_star_url(search_base: &url::Url, html: &str, expected_name: &str) -> Option<(String, Option<String>)> {
+    let target = expected_name.trim().to_ascii_lowercase();
+    let mut candidates: Vec<(String, String, Option<String>)> = Vec::new();
+    for seg in html.split("class=\"avatar-box\"").skip(1) {
+        let block = seg.split("</a>").next().unwrap_or("");
+        // Look backwards or inside for href="/star/..." or https://www.javbus.com/star/...
+        let href = extract_attr_value(block, "href").or_else(|| {
+            // Often `<a class="avatar-box text-center" href="https://www.javbus.com/star/xxx">`
+            None
+        });
+        let Some(raw_href) = href else { continue; };
+        if !raw_href.contains("/star/") { continue; }
+        let Ok(resolved_url) = search_base.join(raw_href.trim()) else { continue; };
+        let avatar = block.split("<img").nth(1)
+            .and_then(|s| s.split('>').next())
+            .and_then(|tag| extract_attr_value(tag, "src"))
+            .filter(|src| !src.to_ascii_lowercase().contains("nowprinting"))
+            .and_then(|src| search_base.join(src.trim()).ok())
+            .map(|u| u.to_string());
+        let name = block.split("<span").nth(1)
+            .and_then(|s| s.split_once('>').map(|(_, b)| b))
+            .and_then(|s| s.split("</span>").next())
+            .map(clean_html_text)
+            .unwrap_or_default();
+        if !name.is_empty() {
+            candidates.push((name, resolved_url.to_string(), avatar));
+        }
+    }
+    // Also support `<a href=".../star/..." class="avatar-box ...">` where href precedes class
+    if candidates.is_empty() {
+        for seg in html.split("<a ").skip(1) {
+            let Some((open_tag, rest)) = seg.split_once('>') else { continue; };
+            if !open_tag.contains("avatar-box") { continue; }
+            let Some(raw_href) = extract_attr_value(open_tag, "href") else { continue; };
+            if !raw_href.contains("/star/") { continue; }
+            let Ok(resolved_url) = search_base.join(raw_href.trim()) else { continue; };
+            let block = rest.split("</a>").next().unwrap_or("");
+            let avatar = block.split("<img").nth(1)
+                .and_then(|s| s.split('>').next())
+                .and_then(|tag| extract_attr_value(tag, "src"))
+                .filter(|src| !src.to_ascii_lowercase().contains("nowprinting"))
+                .and_then(|src| search_base.join(src.trim()).ok())
+                .map(|u| u.to_string());
+            let name = block.split("<span").nth(1)
+                .and_then(|s| s.split_once('>').map(|(_, b)| b))
+                .and_then(|s| s.split("</span>").next())
+                .map(clean_html_text)
+                .unwrap_or_default();
+            if !name.is_empty() {
+                candidates.push((name, resolved_url.to_string(), avatar));
+            }
+        }
+    }
+    if let Some((_, url, avatar)) = candidates.iter().find(|(n, _, _)| n.trim().to_ascii_lowercase() == target) {
+        return Some((url.clone(), avatar.clone()));
+    }
+    if candidates.len() == 1 {
+        let (_, url, avatar) = &candidates[0];
+        return Some((url.clone(), avatar.clone()));
+    }
+    None
+}
+
+async fn fetch_wikipedia_summary(client: &reqwest::Client, lang: &str, name: &str) -> Option<(Option<String>, Option<String>, String)> {
+    let mut url = url::Url::parse(&format!("https://{lang}.wikipedia.org/api/rest_v1/page/summary/")).ok()?;
+    url.path_segments_mut().ok()?.push(name.trim());
+    let resp = client.get(url.clone())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    if json.get("type").and_then(|v| v.as_str()) == Some("disambiguation") { return None; }
+    let avatar = json.pointer("/thumbnail/source")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| s.starts_with("https://"))
+        .map(str::to_string);
+    let bio = json.get("extract")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(260).collect::<String>());
+    let page_url = json.pointer("/content_urls/desktop/page")
+        .and_then(|v| v.as_str())
+        .unwrap_or(url.as_str())
+        .to_string();
+    if avatar.is_some() || bio.is_some() { Some((avatar, bio, page_url)) } else { None }
+}
+
+static GFRIENDS_INDEX: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::collections::HashMap<String, String>, std::time::Instant)>>> = std::sync::OnceLock::new();
+const GFRIENDS_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+const WIKI_USER_AGENT: &str = "PersonalMediaLibrary/1.0 (https://personal-media-library.local)";
+
+fn normalize_lookup_key(name: &str) -> String {
+    name.trim()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '　')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn build_gfriends_url(folder: &str, file_with_query: &str) -> Option<String> {
+    let (file_part, query_part) = match file_with_query.split_once('?') {
+        Some((f, q)) => (f, Some(q)),
+        None => (file_with_query, None),
+    };
+    let mut url = url::Url::parse("https://cdn.jsdelivr.net/gh/gfriends/gfriends@master/Content/").ok()?;
+    {
+        let mut segs = url.path_segments_mut().ok()?;
+        segs.push(folder);
+        segs.push(file_part);
+    }
+    if let Some(q) = query_part {
+        if !q.is_empty() { url.set_query(Some(q)); }
+    }
+    Some(url.to_string())
+}
+
+async fn lookup_gfriends_avatar(client: &reqwest::Client, names: &[String]) -> Option<String> {
+    let cell = GFRIENDS_INDEX.get_or_init(|| tokio::sync::RwLock::new(None));
+    {
+        let guard = cell.read().await;
+        if let Some((map, loaded_at)) = guard.as_ref() {
+            if loaded_at.elapsed() < GFRIENDS_TTL {
+                for n in names {
+                    if let Some(url) = map.get(&normalize_lookup_key(n)) {
+                        return Some(url.clone());
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    // Fetch Filetree.json from jsDelivr CDN (fallback to raw.githubusercontent.com)
+    let mut parsed_json: Option<serde_json::Value> = None;
+    for tree_url in [
+        "https://cdn.jsdelivr.net/gh/gfriends/gfriends@master/Filetree.json",
+        "https://raw.githubusercontent.com/gfriends/gfriends/master/Filetree.json",
+    ] {
+        if let Ok(resp) = client.get(tree_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(val) = resp.json::<serde_json::Value>().await {
+                    parsed_json = Some(val);
+                    break;
+                }
+            }
+        }
+    }
+    let val = parsed_json?;
+    let content = val.get("Content")?.as_object()?;
+    let mut map = std::collections::HashMap::<String, String>::with_capacity(24000);
+    for (folder, files_val) in content {
+        let Some(files) = files_val.as_object() else { continue; };
+        for (display_file, actual_val) in files {
+            let Some(actual) = actual_val.as_str() else { continue; };
+            let stem = display_file
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or(display_file);
+            let key = normalize_lookup_key(stem);
+            if key.is_empty() || map.contains_key(&key) { continue; }
+            if let Some(cdn_url) = build_gfriends_url(folder, actual) {
+                map.insert(key, cdn_url);
+            }
+        }
+    }
+    let found = names.iter().find_map(|n| map.get(&normalize_lookup_key(n)).cloned());
+    {
+        let mut guard = cell.write().await;
+        *guard = Some((map, std::time::Instant::now()));
+    }
+    found
+}
+
+fn clean_wikitext_value(raw: &str) -> String {
+    let mut text = raw.to_string();
+    // Strip <ref>...</ref> and HTML comments
+    while let Some(start) = text.find("<!--") {
+        if let Some(end) = text[start..].find("-->") {
+            text.replace_range(start..start + end + 3, "");
+        } else { break; }
+    }
+    while let Some(start) = text.find("<ref") {
+        if let Some(end) = text[start..].find("</ref>") {
+            text.replace_range(start..start + end + 6, "");
+        } else if let Some(end) = text[start..].find("/>") {
+            text.replace_range(start..start + end + 2, "");
+        } else { break; }
+    }
+    // Replace common templates like {{JPN}} or {{生年月日と年齢|...}}
+    text = text.replace("{{JPN}}", "日本").replace("{{Flagicon|Japan}}", "日本");
+    // Strip remaining simple {{...}} templates
+    while let Some(start) = text.find("{{") {
+        if let Some(end) = text[start..].find("}}") {
+            text.replace_range(start..start + end + 2, "");
+        } else { break; }
+    }
+    // Convert [[Target|Label]] -> Label and [[Target]] -> Target
+    while let Some(start) = text.find("[[") {
+        if let Some(end) = text[start..].find("]]") {
+            let inner = &text[start + 2..start + end];
+            let label = inner.rsplit_once('|').map(|(_, l)| l).unwrap_or(inner).to_string();
+            text.replace_range(start..start + end + 2, &label);
+        } else { break; }
+    }
+    clean_html_text(&text)
+        .replace("'''", "")
+        .replace("''", "")
+        .trim_matches(|c: char| c == '・' || c == '、' || c == ',' || c == ' ')
+        .trim()
+        .to_string()
+}
+
+fn parse_ja_wikipedia_infobox(wikitext: &str, info: &mut EnrichedPerformerInfo) {
+    let mut year = String::new();
+    let mut month = String::new();
+    let mut day = String::new();
+    let mut bwh = String::new();
+    let mut cup = String::new();
+
+    for line in wikitext.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix('|') else { continue; };
+        let Some((raw_key, raw_val)) = rest.split_once('=') else { continue; };
+        let key = raw_key.trim();
+        let val = clean_wikitext_value(raw_val);
+        if val.is_empty() || val == "-" || val == "不明" || val == "非公開" { continue; }
+        match key {
+            "生年" => { year = val.chars().filter(|c| c.is_ascii_digit()).collect(); }
+            "生月" => { month = val.chars().filter(|c| c.is_ascii_digit()).collect(); }
+            "生日" => { day = val.chars().filter(|c| c.is_ascii_digit()).collect(); }
+            "出身地" | "出生地" => {
+                if info.hometown.is_none() { info.hometown = Some(val); }
+            }
+            "血液型" => {
+                if info.blood_type.is_none() {
+                    let clean = if val.ends_with('型') { val } else { format!("{val}型") };
+                    info.blood_type = Some(clean);
+                }
+            }
+            "身長" => {
+                if info.height_cm.is_none() {
+                    let digits: String = val.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(cm) = digits.parse::<i64>() {
+                        if (120..=220).contains(&cm) { info.height_cm = Some(cm); }
+                    }
+                }
+            }
+            "スリーサイズ" => { bwh = val; }
+            "ブラのサイズ" | "カップ" => { cup = val; }
+            "趣味" | "趣味・特技" | "特技" => {
+                if info.hobby.is_none() { info.hobby = Some(val); }
+            }
+            "活動期間" | "デビュー" => {
+                if info.debut_year.is_none() { info.debut_year = Some(val); }
+            }
+            "所属事務所" | "事務所" | "専属契約" => {
+                if info.agency.is_none() { info.agency = Some(val); }
+            }
+            "別名" | "愛称" => {
+                for alias in val.split(['、', '・', '/', ',', '，']) {
+                    let a = alias.trim();
+                    if !a.is_empty() && a.chars().count() <= 30 && !info.aliases.contains(&a.to_string()) {
+                        info.aliases.push(a.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if info.birth_date.is_none() && year.len() == 4 {
+        if let (Ok(m), Ok(d)) = (month.parse::<u32>(), day.parse::<u32>()) {
+            if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                info.birth_date = Some(format!("{year}-{m:02}-{d:02}"));
+            }
+        }
+    }
+    if info.measurements.is_none() {
+        let mut parts = Vec::new();
+        if !cup.is_empty() { parts.push(format!("{cup}罩杯")); }
+        if !bwh.is_empty() { parts.push(bwh); }
+        if !parts.is_empty() { info.measurements = Some(parts.join(" · ")); }
+    }
+}
+
+async fn fetch_ja_wikipedia_infobox(client: &reqwest::Client, name: &str, info: &mut EnrichedPerformerInfo) {
+    let Ok(mut url) = url::Url::parse("https://ja.wikipedia.org/w/api.php") else { return; };
+    url.query_pairs_mut()
+        .append_pair("action", "query")
+        .append_pair("titles", name.trim())
+        .append_pair("redirects", "1")
+        .append_pair("prop", "revisions")
+        .append_pair("rvprop", "content")
+        .append_pair("rvsection", "0")
+        .append_pair("format", "json")
+        .append_pair("formatversion", "2");
+    let Ok(resp) = client.get(url).send().await else { return; };
+    if !resp.status().is_success() { return; }
+    let Ok(json) = resp.json::<serde_json::Value>().await else { return; };
+    if let Some(content) = json.pointer("/query/pages/0/revisions/0/content").and_then(|v| v.as_str()) {
+        parse_ja_wikipedia_infobox(content, info);
+    }
+}
+
+/// Automatically fetch performer portrait and rich profile info (birthday, blood type, height,
+/// measurements, hometown, debut year, agency, hobby, bio) from gfriends + Wikipedia + JavBus.
+pub async fn fetch_performer_enrichment(name: &str, existing_profile_url: Option<&str>) -> Result<EnrichedPerformerInfo, String> {
+    let clean_name = name.trim();
+    if clean_name.is_empty() { return Err("演员姓名为空".into()); }
+    let wiki_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .user_agent(WIKI_USER_AGENT)
+        .build()
+        .map_err(|_| "初始化资料抓取客户端失败".to_string())?;
+    let web_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|_| "初始化网页客户端失败".to_string())?;
+
+    let mut result = EnrichedPerformerInfo::default();
+    let mut lookup_names = vec![clean_name.to_string()];
+
+    // 1. Japanese Wikipedia structured Infobox (birthday, height, B/W/H, blood type, hometown, debut, agency, hobby)
+    fetch_ja_wikipedia_infobox(&wiki_client, clean_name, &mut result).await;
+    for alias in &result.aliases {
+        if !lookup_names.contains(alias) { lookup_names.push(alias.clone()); }
+    }
+
+    // 2. gfriends CDN portrait lookup (instant in-memory index after first load)
+    if let Some(avatar) = lookup_gfriends_avatar(&wiki_client, &lookup_names).await {
+        result.avatar_url = Some(avatar);
+    }
+
+    // 3. Wikipedia REST Summary (prefer zh for Chinese bio, fallback to ja; also fallback portrait)
+    for lang in ["zh", "ja"] {
+        if let Some((wiki_avatar, wiki_bio, wiki_page)) = fetch_wikipedia_summary(&wiki_client, lang, clean_name).await {
+            if result.avatar_url.is_none() { result.avatar_url = wiki_avatar; }
+            if result.bio.is_none() { result.bio = wiki_bio; }
+            if result.profile_url.is_none() { result.profile_url = Some(wiki_page); }
+            if result.bio.is_some() && result.avatar_url.is_some() { break; }
+        }
+    }
+
+    // 4. Fallback to JavBus (with age-verification cookie) if portrait or core measurements still missing
+    if result.avatar_url.is_none() || (result.birth_date.is_none() && result.measurements.is_none()) {
+        let mut star_url: Option<String> = existing_profile_url
+            .map(str::trim)
+            .filter(|u| u.contains("javbus.com/star/"))
+            .map(str::to_string);
+
+        if star_url.is_none() {
+            if let Ok(mut search_url) = url::Url::parse("https://www.javbus.com/searchstar/") {
+                if let Ok(mut segs) = search_url.path_segments_mut() { segs.push(clean_name); }
+                if let Ok(resp) = web_client.get(search_url.clone())
+                    .header(reqwest::header::COOKIE, "existmag=all; age=verified; dv=1")
+                    .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,ja;q=0.8")
+                    .send().await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(html) = resp.text().await {
+                            if let Some((found_url, thumb)) = find_javbus_star_url(&search_url, &html, clean_name) {
+                                star_url = Some(found_url);
+                                if result.avatar_url.is_none() && thumb.is_some() { result.avatar_url = thumb; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ref target_url) = star_url {
+            if let Ok(parsed_url) = url::Url::parse(target_url) {
+                if let Ok(resp) = web_client.get(parsed_url.clone())
+                    .header(reqwest::header::COOKIE, "existmag=all; age=verified; dv=1")
+                    .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,ja;q=0.8")
+                    .send().await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(html) = resp.text().await {
+                            let parsed = parse_javbus_star_page(&parsed_url, &html);
+                            if result.avatar_url.is_none() && parsed.avatar_url.is_some() { result.avatar_url = parsed.avatar_url; }
+                            if parsed.profile_url.is_some() { result.profile_url = parsed.profile_url; }
+                            if result.birth_date.is_none() { result.birth_date = parsed.birth_date; }
+                            if result.height_cm.is_none() { result.height_cm = parsed.height_cm; }
+                            if result.measurements.is_none() { result.measurements = parsed.measurements; }
+                            if result.hometown.is_none() { result.hometown = parsed.hometown; }
+                            if result.hobby.is_none() { result.hobby = parsed.hobby; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if result.avatar_url.is_none()
+        && result.birth_date.is_none()
+        && result.height_cm.is_none()
+        && result.measurements.is_none()
+        && result.bio.is_none()
+        && result.blood_type.is_none()
+        && result.hometown.is_none()
+    {
+        return Err(format!("未能从公开站点获取到「{clean_name}」的头像或资料"));
+    }
+    Ok(result)
+}
+
+pub fn apply_performer_enrichment(
+    conn: &Connection,
+    id: &str,
+    info: &EnrichedPerformerInfo,
+    force: bool,
+) -> Result<Performer, PerformerError> {
+    ensure_performer_schema(conn)?;
+    let existing = read_person(conn, id)?.ok_or(PerformerError::NotFound)?;
+    let avatar = if force || existing.avatar_url.as_deref().unwrap_or("").is_empty() {
+        info.avatar_url.clone().or(existing.avatar_url)
+    } else {
+        existing.avatar_url
+    };
+    let profile = if force || existing.profile_url.as_deref().unwrap_or("").is_empty() {
+        info.profile_url.clone().or(existing.profile_url)
+    } else {
+        existing.profile_url
+    };
+    let birth_date = info.birth_date.clone().or(existing.birth_date);
+    let height_cm = info.height_cm.or(existing.height_cm);
+    let measurements = info.measurements.clone().or(existing.measurements);
+    let hometown = info.hometown.clone().or(existing.hometown);
+    let hobby = info.hobby.clone().or(existing.hobby);
+    let bio = info.bio.clone().or(existing.bio);
+    let blood_type = info.blood_type.clone().or(existing.blood_type);
+    let debut_year = info.debut_year.clone().or(existing.debut_year);
+    let agency = info.agency.clone().or(existing.agency);
+    let mut merged_aliases = existing.aliases.clone();
+    for a in &info.aliases {
+        if a != &existing.name && !merged_aliases.contains(a) && merged_aliases.len() < MAX_ALIASES {
+            merged_aliases.push(a.clone());
+        }
+    }
+    let aliases_json = serde_json::to_string(&merged_aliases).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "UPDATE performers SET aliases_json=?2, avatar_url=?3, profile_url=?4, birth_date=?5, height_cm=?6,
+         measurements=?7, hometown=?8, hobby=?9, bio=?10, blood_type=?11, debut_year=?12, agency=?13,
+         status='confirmed', updated_at=?14 WHERE id=?1",
+        params![
+            id, aliases_json, avatar, profile, birth_date, height_cm,
+            measurements, hometown, hobby, bio, blood_type, debut_year, agency,
+            chrono::Utc::now().timestamp()
+        ],
+    )?;
+    read_person(conn, id)?.ok_or(PerformerError::NotFound)
+}
+
+pub fn list_performers_missing_profile(conn: &Connection, limit: u32) -> Result<(Vec<(String, String, Option<String>)>, u64), PerformerError> {
+    sync_performers(conn)?;
+    let total_missing: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM performers WHERE avatar_url IS NULL OR trim(avatar_url) = ''",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.id, p.name, p.profile_url,
+            (SELECT COUNT(DISTINCT c.number) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number
+             WHERE c.person_id=p.id AND {VERIFIED}) AS movie_count
+         FROM performers p
+         WHERE p.avatar_url IS NULL OR trim(p.avatar_url) = ''
+         ORDER BY movie_count DESC, p.name COLLATE NOCASE ASC
+         LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map([limit.min(50)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((rows, total_missing))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformerEnrichStats {
+    pub total_performers: u64,
+    pub with_avatar: u64,
+    pub with_profile_info: u64,
+    pub missing_count: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformerEnrichProgress {
+    pub running: bool,
+    pub paused: bool,
+    pub total: usize,
+    pub completed: usize,
+    pub enriched: usize,
+    pub failed: usize,
+    pub current_name: Option<String>,
+    pub last_message: Option<String>,
+}
+
+fn enrich_progress_cell() -> &'static std::sync::Mutex<PerformerEnrichProgress> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<PerformerEnrichProgress>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(PerformerEnrichProgress::default()))
+}
+
+fn enrich_pause_flag() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    FLAG.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
+fn enrich_stop_flag() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    FLAG.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn get_performer_enrich_stats(conn: &Connection) -> Result<PerformerEnrichStats, PerformerError> {
+    sync_performers(conn)?;
+    let total_performers: u64 = conn.query_row("SELECT COUNT(*) FROM performers", [], |r| r.get(0))?;
+    let with_avatar: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM performers WHERE avatar_url IS NOT NULL AND trim(avatar_url) != ''",
+        [],
+        |r| r.get(0),
+    )?;
+    let with_profile_info: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM performers WHERE (birth_date IS NOT NULL AND trim(birth_date) != '')
+            OR height_cm IS NOT NULL
+            OR (measurements IS NOT NULL AND trim(measurements) != '')
+            OR (bio IS NOT NULL AND trim(bio) != '')",
+        [],
+        |r| r.get(0),
+    )?;
+    let missing_count: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM performers WHERE (avatar_url IS NULL OR trim(avatar_url) = '')
+            OR ((birth_date IS NULL OR trim(birth_date) = '') AND height_cm IS NULL AND (bio IS NULL OR trim(bio) = ''))",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(PerformerEnrichStats {
+        total_performers,
+        with_avatar,
+        with_profile_info,
+        missing_count,
+    })
+}
+
+pub fn get_performer_enrich_progress() -> PerformerEnrichProgress {
+    enrich_progress_cell().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+pub fn pause_performer_enrich() -> PerformerEnrichProgress {
+    enrich_pause_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = enrich_progress_cell().lock() {
+        if g.running { g.paused = true; }
+        return g.clone();
+    }
+    PerformerEnrichProgress::default()
+}
+
+pub fn resume_performer_enrich() -> PerformerEnrichProgress {
+    enrich_pause_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = enrich_progress_cell().lock() {
+        g.paused = false;
+        return g.clone();
+    }
+    PerformerEnrichProgress::default()
+}
+
+pub fn stop_performer_enrich() -> PerformerEnrichProgress {
+    enrich_stop_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+    enrich_pause_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = enrich_progress_cell().lock() {
+        g.paused = false;
+        g.last_message = Some("正在停止任务…".to_string());
+        return g.clone();
+    }
+    PerformerEnrichProgress::default()
+}
+
+pub fn list_performers_for_enrichment(conn: &Connection, force_all: bool) -> Result<Vec<(String, String, Option<String>)>, PerformerError> {
+    sync_performers(conn)?;
+    let where_clause = if force_all {
+        "1 = 1"
+    } else {
+        "(p.avatar_url IS NULL OR trim(p.avatar_url) = '')
+         OR ((p.birth_date IS NULL OR trim(p.birth_date) = '') AND p.height_cm IS NULL AND (p.bio IS NULL OR trim(p.bio) = ''))"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.id, p.name, p.profile_url,
+            (SELECT COUNT(DISTINCT c.number) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number
+             WHERE c.person_id=p.id AND {VERIFIED}) AS movie_count
+         FROM performers p
+         WHERE {where_clause}
+         ORDER BY movie_count DESC, p.name COLLATE NOCASE ASC"
+    ))?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn start_performer_enrich_task<F>(open_db: F, force_all: bool) -> Result<PerformerEnrichProgress, String>
+where
+    F: Fn() -> Result<Connection, String> + Send + Sync + 'static,
+{
+    {
+        let mut g = enrich_progress_cell().lock().map_err(|_| "状态锁异常".to_string())?;
+        if g.running {
+            return Ok(g.clone());
+        }
+        enrich_stop_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+        enrich_pause_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+        *g = PerformerEnrichProgress {
+            running: true,
+            paused: false,
+            total: 0,
+            completed: 0,
+            enriched: 0,
+            failed: 0,
+            current_name: None,
+            last_message: Some("正在扫描待补全演员列表…".to_string()),
+        };
+    }
+
+    let open_db = std::sync::Arc::new(open_db);
+    let open_db_list = open_db.clone();
+    tokio::spawn(async move {
+        struct EnrichRunGuard;
+        impl Drop for EnrichRunGuard {
+            fn drop(&mut self) {
+                if let Ok(mut g) = enrich_progress_cell().lock() {
+                    if g.running {
+                        g.running = false;
+                        g.paused = false;
+                        g.current_name = None;
+                        if g.last_message.is_none() {
+                            g.last_message = Some("任务已结束".to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let _guard = EnrichRunGuard;
+
+        let queue = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, Option<String>)>, String> {
+            let conn = open_db_list()?;
+            list_performers_for_enrichment(&conn, force_all).map_err(|e| e.to_string())
+        }).await;
+
+        let items = match queue {
+            Ok(Ok(list)) => list,
+            Ok(Err(e)) => {
+                if let Ok(mut g) = enrich_progress_cell().lock() {
+                    g.running = false;
+                    g.last_message = Some(format!("扫描失败：{e}"));
+                }
+                return;
+            }
+            Err(e) => {
+                if let Ok(mut g) = enrich_progress_cell().lock() {
+                    g.running = false;
+                    g.last_message = Some(format!("任务异常：{e}"));
+                }
+                return;
+            }
+        };
+
+        if let Ok(mut g) = enrich_progress_cell().lock() {
+            g.total = items.len();
+            if items.is_empty() {
+                g.running = false;
+                g.last_message = Some("所有演员资料均已补全，无需重复获取。".to_string());
+                return;
+            }
+            g.last_message = Some(format!("共 {} 位待处理演员，开始联网获取…", items.len()));
+        }
+
+        for (id, name, existing_url) in items {
+            if enrich_stop_flag().load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            while enrich_pause_flag().load(std::sync::atomic::Ordering::SeqCst) {
+                if enrich_stop_flag().load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            if enrich_stop_flag().load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+
+            if let Ok(mut g) = enrich_progress_cell().lock() {
+                g.current_name = Some(name.clone());
+            }
+
+            let fetch_outcome = tokio::select! {
+                res = fetch_performer_enrichment(&name, existing_url.as_deref()) => Some(res),
+                _ = async {
+                    while !enrich_stop_flag().load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    }
+                } => None,
+            };
+
+            let Some(outcome) = fetch_outcome else {
+                break;
+            };
+
+            match outcome {
+                Ok(info) => {
+                    let open_save = open_db.clone();
+                    let id_clone = id.clone();
+                    let saved = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                        let conn = open_save()?;
+                        apply_performer_enrichment(&conn, &id_clone, &info, force_all)
+                            .map_err(|e| e.to_string())?;
+                        Ok(())
+                    }).await;
+                    if let Ok(mut g) = enrich_progress_cell().lock() {
+                        g.completed += 1;
+                        if matches!(saved, Ok(Ok(()))) {
+                            g.enriched += 1;
+                            g.last_message = Some(format!("已更新「{name}」资料"));
+                        } else {
+                            g.failed += 1;
+                            g.last_message = Some(format!("保存「{name}」失败"));
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = enrich_progress_cell().lock() {
+                        g.completed += 1;
+                        g.failed += 1;
+                        g.last_message = Some(err);
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
+        if let Ok(mut g) = enrich_progress_cell().lock() {
+            let stopped = enrich_stop_flag().load(std::sync::atomic::Ordering::SeqCst);
+            g.running = false;
+            g.paused = false;
+            g.current_name = None;
+            g.last_message = Some(if stopped {
+                format!("已手动停止：成功 {}，未匹配 {}", g.enriched, g.failed)
+            } else {
+                format!("补全完成：成功 {}，未匹配 {}", g.enriched, g.failed)
+            });
+        }
+    });
+
+    Ok(get_performer_enrich_progress())
 }
 
 #[cfg(test)]

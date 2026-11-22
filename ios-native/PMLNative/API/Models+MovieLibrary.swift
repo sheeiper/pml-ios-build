@@ -15,6 +15,7 @@ public struct ScrapeIssue: Codable, Identifiable, Hashable {
     public let category: String
     public let retryable: Bool
     public let updatedAt: Int64
+    public let files: [UnrecognizedVideo]?
 }
 
 public struct ScrapeIssueCount: Codable, Identifiable, Hashable {
@@ -40,6 +41,22 @@ public struct UnrecognizedVideoPage: Codable {
     public let total: Int
 }
 
+public struct MovieAssetPart: Codable, Identifiable, Hashable {
+    public var id: String { assetId }
+    public let assetId: String
+    public let fileName: String
+    public let remotePath: String
+    public let sizeBytes: Int64
+    public let durationSeconds: Double?
+}
+
+public struct RelatedMoviesGrouped: Codable {
+    public let actorNames: [String]
+    public let byActors: [MovieMetadata]
+    public let makerName: String?
+    public let byMaker: [MovieMetadata]
+}
+
 public struct MoviePerformer: Codable, Identifiable, Hashable {
     public let id: String
     public let name: String
@@ -50,6 +67,15 @@ public struct MoviePerformer: Codable, Identifiable, Hashable {
     public let status: String
     public let updatedAt: Int64
     public let movieCount: Int
+    public let birthDate: String?
+    public let heightCm: Int?
+    public let measurements: String?
+    public let hometown: String?
+    public let hobby: String?
+    public let bio: String?
+    public let bloodType: String?
+    public let debutYear: String?
+    public let agency: String?
 }
 
 public struct MoviePerformerList: Codable {
@@ -67,4 +93,34 @@ public struct MovieProfileCandidate: Codable {
     public let avatarUrl: String
     public let profileUrl: String
     public let name: String
+}
+
+public struct PerformerEnrichStats: Codable {
+    public let totalPerformers: Int
+    public let withAvatar: Int
+    public let withProfileInfo: Int
+    public let missingCount: Int
+}
+
+public struct PerformerEnrichProgress: Codable {
+    public let running: Bool
+    public let paused: Bool
+    public let total: Int
+    public let completed: Int
+    public let enriched: Int
+    public let failed: Int
+    public let currentName: String?
+    public let lastMessage: String?
+}
+
+public struct RemoteSyncReport: Codable {
+    public let scannedDirs: Int
+    public let addedFiles: Int
+    public let updatedFiles: Int
+    public let removedFiles: Int
+    public let unboundMissingAssets: Int
+    public let reboundExistingMovies: Int
+    public let cleanedStaleFailures: Int
+    public let pendingNewCount: Int
+    public let pendingNewNumbers: [String]
 }

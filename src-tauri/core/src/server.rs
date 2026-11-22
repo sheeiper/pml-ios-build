@@ -871,6 +871,73 @@ async fn dispatch_command(
                 Err(e) => error_response(&e.to_string()),
             }
         }
+        "enrich_movie_performer" => {
+            let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let force = payload.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let app_read = app.clone();
+            let id_read = id.clone();
+            let target = tokio::task::spawn_blocking(move || -> Result<(String, Option<String>), String> {
+                let conn = four_domains::open_v2(&app_read)?;
+                let detail = crate::performers::get_performer(&conn, &id_read)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("人物不存在")?;
+                Ok((detail.person.name, detail.person.profile_url))
+            }).await;
+            match target {
+                Ok(Ok((name, existing_url))) => {
+                    match crate::performers::fetch_performer_enrichment(&name, existing_url.as_deref()).await {
+                        Ok(info) => {
+                            let app_write = app.clone();
+                            blocking_result_response(move || {
+                                let conn = four_domains::open_v2(&app_write)?;
+                                crate::performers::apply_performer_enrichment(&conn, &id, &info, force)
+                                    .map_err(|e| e.to_string())
+                            }).await
+                        }
+                        Err(e) => error_response(&e),
+                    }
+                }
+                Ok(Err(e)) => error_response(&e),
+                Err(e) => error_response(&e.to_string()),
+            }
+        }
+        "batch_enrich_movie_performers" => {
+            let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(15).min(50) as u32;
+            let app_list = app.clone();
+            let pending = tokio::task::spawn_blocking(move || -> Result<(Vec<(String, String, Option<String>)>, u64), String> {
+                let conn = four_domains::open_v2(&app_list)?;
+                crate::performers::list_performers_missing_profile(&conn, limit).map_err(|e| e.to_string())
+            }).await;
+            match pending {
+                Ok(Ok((items, total_missing))) => {
+                    let mut enriched: u64 = 0;
+                    let mut failed: u64 = 0;
+                    for (id, name, existing_url) in items {
+                        match crate::performers::fetch_performer_enrichment(&name, existing_url.as_deref()).await {
+                            Ok(info) => {
+                                let app_save = app.clone();
+                                let saved = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                                    let conn = four_domains::open_v2(&app_save)?;
+                                    crate::performers::apply_performer_enrichment(&conn, &id, &info, false)
+                                        .map_err(|e| e.to_string())?;
+                                    Ok(())
+                                }).await;
+                                if matches!(saved, Ok(Ok(()))) { enriched += 1; } else { failed += 1; }
+                            }
+                            Err(_) => { failed += 1; }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    }
+                    result_response(Ok(serde_json::json!({
+                        "enriched": enriched,
+                        "failed": failed,
+                        "remaining": total_missing.saturating_sub(enriched),
+                    })))
+                }
+                Ok(Err(e)) => error_response(&e),
+                Err(e) => error_response(&e.to_string()),
+            }
+        }
         "get_movie_performer" | "update_movie_performer" | "set_movie_performer_status" => {
             let operation = command.to_owned();
             let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -891,6 +958,122 @@ async fn dispatch_command(
                     crate::performers::update_performer(&conn, &id, name, &aliases, avatar.as_deref(), profile.as_deref()).map_err(|e| e.to_string())?
                 };
                 serde_json::to_value(person).map_err(|e| e.to_string())
+            }).await
+        }
+        "list_movie_assets" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::list_movie_assets(&conn, &number)
+                    .map_err(|e| format!("获取影片分片失败：{e}"))
+            }).await
+        }
+        "get_related_movies_grouped" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let limit = payload.get("limitPerGroup").and_then(Value::as_u64).unwrap_or(8) as u32;
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::get_related_movies_grouped(&conn, &number, limit)
+                    .map_err(|e| format!("获取分区关联推荐失败：{e}"))
+            }).await
+        }
+        "get_performer_enrich_stats" => {
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::performers::get_performer_enrich_stats(&conn)
+                    .map_err(|e| format!("获取演员资料统计失败：{e}"))
+            }).await
+        }
+        "get_performer_enrich_progress" => {
+            result_response(Ok(crate::performers::get_performer_enrich_progress()))
+        }
+        "start_performer_enrich" => {
+            let force_all = payload.get("forceAll").and_then(Value::as_bool).unwrap_or(false);
+            let app_clone = app.clone();
+            result_response(crate::performers::start_performer_enrich_task(
+                move || four_domains::open_v2(&app_clone),
+                force_all,
+            ))
+        }
+        "pause_performer_enrich" => {
+            result_response(Ok(crate::performers::pause_performer_enrich()))
+        }
+        "resume_performer_enrich" => {
+            result_response(Ok(crate::performers::resume_performer_enrich()))
+        }
+        "stop_performer_enrich" => {
+            result_response(Ok(crate::performers::stop_performer_enrich()))
+        }
+        "get_random_featured_movies" => {
+            let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(20) as u32;
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::get_random_featured_movies(&conn, limit)
+                    .map_err(|e| format!("获取随机推荐影片失败：{e}"))
+            }).await
+        }
+        "ignore_unrecognized_video" => {
+            let asset_id = payload.get("assetId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::ignore_unrecognized_video(&conn, &asset_id)
+                    .map_err(|e| format!("忽略视频失败：{e}"))
+            }).await
+        }
+        "sync_remote_and_reconcile" => {
+            let auto_scrape = payload.get("autoScrape").and_then(Value::as_bool).unwrap_or(false);
+            let mode = payload.get("mode").and_then(Value::as_str).unwrap_or("fast").to_ascii_lowercase();
+            let app_wl = app.clone();
+            let mode_for_paths = mode.clone();
+            let paths_res = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+                let conn = four_domains::open_v2(&app_wl)?;
+                if mode_for_paths == "issues" {
+                    crate::jav_scraper::issue_and_unrecognized_parent_dirs(&conn).map_err(|e| e.to_string())
+                } else {
+                    crate::jav_scraper::get_scrape_whitelist(&conn).map_err(|e| e.to_string())
+                }
+            }).await;
+            let paths = match paths_res {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => return error_response(&e),
+                Err(e) => return error_response(&e.to_string()),
+            };
+            let (recursive, incremental) = match mode.as_str() {
+                "issues" => (false, false),
+                "deep" => (true, false),
+                _ => (true, true),
+            };
+            let (scanned_dirs, added, updated, removed) = match four_domains::sync_whitelisted_paths(
+                app.clone(),
+                app.state::<MediaLibraryState>(),
+                &paths,
+                recursive,
+                incremental,
+            ).await {
+                Ok(counts) => counts,
+                Err(e) => return error_response(&e),
+            };
+            let app_rec = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app_rec)?;
+                let report = crate::jav_scraper::reconcile_movie_library_changes(
+                    &conn,
+                    scanned_dirs,
+                    added,
+                    updated,
+                    removed,
+                ).map_err(|e| format!("对账清理失败：{e}"))?;
+                if auto_scrape && report.pending_new_count > 0 {
+                    if let Ok(db_path) = four_domains::v2_path(&app_rec) {
+                        let _ = crate::jav_scraper::start_batch_scrape_engine(db_path.to_string_lossy().to_string());
+                    }
+                }
+                Ok(report)
             }).await
         }
         "list_movie_metadata" => {

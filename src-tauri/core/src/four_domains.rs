@@ -867,6 +867,93 @@ pub async fn refresh_domain_path(
     scan_path_v2(app, state, domain, path).await
 }
 
+/// Synchronize the specified paths against the remote provider (115 / CloudDrive2),
+/// returning `(scanned_dirs, added, updated, missing_or_deleted)`.
+/// - `recursive = true, incremental = true` -> fast incremental sync (skips unchanged subdirs)
+/// - `recursive = true, incremental = false` -> deep full sync (concurrent 4x)
+/// - `recursive = false, incremental = false` -> targeted single-level refresh (e.g. failed-item parent dirs)
+pub async fn sync_whitelisted_paths(
+    app: AppHandle,
+    state: State<'_, media_library::MediaLibraryState>,
+    paths: &[String],
+    recursive: bool,
+    incremental: bool,
+) -> Result<(usize, i64, i64, i64), String> {
+    ensure_v2(&app)?;
+    let domain_roots: Vec<(String, String)> = {
+        let conn = open_v2(&app)?;
+        let mut list = Vec::new();
+        for d in ["vault", "recent", "pending"] {
+            if let Ok((_, rpath)) = domain_root(&conn, d) {
+                let clean = rpath.trim().trim_end_matches('/').to_string();
+                if !clean.is_empty() {
+                    list.push((d.to_string(), clean));
+                }
+            }
+        }
+        list
+    };
+
+    // Normalize paths; when recursive, collapse nested subpaths so we don't scan the same subtree twice.
+    let mut normalized: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim().trim_end_matches('/').to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    let targets: Vec<String> = if recursive {
+        let mut collapsed: Vec<String> = Vec::new();
+        for p in normalized {
+            if !collapsed.iter().any(|parent| p == *parent || p.starts_with(&format!("{parent}/"))) {
+                collapsed.push(p);
+            }
+        }
+        collapsed
+    } else {
+        normalized
+    };
+
+    if targets.is_empty() {
+        if !recursive {
+            return Ok((0, 0, 0, 0));
+        }
+        let summary = scan_provider_tree(app, state, "vault", "", true, incremental).await?;
+        return Ok((1, summary.added, summary.updated, summary.missing + summary.deleted));
+    }
+
+    let mut scanned_dirs = 0usize;
+    let mut added = 0i64;
+    let mut updated = 0i64;
+    let mut removed = 0i64;
+
+    for target in targets {
+        let matched_domain = domain_roots
+            .iter()
+            .find(|(_, root)| target == *root || target.starts_with(&format!("{root}/")))
+            .map(|(d, _)| d.as_str());
+        if let Some(domain) = matched_domain {
+            let summary = scan_provider_tree(app.clone(), state.clone(), domain, &target, recursive, incremental).await?;
+            scanned_dirs += 1;
+            added += summary.added;
+            updated += summary.updated;
+            removed += summary.missing + summary.deleted;
+        } else if recursive {
+            for (domain, root) in &domain_roots {
+                if root.starts_with(&format!("{target}/")) || root == &target {
+                    let summary = scan_provider_tree(app.clone(), state.clone(), domain, root, true, incremental).await?;
+                    scanned_dirs += 1;
+                    added += summary.added;
+                    updated += summary.updated;
+                    removed += summary.missing + summary.deleted;
+                }
+            }
+        }
+    }
+
+    Ok((scanned_dirs, added, updated, removed))
+}
+
 
 fn domain_media_type(domain: &str, path: &str) -> Option<&'static str> {
     let extension = path
@@ -962,46 +1049,63 @@ async fn scan_provider_tree(
     let mut files: Vec<(String, String, String, Option<String>, String, i64, Option<String>, Option<String>)> = Vec::new();
     let mut listings = Vec::new();
     let fetched: Result<(), String> = async {
-    while let Some(directory) = queue.pop_front() {
-        tokio::task::yield_now().await;
-        if !visited.insert(directory.clone()) {
-            continue;
+    const DIR_CONCURRENCY: usize = 4;
+    while !queue.is_empty() {
+        let mut batch = Vec::with_capacity(DIR_CONCURRENCY);
+        while batch.len() < DIR_CONCURRENCY {
+            let Some(directory) = queue.pop_front() else { break; };
+            if visited.insert(directory.clone()) {
+                batch.push(directory);
+            }
         }
-        let entries = media_library::list_provider_entries(state.clone(), directory.clone()).await
-            .map_err(|error| format!("目录读取失败 {directory}: {error}"))?;
-        validate_provider_listing(&directory, &entries)?;
-        listings.push((directory.clone(), entries.clone()));
-        if recursive { tokio::time::sleep(Duration::from_millis(30)).await; }
-        for entry in entries {
-            if entry.is_directory {
-                if recursive {
-                    if incremental {
-                        if let Some((cached_mod, cached_etag)) = cached_subdirs.get(&entry.path) {
-                            let mod_match = entry.modified_at.is_some() && entry.modified_at == *cached_mod;
-                            let etag_match = entry.etag.is_some() && entry.etag == *cached_etag;
-                            if mod_match || etag_match {
-                                // 目录修改时间或 etag 一致，且历史快照完整，跳过此子树递归
-                                continue;
+        if batch.is_empty() {
+            break;
+        }
+        let futures = batch.into_iter().map(|directory| {
+            let state_ref = state.clone();
+            async move {
+                let res = media_library::list_provider_entries(state_ref, directory.clone())
+                    .await
+                    .map_err(|error| format!("目录读取失败 {directory}: {error}"));
+                (directory, res)
+            }
+        });
+        let results = futures_util::future::join_all(futures).await;
+        for (directory, res) in results {
+            let entries = res?;
+            validate_provider_listing(&directory, &entries)?;
+            listings.push((directory.clone(), entries.clone()));
+            for entry in entries {
+                if entry.is_directory {
+                    if recursive {
+                        if incremental {
+                            if let Some((cached_mod, cached_etag)) = cached_subdirs.get(&entry.path) {
+                                let mod_match = entry.modified_at.is_some() && entry.modified_at == *cached_mod;
+                                let etag_match = entry.etag.is_some() && entry.etag == *cached_etag;
+                                if mod_match || etag_match {
+                                    // 目录修改时间或 etag 一致，且历史快照完整，跳过此子树递归
+                                    continue;
+                                }
                             }
                         }
+                        queue.push_back(entry.path);
                     }
-                    queue.push_back(entry.path);
-                }
-            } else if let Some(media_type) = domain_media_type(domain, &entry.path) {
-                let name = entry.name.clone();
-                let parent = parent_path(&entry.path);
-                files.push((
-                    entry.path,
-                    name,
-                    parent,
-                    entry.etag,
-                    media_type.to_owned(),
-                    entry.size_bytes,
-                    entry.modified_at,
-                    None,
-                ));
-                if files.len() > 250_000 {
-                    return Err("目录超过 250000 项".into());
+                } else if let Some(media_type) = domain_media_type(domain, &entry.path) {
+                    let name = entry.name.clone();
+                    let parent = parent_path(&entry.path);
+                    files.push((
+                        entry.path,
+                        name,
+                        parent,
+                        entry.etag,
+                        media_type.to_owned(),
+                        entry.size_bytes,
+                        entry.modified_at,
+                        None,
+                    ));
+                    if files.len() > 250_000 {
+                        return Err("目录超过 250000 项".into());
+                    }
                 }
             }
         }
