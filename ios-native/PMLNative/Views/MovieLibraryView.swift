@@ -112,7 +112,14 @@ public struct MovieLibraryView: View {
                 assetId: movie.assetId,
                 fileName: movie.title,
                 remotePath: nil,
-                onPlay: { target in Task { await playAsset(target, title: movie.title) } },
+                onPlay: { target in
+                    selectedMovie = nil
+                    selectedPerformer = nil
+                    Task {
+                        try? await Task.sleep(nanoseconds: 380_000_000)
+                        await playAsset(target, title: movie.title)
+                    }
+                },
                 onFilterActor: { actorName in
                     mode = .movies
                     selectedActor = actorName
@@ -135,7 +142,12 @@ public struct MovieLibraryView: View {
                     resetAndLoad()
                 },
                 onPlay: { targetId, title in
-                    Task { await playAsset(targetId, title: title) }
+                    selectedMovie = nil
+                    selectedPerformer = nil
+                    Task {
+                        try? await Task.sleep(nanoseconds: 380_000_000)
+                        await playAsset(targetId, title: title)
+                    }
                 }
             )
             .environmentObject(model)
@@ -693,10 +705,11 @@ public struct MovieLibraryView: View {
                     if batchProgress?.running == true {
                         Button("停止影片刮削", role: .destructive) { Task { await stopScrape() } }
                     } else {
-                        Button(syncingRemote ? "正在同步 115…" : "快速同步 115 并增量刮削") {
+                        Button(syncingRemote ? "正在同步 115…" : "同步 115 变动并仅刮新增（跳过失败项）") {
                             Task { await runRemoteSync(autoScrape: true, mode: "fast") }
                         }
                         .disabled(syncingRemote)
+                        Button("仅刮变动/新增（跳过失败项）") { Task { await startManualScrape(mode: "new") } }
                         Button("快速检测 115 变动") {
                             Task { await runRemoteSync(autoScrape: false, mode: "fast") }
                         }
@@ -709,9 +722,9 @@ public struct MovieLibraryView: View {
                             Task { await runRemoteSync(autoScrape: false, mode: "deep") }
                         }
                         .disabled(syncingRemote)
-                        Button("仅本地增量刮削") { Task { await startManualScrape(failedOnly: false) } }
+                        Button("全量增量刮削（含失败项）") { Task { await startManualScrape(mode: "all") } }
                         if (batchStats?.failedCount ?? 0) > 0 {
-                            Button("仅重试失败项（含 FC2 兜底）") { Task { await startManualScrape(failedOnly: true) } }
+                            Button("仅重试失败项（含 FC2 兜底）") { Task { await startManualScrape(mode: "failed") } }
                         }
                     }
                 }
@@ -773,9 +786,15 @@ public struct MovieLibraryView: View {
         }
     }
 
-    private func startManualScrape(failedOnly: Bool) async {
+    private func startManualScrape(mode: String) async {
         guard let c = model.apiClient else { return }
-        if failedOnly { try? await c.startFailedBatchScrape() } else { try? await c.startBatchScrape() }
+        if mode == "failed" {
+            try? await c.startFailedBatchScrape()
+        } else if mode == "new" {
+            try? await c.startNewBatchScrape()
+        } else {
+            try? await c.startBatchScrape()
+        }
         batchProgress = try? await c.getBatchScrapeProgress()
         beginScrapePolling()
     }

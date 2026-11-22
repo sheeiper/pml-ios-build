@@ -777,6 +777,13 @@ async fn dispatch_command(
                 crate::jav_scraper::start_failed_batch_scrape_engine(p.to_string_lossy().to_string())
             }).await
         }
+        "start_batch_scrape_new" => {
+            let app = app.clone();
+            blocking_result_response(move || {
+                let p = four_domains::v2_path(&app)?;
+                crate::jav_scraper::start_new_batch_scrape_engine(p.to_string_lossy().to_string())
+            }).await
+        }
         "pause_batch_scrape" => {
             crate::jav_scraper::pause_batch_scrape();
             result_response(Ok(crate::jav_scraper::get_batch_scrape_progress()))
@@ -1079,6 +1086,7 @@ async fn dispatch_command(
         }
         "sync_remote_and_reconcile" => {
             let auto_scrape = payload.get("autoScrape").and_then(Value::as_bool).unwrap_or(false);
+            let skip_failed = payload.get("skipFailed").and_then(Value::as_bool).unwrap_or(true);
             let mode = payload.get("mode").and_then(Value::as_str).unwrap_or("fast").to_ascii_lowercase();
             let app_wl = app.clone();
             let mode_for_paths = mode.clone();
@@ -1122,7 +1130,12 @@ async fn dispatch_command(
                 ).map_err(|e| format!("对账清理失败：{e}"))?;
                 if auto_scrape && report.pending_new_count > 0 {
                     if let Ok(db_path) = four_domains::v2_path(&app_rec) {
-                        let _ = crate::jav_scraper::start_batch_scrape_engine(db_path.to_string_lossy().to_string());
+                        let path_str = db_path.to_string_lossy().to_string();
+                        if skip_failed {
+                            let _ = crate::jav_scraper::start_new_batch_scrape_engine(path_str);
+                        } else {
+                            let _ = crate::jav_scraper::start_batch_scrape_engine(path_str);
+                        }
                     }
                 }
                 Ok(report)

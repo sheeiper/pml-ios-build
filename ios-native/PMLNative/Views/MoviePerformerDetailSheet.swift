@@ -132,6 +132,8 @@ struct MoviePerformerDetailSheet: View {
             }
             .sheet(item: $selectedMovie) { movie in
                 MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
+                    selectedMovie = nil
+                    dismiss()
                     onPlay?(targetId, movie.title)
                 }
                 .environmentObject(model)

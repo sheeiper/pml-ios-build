@@ -385,7 +385,116 @@ pub fn list_movie_subtitles(conn: &Connection, number: &str) -> Result<Vec<Saved
     rows.collect()
 }
 
-pub fn list_subtitles_for_asset(conn: &Connection, asset_id: &str) -> Result<Vec<SavedMovieSubtitle>, rusqlite::Error> {
+#[derive(Debug, Clone)]
+pub struct ResolvedAssetSubtitle {
+    pub subtitle: SavedMovieSubtitle,
+    pub display_name: String,
+    pub default_offset_seconds: Option<f64>,
+    pub priority: u8,
+}
+
+/// Detect 1-based part index (CD1/CD2, Part1/Part2, P1/P2, Disc1/Disc2, -A/-B) from a subtitle name.
+/// Returns `None` if the subtitle appears to be a single full-movie subtitle rather than segmented.
+pub fn detect_subtitle_part_index(name: &str) -> Option<usize> {
+    // Strip trailing language label like "[简体中文]" and extension ".srt"/".vtt"
+    let mut cleaned = name.to_ascii_lowercase();
+    if let Some(pos) = cleaned.find('[') {
+        cleaned.truncate(pos);
+    }
+    cleaned = cleaned.trim().to_string();
+    for ext in [".srt", ".vtt", ".ass"] {
+        if let Some(stripped) = cleaned.strip_suffix(ext) {
+            cleaned = stripped.trim().to_string();
+        }
+    }
+
+    let tokens: Vec<&str> = cleaned
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    for (idx, tok) in tokens.iter().enumerate() {
+        for prefix in ["part", "disc", "disk", "cd", "pt", "p"] {
+            if let Some(rest) = tok.strip_prefix(prefix) {
+                if rest.len() == 1 {
+                    if let Ok(n) = rest.parse::<usize>() {
+                        if (1..=9).contains(&n) {
+                            return Some(n);
+                        }
+                    }
+                } else if rest.is_empty() && prefix != "p" {
+                    if let Some(next_tok) = tokens.get(idx + 1) {
+                        if next_tok.len() == 1 {
+                            if let Ok(n) = next_tok.parse::<usize>() {
+                                if (1..=9).contains(&n) {
+                                    return Some(n);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Trailing single letter part marker: e.g. "SSIS-001-A" / "FC2-1234567_B"
+    if let Some(last) = tokens.last() {
+        if last.len() == 1 {
+            match last.as_bytes()[0] {
+                b'a' => return Some(1),
+                b'b' => return Some(2),
+                b'c' => return Some(3),
+                b'd' => return Some(4),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn parse_srt_timestamp_secs(raw: &str) -> Option<f64> {
+    let clean = raw.trim().replace(',', ".");
+    let mut parts = clean.split(':');
+    let a: f64 = parts.next()?.trim().parse().ok()?;
+    let b: f64 = parts.next()?.trim().parse().ok()?;
+    if let Some(c_str) = parts.next() {
+        let c: f64 = c_str.split_whitespace().next()?.parse().ok()?;
+        Some(a * 3600.0 + b * 60.0 + c)
+    } else {
+        Some(a * 60.0 + b)
+    }
+}
+
+fn srt_max_end_seconds(srt: &str) -> f64 {
+    let mut max_end = 0.0f64;
+    for line in srt.lines() {
+        if let Some((_, rhs)) = line.split_once("-->") {
+            if let Some(secs) = parse_srt_timestamp_secs(rhs) {
+                if secs > max_end {
+                    max_end = secs;
+                }
+            }
+        }
+    }
+    max_end
+}
+
+fn format_hms_short(seconds: f64) -> String {
+    let total = seconds.round().max(0.0) as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+pub fn list_subtitles_for_asset_with_context(
+    conn: &Connection,
+    asset_id: &str,
+) -> Result<Vec<ResolvedAssetSubtitle>, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
     let number: Option<String> = conn
         .query_row(
@@ -397,7 +506,124 @@ pub fn list_subtitles_for_asset(conn: &Connection, asset_id: &str) -> Result<Vec
         )
         .optional()?;
     let Some(num) = number else { return Ok(Vec::new()); };
-    list_movie_subtitles(conn, &num)
+    let upper = normalize_jav_number(&num).unwrap_or_else(|| num.trim().to_uppercase());
+
+    // Inspect all video parts belonging to this movie to determine whether it is multi-part
+    // and compute the cumulative duration of preceding parts.
+    let parts = list_movie_assets(conn, &upper).unwrap_or_default();
+    let total_parts = parts.len();
+    let current_part_idx = parts
+        .iter()
+        .position(|p| p.asset_id == asset_id)
+        .map(|i| i + 1)
+        .unwrap_or(1);
+
+    let mut prior_duration = 0.0f64;
+    let mut prior_durations_valid = current_part_idx > 1 && total_parts > 1;
+    if prior_durations_valid {
+        for part in parts.iter().take(current_part_idx - 1) {
+            let d = part.duration_seconds.unwrap_or(0.0);
+            if d > 30.0 {
+                prior_duration += d;
+            } else {
+                prior_durations_valid = false;
+                break;
+            }
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, number, name, lang, source, created_at, content FROM movie_subtitles
+         WHERE number = ?1 ORDER BY created_at DESC"
+    )?;
+    let rows = stmt.query_map(params![upper], |r| {
+        Ok((
+            SavedMovieSubtitle {
+                id: r.get(0)?,
+                number: r.get(1)?,
+                name: r.get(2)?,
+                lang: r.get(3)?,
+                source: r.get(4)?,
+                created_at: r.get(5)?,
+            },
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+
+    let mut resolved: Vec<ResolvedAssetSubtitle> = Vec::new();
+    for item in rows {
+        let (sub, content) = item?;
+        let lang_tag = match sub.lang.as_str() {
+            "zh-CN" => "简体中文",
+            "zh-TW" => "繁体中文",
+            other => other,
+        };
+        if total_parts <= 1 {
+            resolved.push(ResolvedAssetSubtitle {
+                display_name: format!("[{lang_tag}] {}", sub.name),
+                subtitle: sub,
+                default_offset_seconds: None,
+                priority: 0,
+            });
+            continue;
+        }
+
+        match detect_subtitle_part_index(&sub.name) {
+            Some(sub_part) if sub_part == current_part_idx => {
+                resolved.push(ResolvedAssetSubtitle {
+                    display_name: format!("[{lang_tag} · P{sub_part}分段匹配] {}", sub.name),
+                    subtitle: sub,
+                    default_offset_seconds: Some(0.0),
+                    priority: 0,
+                });
+            }
+            Some(sub_part) => {
+                resolved.push(ResolvedAssetSubtitle {
+                    display_name: format!("[{lang_tag} · P{sub_part}分段] {}", sub.name),
+                    subtitle: sub,
+                    default_offset_seconds: Some(0.0),
+                    priority: 2,
+                });
+            }
+            None => {
+                // Full single-file subtitle on a multi-part video
+                let max_end = srt_max_end_seconds(&content);
+                if current_part_idx > 1 && prior_durations_valid && max_end > prior_duration + 20.0 {
+                    resolved.push(ResolvedAssetSubtitle {
+                        display_name: format!(
+                            "[{lang_tag} · 完整字幕·自动续接 +{}] {}",
+                            format_hms_short(prior_duration),
+                            sub.name
+                        ),
+                        subtitle: sub,
+                        default_offset_seconds: Some(prior_duration),
+                        priority: 1,
+                    });
+                } else {
+                    resolved.push(ResolvedAssetSubtitle {
+                        display_name: format!("[{lang_tag} · 完整字幕] {}", sub.name),
+                        subtitle: sub,
+                        default_offset_seconds: Some(0.0),
+                        priority: 1,
+                    });
+                }
+            }
+        }
+    }
+
+    resolved.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| b.subtitle.created_at.cmp(&a.subtitle.created_at))
+    });
+    Ok(resolved)
+}
+
+pub fn list_subtitles_for_asset(conn: &Connection, asset_id: &str) -> Result<Vec<SavedMovieSubtitle>, rusqlite::Error> {
+    Ok(list_subtitles_for_asset_with_context(conn, asset_id)?
+        .into_iter()
+        .map(|r| r.subtitle)
+        .collect())
 }
 
 pub fn get_movie_subtitle_content(conn: &Connection, id: &str) -> Result<Option<(String, String)>, rusqlite::Error> {
@@ -2485,15 +2711,26 @@ pub fn get_batch_scrape_stats(conn: &Connection) -> Result<BatchScrapeStats, rus
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchScrapeMode {
+    AllUnscraped,
+    FailedOnly,
+    NewOnly,
+}
+
 pub fn start_batch_scrape_engine(db_path: String) -> Result<(), String> {
-    start_batch_scrape_with_mode(db_path, false)
+    start_batch_scrape_with_mode(db_path, BatchScrapeMode::AllUnscraped)
 }
 
 pub fn start_failed_batch_scrape_engine(db_path: String) -> Result<(), String> {
-    start_batch_scrape_with_mode(db_path, true)
+    start_batch_scrape_with_mode(db_path, BatchScrapeMode::FailedOnly)
 }
 
-fn start_batch_scrape_with_mode(db_path: String, failed_only: bool) -> Result<(), String> {
+pub fn start_new_batch_scrape_engine(db_path: String) -> Result<(), String> {
+    start_batch_scrape_with_mode(db_path, BatchScrapeMode::NewOnly)
+}
+
+fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Result<(), String> {
     {
         let mut g = batch_progress_cell().lock().map_err(|e| e.to_string())?;
         if g.running {
@@ -2562,15 +2799,28 @@ fn start_batch_scrape_with_mode(db_path: String, failed_only: bool) -> Result<()
         };
         let mut queue = Vec::new();
         for (number, assets) in &number_assets {
-            if failed_only {
-                match conn.query_row("SELECT EXISTS(SELECT 1 FROM scrape_failures WHERE number=?1)", params![number], |row| row.get::<_, bool>(0)) {
-                    Ok(true) => {},
-                    Ok(false) => continue,
-                    Err(e) => {
-                        if let Ok(mut g) = batch_progress_cell().lock() { g.running = false; g.last_error = Some(e.to_string()); }
-                        return;
+            match mode {
+                BatchScrapeMode::FailedOnly => {
+                    match conn.query_row("SELECT EXISTS(SELECT 1 FROM scrape_failures WHERE number=?1)", params![number], |row| row.get::<_, bool>(0)) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            if let Ok(mut g) = batch_progress_cell().lock() { g.running = false; g.last_error = Some(e.to_string()); }
+                            return;
+                        }
                     }
                 }
+                BatchScrapeMode::NewOnly => {
+                    match conn.query_row("SELECT EXISTS(SELECT 1 FROM scrape_failures WHERE number=?1)", params![number], |row| row.get::<_, bool>(0)) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            if let Ok(mut g) = batch_progress_cell().lock() { g.running = false; g.last_error = Some(e.to_string()); }
+                            return;
+                        }
+                    }
+                }
+                BatchScrapeMode::AllUnscraped => {}
             }
             match get_movie_metadata(&conn, number) {
                 Ok(Some(_)) => {

@@ -10868,6 +10868,8 @@ pub struct SubtitleTrack {
     pub name: String,
     pub path: String,
     pub format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_offset_seconds: Option<f64>,
 }
 
 fn pml_subtitle_file_name(path: &str) -> &str {
@@ -10886,17 +10888,13 @@ pub async fn find_asset_subtitles(
 ) -> Result<Vec<SubtitleTrack>, String> {
     let mut tracks: Vec<SubtitleTrack> = Vec::new();
     if let Ok(v2_conn) = crate::four_domains::open_v2(&app) {
-        if let Ok(saved) = crate::jav_scraper::list_subtitles_for_asset(&v2_conn, &asset_id) {
-            for sub in saved {
-                let lang_tag = match sub.lang.as_str() {
-                    "zh-CN" => "简体中文",
-                    "zh-TW" => "繁体中文",
-                    other => other,
-                };
+        if let Ok(saved) = crate::jav_scraper::list_subtitles_for_asset_with_context(&v2_conn, &asset_id) {
+            for resolved in saved {
                 tracks.push(SubtitleTrack {
-                    name: format!("[{lang_tag}] {}", sub.name),
-                    path: format!("pml-sub://{}", sub.id),
+                    name: resolved.display_name,
+                    path: format!("pml-sub://{}", resolved.subtitle.id),
                     format: "srt".to_string(),
+                    default_offset_seconds: resolved.default_offset_seconds,
                 });
             }
         }
@@ -10962,6 +10960,7 @@ pub async fn find_asset_subtitles(
             name: name.to_string(),
             path: entry.remote_path.clone(),
             format: ext.to_string(),
+            default_offset_seconds: None,
         });
     }
     remote_tracks.sort_by(|a, b| a.name.cmp(&b.name));

@@ -10,6 +10,7 @@ struct SubtitleTrack: Decodable, Identifiable {
     let name: String
     let path: String
     let format: String
+    let defaultOffsetSeconds: Double?
 
     var id: String { path }
 }

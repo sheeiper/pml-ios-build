@@ -17,7 +17,7 @@ public struct MovieDetailSheet: View {
     @State private var metadata: MovieMetadata?
     @State private var parts: [MovieAssetPart] = []
     @State private var relatedGrouped: RelatedMoviesGrouped?
-    @State private var selectedSampleURL: String?
+    @State private var selectedSampleIndex: Int?
     @State private var selectedPerformer: MoviePerformer?
     @State private var currentNumber: String?
     @State private var savedSubtitles: [SavedMovieSubtitle] = []
@@ -329,10 +329,10 @@ public struct MovieDetailSheet: View {
 
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(spacing: 8) {
-                                        ForEach(meta.sampleImages, id: \.self) { sample in
+                                        ForEach(Array(meta.sampleImages.enumerated()), id: \.offset) { idx, sample in
                                             if let url = appModel.proxyScraperImageURL(rawUrl: sample) {
                                                 Button {
-                                                    selectedSampleURL = sample
+                                                    selectedSampleIndex = idx
                                                 } label: {
                                                     CachedImageView(url: url, contentMode: .fill, minHeight: 100, maxPixel: 540)
                                                         .frame(width: 150, height: 100)
@@ -383,32 +383,25 @@ public struct MovieDetailSheet: View {
             .sheet(item: $selectedPerformer) { person in
                 MoviePerformerDetailSheet(
                     performer: person,
-                    onFilterMovies: onFilterActor.map { handler in { actorName in dismiss(); handler(actorName) } },
+                    onFilterMovies: onFilterActor.map { handler in { actorName in selectedPerformer = nil; dismiss(); handler(actorName) } },
                     onPlay: { targetId, _ in
+                        selectedPerformer = nil
                         dismiss()
                         onPlay?(targetId)
                     }
                 )
                 .environmentObject(appModel)
             }
-            .sheet(item: Binding<SampleImageItem?>(
-                get: { selectedSampleURL.map { SampleImageItem(url: $0) } },
-                set: { selectedSampleURL = $0?.url }
-            )) { item in
-                if let u = appModel.proxyScraperImageURL(rawUrl: item.url) {
-                    NavigationStack {
-                        ZStack {
-                            Color.black.ignoresSafeArea()
-                            CachedImageView(url: u, contentMode: .fit, minHeight: 360, maxPixel: 1800)
-                        }
-                        .toolbar {
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button("关闭") { selectedSampleURL = nil }
-                                    .foregroundStyle(.white)
-                            }
-                        }
-                    }
-                }
+            .fullScreenCover(item: Binding<SampleGallerySelection?>(
+                get: { selectedSampleIndex.map { SampleGallerySelection(index: $0) } },
+                set: { selectedSampleIndex = $0?.index }
+            )) { selection in
+                SampleGalleryPagerView(
+                    images: metadata?.sampleImages ?? [],
+                    initialIndex: selection.index,
+                    onClose: { selectedSampleIndex = nil }
+                )
+                .environmentObject(appModel)
             }
             .task {
                 currentNumber = number
@@ -719,7 +712,69 @@ public struct MovieDetailSheet: View {
     }
 }
 
-private struct SampleImageItem: Identifiable {
-    var id: String { url }
-    let url: String
+private struct SampleGallerySelection: Identifiable {
+    var id: Int { index }
+    let index: Int
+}
+
+private struct SampleGalleryPagerView: View {
+    @EnvironmentObject private var appModel: AppModel
+    let images: [String]
+    let onClose: () -> Void
+    @State private var currentIndex: Int
+
+    init(images: [String], initialIndex: Int, onClose: @escaping () -> Void) {
+        self.images = images
+        self.onClose = onClose
+        _currentIndex = State(initialValue: min(max(0, initialIndex), max(0, images.count - 1)))
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black.ignoresSafeArea()
+
+            if !images.isEmpty {
+                TabView(selection: $currentIndex) {
+                    ForEach(Array(images.enumerated()), id: \.offset) { idx, raw in
+                        Group {
+                            if let url = appModel.proxyScraperImageURL(rawUrl: raw) {
+                                CachedImageView(url: url, contentMode: .fit, minHeight: 360, maxPixel: 1800)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            } else {
+                                Color.black
+                            }
+                        }
+                        .tag(idx)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .automatic))
+                .ignoresSafeArea()
+            }
+
+            HStack {
+                Text("\(min(currentIndex + 1, max(images.count, 1))) / \(images.count)")
+                    .font(.subheadline.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial, in: Capsule())
+
+                Spacer()
+
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+        }
+    }
 }

@@ -606,6 +606,11 @@ struct GestureVideoPlayerSheet: View {
             let text = try await client.subtitleText(remotePath: track.path)
             subtitleCues = SubtitleParser.parse(text)
             subtitleTitle = track.name
+            let offset = track.defaultOffsetSeconds ?? 0
+            subtitleOffset = offset
+            if offset >= 1 {
+                showHUD("字幕已自动续接 +\(pmlFormatTime(Int64(offset)))", seconds: 2.2)
+            }
         } catch {
             subtitleCues = []
             subtitleTitle = nil

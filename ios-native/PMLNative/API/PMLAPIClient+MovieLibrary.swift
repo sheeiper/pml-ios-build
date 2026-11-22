@@ -29,12 +29,16 @@ extension PMLAPIClient {
         try await command("ignore_unrecognized_video", arguments: ["assetId": assetId])
     }
 
-    func syncRemoteAndReconcile(autoScrape: Bool = false, mode: String = "fast") async throws -> RemoteSyncReport {
-        try await command("sync_remote_and_reconcile", arguments: ["autoScrape": autoScrape, "mode": mode], as: RemoteSyncReport.self)
+    func syncRemoteAndReconcile(autoScrape: Bool = false, mode: String = "fast", skipFailed: Bool = true) async throws -> RemoteSyncReport {
+        try await command("sync_remote_and_reconcile", arguments: ["autoScrape": autoScrape, "mode": mode, "skipFailed": skipFailed], as: RemoteSyncReport.self)
     }
 
     func startFailedBatchScrape() async throws {
         try await command("start_batch_scrape_failed")
+    }
+
+    func startNewBatchScrape() async throws {
+        try await command("start_batch_scrape_new")
     }
 
     func listMoviePerformers(query: String = "", limit: Int = 50, offset: Int = 0) async throws -> MoviePerformerList {
