@@ -29,6 +29,7 @@ struct MoviePerformerDetailSheet: View {
     @State private var recentError: String?
     @State private var includeOwnedRecent = false
     @State private var selectedReleaseForMagnets: PerformerRecentRelease?
+    @State private var preview: PreviewItem?
 
     var body: some View {
         NavigationStack {
@@ -175,11 +176,25 @@ struct MoviePerformerDetailSheet: View {
             .sheet(item: $selectedMovie) { movie in
                 MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
                     selectedMovie = nil
-                    if onBack == nil {
-                        dismiss()
+                    Task {
+                        try? await Task.sleep(nanoseconds: 400_000_000)
+                        await playAsset(targetId, title: movie.title)
                     }
                     onPlay?(targetId, movie.title)
                 }
+                .environmentObject(model)
+            }
+            .fullScreenCover(item: $preview) { item in
+                GestureVideoPlayerSheet(
+                    url: item.url,
+                    title: item.title,
+                    assetId: item.assetId,
+                    startAt: item.startAt,
+                    fallbackURL: item.fallbackURL,
+                    sourceLabel: item.sourceLabel,
+                    remotePath: item.remotePath
+                )
+                .id(item.id)
                 .environmentObject(model)
             }
             .fullScreenCover(isPresented: $showAvatarViewer) {
@@ -480,6 +495,11 @@ struct MoviePerformerDetailSheet: View {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func playAsset(_ assetId: String, title: String) async {
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else { return }
+        preview = PreviewItem(url: source.url, isVideo: true, assetId: assetId, title: title, fallbackURL: source.fallbackURL, sourceLabel: source.label, remotePath: nil)
     }
 }
 

@@ -28,6 +28,7 @@ public struct MovieDetailSheet: View {
     @State private var subtitleDownloadingId: String?
     @State private var subtitleDeletingId: String?
     @State private var copyToast: String?
+    @State private var showNoAssetAlert = false
 
     public init(
         number: String? = nil,
@@ -177,6 +178,8 @@ public struct MovieDetailSheet: View {
                                 if let targetId = parts.first?.assetId ?? meta.assetId ?? assetId {
                                     dismiss()
                                     onPlay?(targetId)
+                                } else {
+                                    showNoAssetAlert = true
                                 }
                             } label: {
                                 Label("立即播放", systemImage: "play.fill")
@@ -435,6 +438,11 @@ public struct MovieDetailSheet: View {
                     }
                 )
                 .environmentObject(appModel)
+            }
+            .alert("未找到本地视频文件", isPresented: $showNoAssetAlert) {
+                Button("知道了", role: .cancel) {}
+            } message: {
+                Text("该作品当前仅有影视百科资料，网盘或本地尚未匹配到对应的视频文件。可在影视库【数据管理】中执行增量同步。")
             }
             .fullScreenCover(item: Binding<SampleGallerySelection?>(
                 get: { selectedSampleIndex.map { SampleGallerySelection(index: $0) } },

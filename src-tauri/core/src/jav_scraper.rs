@@ -75,7 +75,8 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             content TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_movie_subtitles_number ON movie_subtitles(number);"
+        CREATE INDEX IF NOT EXISTS idx_movie_subtitles_number ON movie_subtitles(number);
+        CREATE INDEX IF NOT EXISTS idx_assets_media_missing ON assets(media_type, missing);"
     )?;
 
     // Automatically quarantine promotional clips and ad videos from unrecognized lists
@@ -2135,6 +2136,9 @@ pub struct RemoteSyncReport {
 pub fn issue_and_unrecognized_parent_dirs(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
     let whitelist = get_scrape_whitelist(conn)?;
+    if whitelist.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut fail_numbers = std::collections::HashSet::<String>::new();
     {
         let mut stmt = conn.prepare("SELECT number FROM scrape_failures")?;
@@ -2144,7 +2148,7 @@ pub fn issue_and_unrecognized_parent_dirs(conn: &Connection) -> Result<Vec<Strin
         }
     }
     let mut dirs = std::collections::BTreeSet::<String>::new();
-    let mut stmt = conn.prepare("SELECT file_name, remote_path, parent_path FROM assets WHERE missing = 0 AND media_type = 'video'")?;
+    let mut stmt = conn.prepare("SELECT file_name, remote_path, parent_path FROM assets WHERE media_type = 'video' AND missing = 0")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
     for row in rows.flatten() {
         let (file_name, remote_path, parent_path) = row;
@@ -2665,13 +2669,47 @@ pub fn is_path_whitelisted(conn: &Connection, path: &str) -> bool {
 
 fn whitelisted_number_assets(conn: &Connection) -> Result<(usize, std::collections::BTreeMap<String, Vec<String>>), rusqlite::Error> {
     let whitelist = get_scrape_whitelist(conn)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, file_name, remote_path, size_bytes FROM assets
-         WHERE missing = 0 AND media_type = 'video'
-           AND id NOT IN (SELECT asset_id FROM scrape_ignored_assets)
-         ORDER BY id"
-    )?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?)))?;
+    if whitelist.is_empty() {
+        return Ok((0, std::collections::BTreeMap::new()));
+    }
+
+    let has_root = whitelist.iter().any(|p| normalize_scrape_path(p).trim_matches('/').is_empty());
+    let mut sql = "SELECT id, file_name, remote_path, size_bytes FROM assets
+                   WHERE media_type = 'video' AND missing = 0
+                     AND id NOT IN (SELECT asset_id FROM scrape_ignored_assets)".to_string();
+    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+
+    if !has_root {
+        sql.push_str(" AND (");
+        let mut added_clause = false;
+        for p in &whitelist {
+            let clean = normalize_scrape_path(p);
+            let clean = clean.trim_end_matches('/').to_string();
+            if clean.is_empty() { continue; }
+            if added_clause { sql.push_str(" OR "); }
+            let like_pattern = format!("{}/%", clean);
+            sql.push_str(&format!("remote_path = ?{} OR remote_path LIKE ?{}", params_vec.len() + 1, params_vec.len() + 2));
+            params_vec.push(rusqlite::types::Value::Text(clean));
+            params_vec.push(rusqlite::types::Value::Text(like_pattern));
+            added_clause = true;
+        }
+        if added_clause {
+            sql.push(')');
+        } else {
+            // All whitelist entries were empty slashes; fall back to no filter
+            sql = "SELECT id, file_name, remote_path, size_bytes FROM assets
+                   WHERE media_type = 'video' AND missing = 0
+                     AND id NOT IN (SELECT asset_id FROM scrape_ignored_assets)".to_string();
+            params_vec.clear();
+        }
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rusqlite_params = rusqlite::params_from_iter(params_vec.iter());
+    let rows = stmt.query_map(rusqlite_params, |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
+    })?;
+
     let mut total = 0;
     let mut numbers = std::collections::BTreeMap::<String, Vec<String>>::new();
     for row in rows {
@@ -2679,7 +2717,9 @@ fn whitelisted_number_assets(conn: &Connection) -> Result<(usize, std::collectio
         if !whitelist.iter().any(|p| path_under(&path, p)) { continue; }
         if is_ad_or_promo_asset(&name, &path, size_bytes) { continue; }
         total += 1;
-        if let Some(number) = extract_jav_number_with_path(&name, &path) { numbers.entry(number).or_default().push(id); }
+        if let Some(number) = extract_jav_number_with_path(&name, &path) {
+            numbers.entry(number).or_default().push(id);
+        }
     }
     Ok((total, numbers))
 }
@@ -2779,24 +2819,34 @@ pub fn get_batch_scrape_stats(conn: &Connection) -> Result<BatchScrapeStats, rus
     let (total_videos, number_assets) = whitelisted_number_assets(conn)?;
     let distinct_numbers: std::collections::HashSet<_> = number_assets.keys().cloned().collect();
 
-    let mut already_scraped = 0usize;
-    let mut check_stmt = conn.prepare("SELECT 1 FROM movie_metadata WHERE number = ?1 AND verification_version = 1 AND source NOT IN ('javdb_not_found', 'not_found', '') AND cover_url IS NOT NULL AND cover_url != '' LIMIT 1")?;
-    for num in &distinct_numbers {
-        if check_stmt.exists(params![num])? {
-            already_scraped += 1;
-        }
+    let mut already_scraped_set = std::collections::HashSet::<String>::new();
+    let mut check_stmt = conn.prepare("SELECT number FROM movie_metadata WHERE verification_version = 1 AND source NOT IN ('javdb_not_found', 'not_found', '') AND cover_url IS NOT NULL AND cover_url != ''")?;
+    let scraped_rows = check_stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for r in scraped_rows.flatten() {
+        already_scraped_set.insert(r);
     }
-
+    let already_scraped = distinct_numbers.iter().filter(|num| already_scraped_set.contains(*num)).count();
     let remaining = distinct_numbers.len().saturating_sub(already_scraped);
+
+    let mut failed_set = std::collections::HashSet::<String>::new();
+    let mut fail_stmt = conn.prepare("SELECT number FROM scrape_failures")?;
+    let fail_rows = fail_stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for r in fail_rows.flatten() {
+        failed_set.insert(r);
+    }
+    let failed_count = distinct_numbers.iter().filter(|num| failed_set.contains(*num)).count();
+
+    let pending_revalidation: usize = conn.query_row("SELECT count(*) FROM movie_metadata WHERE verification_version=0", [], |row| row.get(0)).unwrap_or(0);
+    let unrecognized_videos = total_videos.saturating_sub(number_assets.values().map(Vec::len).sum::<usize>());
 
     Ok(BatchScrapeStats {
         total_whitelisted_videos: total_videos,
         distinct_numbers: distinct_numbers.len(),
         already_scraped,
         remaining_to_scrape: remaining,
-        failed_count: number_assets.keys().filter(|number| conn.query_row("SELECT EXISTS(SELECT 1 FROM scrape_failures WHERE number=?1)", params![number], |row| row.get::<_, bool>(0)).unwrap_or(false)).count(),
-        pending_revalidation: conn.query_row("SELECT count(*) FROM movie_metadata WHERE verification_version=0", [], |row| row.get(0))?,
-        unrecognized_videos: total_videos.saturating_sub(number_assets.values().map(Vec::len).sum::<usize>()),
+        failed_count,
+        pending_revalidation,
+        unrecognized_videos,
     })
 }
 
@@ -2887,48 +2937,39 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
             }
         };
         let mut queue = Vec::new();
+        let mut failed_set = std::collections::HashSet::<String>::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT number FROM scrape_failures") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for r in rows.flatten() { failed_set.insert(r); }
+            }
+        }
+        let mut existing_meta_set = std::collections::HashSet::<String>::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT number FROM movie_metadata") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for r in rows.flatten() { existing_meta_set.insert(r); }
+            }
+        }
+
         for (number, assets) in &number_assets {
             match mode {
                 BatchScrapeMode::FailedOnly => {
-                    match conn.query_row("SELECT EXISTS(SELECT 1 FROM scrape_failures WHERE number=?1)", params![number], |row| row.get::<_, bool>(0)) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            if let Ok(mut g) = batch_progress_cell().lock() { g.running = false; g.last_error = Some(e.to_string()); }
-                            return;
-                        }
-                    }
+                    if !failed_set.contains(number) { continue; }
                 }
                 BatchScrapeMode::NewOnly => {
-                    match conn.query_row("SELECT EXISTS(SELECT 1 FROM scrape_failures WHERE number=?1)", params![number], |row| row.get::<_, bool>(0)) {
-                        Ok(true) => continue,
-                        Ok(false) => {}
-                        Err(e) => {
-                            if let Ok(mut g) = batch_progress_cell().lock() { g.running = false; g.last_error = Some(e.to_string()); }
-                            return;
-                        }
-                    }
+                    if failed_set.contains(number) { continue; }
                 }
                 BatchScrapeMode::AllUnscraped => {}
             }
-            match get_movie_metadata(&conn, number) {
-                Ok(Some(_)) => {
-                    // Repair cached entries too: no network is necessary to bind each duplicate file.
-                    let _ = conn.execute("DELETE FROM scrape_failures WHERE number=?1", params![number]);
-                    for asset in assets {
-                        if let Err(e) = bind_movie_asset(&conn, number, asset) {
-                            if let Ok(mut g) = batch_progress_cell().lock() { g.last_error = Some(e.to_string()); }
-                        }
+            if existing_meta_set.contains(number) {
+                // Repair cached entries too: no network is necessary to bind each duplicate file.
+                let _ = conn.execute("DELETE FROM scrape_failures WHERE number=?1", params![number]);
+                for asset in assets {
+                    if let Err(e) = bind_movie_asset(&conn, number, asset) {
+                        if let Ok(mut g) = batch_progress_cell().lock() { g.last_error = Some(e.to_string()); }
                     }
                 }
-                Ok(None) => queue.push(number.clone()),
-                Err(e) => {
-                    if let Ok(mut g) = batch_progress_cell().lock() {
-                        g.running = false;
-                        g.last_error = Some(format!("读取缓存失败：{e}"));
-                    }
-                    return;
-                }
+            } else {
+                queue.push(number.clone());
             }
         }
 

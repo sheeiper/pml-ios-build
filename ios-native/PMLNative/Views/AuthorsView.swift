@@ -409,6 +409,7 @@ struct AuthorProfileView: View {
     @State private var loading = false
     @State private var errorText = ""
     @State private var preview: PreviewItem?
+    @State private var selectedMovieForDetail: RemoteBrowserEntry?
     @State private var showAliasEditor = false
     @State private var aliasText = ""
     @State private var notice = ""
@@ -506,6 +507,22 @@ struct AuthorProfileView: View {
         .task { await load() }
         .sheet(isPresented: $showAliasEditor) {
             aliasEditor
+        }
+        .sheet(item: $selectedMovieForDetail) { item in
+            MovieDetailSheet(
+                assetId: item.assetId,
+                fileName: item.name,
+                remotePath: item.path,
+                onPlay: { targetId in
+                    selectedMovieForDetail = nil
+                    Task {
+                        try? await Task.sleep(nanoseconds: 400_000_000)
+                        guard let source = await model.playbackSource(assetId: targetId, remotePath: item.path) else { return }
+                        preview = PreviewItem(url: source.url, isVideo: true, assetId: targetId, title: item.name, fallbackURL: source.fallbackURL, sourceLabel: source.label, remotePath: item.path)
+                    }
+                }
+            )
+            .environmentObject(model)
         }
         .fullScreenCover(item: $preview) { item in
             if item.isVideo {
@@ -724,12 +741,16 @@ struct AuthorProfileView: View {
     }
 
     private func open(_ entry: RemoteBrowserEntry) async {
-        guard let assetId = entry.assetId,
-              let source = await model.playbackSource(assetId: assetId, remotePath: entry.path) else { return }
+        guard let source = await model.playbackSource(assetId: entry.assetId, remotePath: entry.path) else {
+            if let err = model.playbackError, !err.isEmpty {
+                errorText = err
+            }
+            return
+        }
         preview = PreviewItem(
             url: source.url,
             isVideo: entry.isVideo,
-            assetId: assetId,
+            assetId: entry.assetId ?? entry.path,
             title: entry.name,
             fallbackURL: source.fallbackURL,
             sourceLabel: source.label,
@@ -819,6 +840,22 @@ struct AuthorProfileView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
         .contentShape(Rectangle())
+        .contextMenu {
+            if !entry.isDirectory {
+                Button {
+                    Task { await open(entry) }
+                } label: {
+                    Label("立即播放", systemImage: "play.fill")
+                }
+                if entry.isVideo {
+                    Button {
+                        selectedMovieForDetail = entry
+                    } label: {
+                        Label("查看影视百科详情", systemImage: "info.circle")
+                    }
+                }
+            }
+        }
     }
 
     private func authorEntryRow(_ entry: RemoteBrowserEntry) -> some View {
@@ -833,9 +870,30 @@ struct AuthorProfileView: View {
         }
         .padding(.vertical, 8)
         .contentShape(Rectangle())
+        .contextMenu {
+            if !entry.isDirectory {
+                Button {
+                    Task { await open(entry) }
+                } label: {
+                    Label("立即播放", systemImage: "play.fill")
+                }
+                if entry.isVideo {
+                    Button {
+                        selectedMovieForDetail = entry
+                    } label: {
+                        Label("查看影视百科详情", systemImage: "info.circle")
+                    }
+                }
+            }
+        }
     }
     private func open(_ asset: LibraryAsset) async {
-        guard let source = await model.playbackSource(assetId: asset.id, remotePath: asset.remotePath) else { return }
+        guard let source = await model.playbackSource(assetId: asset.id, remotePath: asset.remotePath) else {
+            if let err = model.playbackError, !err.isEmpty {
+                errorText = err
+            }
+            return
+        }
         preview = PreviewItem(
             url: source.url,
             isVideo: asset.mediaType == "video",

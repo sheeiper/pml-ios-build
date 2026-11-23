@@ -224,6 +224,7 @@ fn schema_sql() -> &'static str {
     CREATE INDEX IF NOT EXISTS assets_domain_parent ON assets(domain, parent_path, file_name COLLATE NOCASE);
     CREATE INDEX IF NOT EXISTS assets_domain_missing ON assets(domain, missing);
     CREATE INDEX IF NOT EXISTS assets_domain_media ON assets(domain, media_type, missing);
+    CREATE INDEX IF NOT EXISTS idx_assets_media_missing ON assets(media_type, missing);
 
     -- Completion is recorded separately: an empty successful listing is authoritative too.
     CREATE TABLE IF NOT EXISTS directory_sync_state (

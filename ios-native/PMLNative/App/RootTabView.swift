@@ -20,9 +20,11 @@ struct RootTabView: View {
                 .tabItem { Label("主页", systemImage: "house.fill") }
                 .tag(AppTab.home)
 
-            MovieLibraryView()
-                .tabItem { Label("媒体库", systemImage: "film.stack.fill") }
-                .tag(AppTab.mediaLibrary)
+            NavigationStack {
+                MovieLibraryView()
+            }
+            .tabItem { Label("影视库", systemImage: "film.stack.fill") }
+            .tag(AppTab.mediaLibrary)
 
             ShortVideosView()
                 .tabItem { Label("短视频", systemImage: "play.rectangle.fill") }
@@ -154,7 +156,6 @@ struct AppCenterView: View {
     var body: some View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 12) {
-                tile("影视库", "film.stack.fill", .movies)
                 tile("文件浏览", "folder.fill", .browse)
                 tile("Telegram 订阅", "paperplane.fill", .telegram)
                 tile("待整理", "tray.and.arrow.down.fill", .pending)

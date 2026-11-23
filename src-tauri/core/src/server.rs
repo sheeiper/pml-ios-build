@@ -351,6 +351,7 @@ pub fn start_on_loopback(app: AppHandle, port: u16) -> Result<u16, String> {
 }
 
 static LAST_SERVER_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static SYNC_RECONCILE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn record_server_error(message: &str) {
     eprintln!("personal-media-library server error: {message}");
@@ -1152,6 +1153,17 @@ async fn dispatch_command(
             }).await
         }
         "sync_remote_and_reconcile" => {
+            if SYNC_RECONCILE_RUNNING.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
+                return error_response("已有同步扫描任务正在进行中，请等待完成后再试");
+            }
+            struct SyncGuard;
+            impl Drop for SyncGuard {
+                fn drop(&mut self) {
+                    SYNC_RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _sync_guard = SyncGuard;
+
             let auto_scrape = payload.get("autoScrape").and_then(Value::as_bool).unwrap_or(false);
             let skip_failed = payload.get("skipFailed").and_then(Value::as_bool).unwrap_or(true);
             let mode = payload.get("mode").and_then(Value::as_str).unwrap_or("fast").to_ascii_lowercase();
