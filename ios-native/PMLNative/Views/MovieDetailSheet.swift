@@ -430,12 +430,7 @@ public struct MovieDetailSheet: View {
             .sheet(item: $selectedPerformer) { person in
                 MoviePerformerDetailSheet(
                     performer: person,
-                    onFilterMovies: onFilterActor.map { handler in { actorName in selectedPerformer = nil; dismiss(); handler(actorName) } },
-                    onPlay: { targetId, _ in
-                        selectedPerformer = nil
-                        dismiss()
-                        onPlay?(targetId)
-                    }
+                    onFilterMovies: onFilterActor.map { handler in { actorName in selectedPerformer = nil; dismiss(); handler(actorName) } }
                 )
                 .environmentObject(appModel)
             }

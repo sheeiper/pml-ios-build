@@ -77,12 +77,6 @@ public struct MovieLibraryView: View {
                         mode = .movies
                         selectedActor = actorName
                         resetAndLoad()
-                    },
-                    onPlay: { targetId, title in
-                        Task {
-                            try? await Task.sleep(nanoseconds: 380_000_000)
-                            await playAsset(targetId, title: title)
-                        }
                     }
                 )
                 .environmentObject(model)

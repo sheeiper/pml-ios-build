@@ -20,16 +20,33 @@ struct MoviePerformerDetailSheet: View {
         case recent = "近期新作"
     }
 
+    private enum FullScreenModal: Identifiable {
+        case player(PreviewItem)
+        case avatar(MoviePerformer, URL?)
+
+        var id: String {
+            switch self {
+            case .player(let item): return "player-\(item.id)"
+            case .avatar(let p, _): return "avatar-\(p.id)"
+            }
+        }
+    }
+
+    private struct PendingPlayback {
+        let assetId: String
+        let title: String
+    }
+
     @State private var detailTab: PerformerWorkTab = .library
     @State private var showEditor = false
-    @State private var showAvatarViewer = false
+    @State private var fullScreenModal: FullScreenModal?
+    @State private var pendingPlayback: PendingPlayback?
     @State private var selectedMovie: MovieMetadata?
     @State private var recentResult: PerformerRecentReleasesResult?
     @State private var recentLoading = false
     @State private var recentError: String?
     @State private var includeOwnedRecent = false
     @State private var selectedReleaseForMagnets: PerformerRecentRelease?
-    @State private var preview: PreviewItem?
 
     var body: some View {
         NavigationStack {
@@ -173,33 +190,37 @@ struct MoviePerformerDetailSheet: View {
                 MovieMagnetsSheet(release: rel)
                     .environmentObject(model)
             }
-            .sheet(item: $selectedMovie) { movie in
-                MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
-                    selectedMovie = nil
+            .sheet(item: $selectedMovie, onDismiss: {
+                if let pending = pendingPlayback {
+                    pendingPlayback = nil
                     Task {
-                        try? await Task.sleep(nanoseconds: 400_000_000)
-                        await playAsset(targetId, title: movie.title)
+                        try? await Task.sleep(nanoseconds: 120_000_000)
+                        await playAsset(pending.assetId, title: pending.title)
                     }
-                    onPlay?(targetId, movie.title)
+                }
+            }) { movie in
+                MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
+                    pendingPlayback = PendingPlayback(assetId: targetId, title: movie.title)
+                    selectedMovie = nil
                 }
                 .environmentObject(model)
             }
-            .fullScreenCover(item: $preview) { item in
-                GestureVideoPlayerSheet(
-                    url: item.url,
-                    title: item.title,
-                    assetId: item.assetId,
-                    startAt: item.startAt,
-                    fallbackURL: item.fallbackURL,
-                    sourceLabel: item.sourceLabel,
-                    remotePath: item.remotePath
-                )
-                .id(item.id)
-                .environmentObject(model)
-            }
-            .fullScreenCover(isPresented: $showAvatarViewer) {
-                if let person = detail?.person ?? Optional(performer) {
-                    PerformerAvatarViewer(person: person, avatarUrl: avatarURL(person.avatarUrl))
+            .fullScreenCover(item: $fullScreenModal) { modal in
+                switch modal {
+                case .player(let item):
+                    GestureVideoPlayerSheet(
+                        url: item.url,
+                        title: item.title,
+                        assetId: item.assetId,
+                        startAt: item.startAt,
+                        fallbackURL: item.fallbackURL,
+                        sourceLabel: item.sourceLabel,
+                        remotePath: item.remotePath
+                    )
+                    .id(item.id)
+                    .environmentObject(model)
+                case .avatar(let person, let avatarUrl):
+                    PerformerAvatarViewer(person: person, avatarUrl: avatarUrl)
                 }
             }
         }
@@ -340,7 +361,7 @@ struct MoviePerformerDetailSheet: View {
         HStack(spacing: 14) {
             Button {
                 if let avatar = person.avatarUrl, !avatar.isEmpty {
-                    showAvatarViewer = true
+                    fullScreenModal = .avatar(person, avatarURL(avatar))
                 }
             } label: {
                 ZStack(alignment: .bottomTrailing) {
@@ -498,8 +519,11 @@ struct MoviePerformerDetailSheet: View {
     }
 
     private func playAsset(_ assetId: String, title: String) async {
-        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else { return }
-        preview = PreviewItem(url: source.url, isVideo: true, assetId: assetId, title: title, fallbackURL: source.fallbackURL, sourceLabel: source.label, remotePath: nil)
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else {
+            errorMessage = model.playbackError ?? "无法解析视频直链"
+            return
+        }
+        fullScreenModal = .player(PreviewItem(url: source.url, isVideo: true, assetId: assetId, title: title, fallbackURL: source.fallbackURL, sourceLabel: source.label, remotePath: nil))
     }
 }
 
