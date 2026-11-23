@@ -90,6 +90,18 @@ const COLUMNS: &str = "asset.id, asset.root_id, asset.domain, asset.remote_path,
  asset.content_hash, asset.thumbnail_asset_id";
 const VISIBLE_PATH: &str = "asset.remote_path NOT LIKE '%inbox%' AND asset.remote_path NOT LIKE '%暂存%'
  AND asset.remote_path NOT LIKE '%未分类%' AND asset.remote_path NOT LIKE '%pending%'";
+const NOT_IN_SCRAPE_WHITELIST: &str = "NOT EXISTS (SELECT 1 FROM scrape_whitelist wl WHERE wl.enabled = 1 AND (asset.remote_path = rtrim(wl.path, '/') OR asset.remote_path LIKE (rtrim(wl.path, '/') || '/%')))";
+const NOT_IN_SCRAPE_WHITELIST_A: &str = "NOT EXISTS (SELECT 1 FROM scrape_whitelist wl WHERE wl.enabled = 1 AND (a.remote_path = rtrim(wl.path, '/') OR a.remote_path LIKE (rtrim(wl.path, '/') || '/%')))";
+
+fn ensure_catalog_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scrape_whitelist (
+            path TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );"
+    )
+}
 fn asset_row(row: &Row<'_>) -> rusqlite::Result<LibraryAsset> {
     let domain: String = row.get(2)?;
     Ok(LibraryAsset {
@@ -140,8 +152,9 @@ fn list_assets_sql(
     collection_id: Option<String>, category_id: Option<String>, limit: Option<i64>,
     offset: Option<i64>, parent_path: Option<String>,
 ) -> Result<Vec<LibraryAsset>, String> {
+    ensure_catalog_schema(connection).map_err(error)?;
     let filter = filter.unwrap_or_else(|| "all".into());
-    let mut clauses = vec!["asset.missing = 0".into()];
+    let mut clauses = vec!["asset.missing = 0".into(), NOT_IN_SCRAPE_WHITELIST.into()];
     let mut values = Vec::new();
     if let Some(path) = parent_path.filter(|v| !v.trim().is_empty()) {
         clauses.push("asset.parent_path = ?".into()); values.push(path.into());
@@ -195,9 +208,11 @@ pub fn list_short_video_feed(app: AppHandle, cursor: Option<String>, limit: Opti
 }
 fn feed_sql(connection: &Connection, cursor: Option<String>, limit: Option<i64>,
     author_id: Option<String>, max_duration_seconds: Option<i64>) -> Result<ShortVideoFeedPage, String> {
+    ensure_catalog_schema(connection).map_err(error)?;
     let limit = limit.unwrap_or(24).clamp(1,48) as usize;
     let mut clauses = vec!["asset.missing=0 AND asset.media_type='video'".into(),
-        "(asset.file_name LIKE '%.mp4' OR asset.file_name LIKE '%.webm' OR asset.file_name LIKE '%.mov' OR asset.file_name LIKE '%.m4v')".into()];
+        "(asset.file_name LIKE '%.mp4' OR asset.file_name LIKE '%.webm' OR asset.file_name LIKE '%.mov' OR asset.file_name LIKE '%.m4v')".into(),
+        NOT_IN_SCRAPE_WHITELIST.into()];
     let mut values = Vec::new();
     if let Some(id) = author_id.filter(|v| !v.trim().is_empty()) {
         clauses.push("metadata.author_id = ?".into()); values.push(id.into());
@@ -226,6 +241,7 @@ pub fn list_library_authors(app: AppHandle, category_id: Option<String>, filter:
     authors_sql(&database(&app)?, category_id, filter)
 }
 fn authors_sql(connection: &Connection, category_id: Option<String>, filter: Option<String>) -> Result<Vec<LibraryAuthor>, String> {
+    ensure_catalog_schema(connection).map_err(error)?;
     let filter = media_filter(filter.as_deref())?;
     let mut values = Vec::new();
     let category = category_filter(category_id, &mut values);
@@ -235,9 +251,10 @@ fn authors_sql(connection: &Connection, category_id: Option<String>, filter: Opt
        WHERE m.author_id=author.id AND a.missing=0
        AND a.remote_path NOT LIKE '%inbox%' AND a.remote_path NOT LIKE '%暂存%'
        AND a.remote_path NOT LIKE '%未分类%' AND a.remote_path NOT LIKE '%pending%'
+       AND {NOT_IN_SCRAPE_WHITELIST_A}
        ORDER BY (a.media_type='image') DESC,a.rowid DESC LIMIT 1)
       {JOINS} WHERE asset.missing=0 AND author.id IS NOT NULL AND metadata.author_id IS NOT NULL
-      AND {VISIBLE_PATH} AND ({category}) AND ({filter})
+      AND {VISIBLE_PATH} AND {NOT_IN_SCRAPE_WHITELIST} AND ({category}) AND ({filter})
       GROUP BY author.id HAVING COUNT(DISTINCT asset.id)>0
       ORDER BY COUNT(DISTINCT asset.id) DESC,author.name COLLATE NOCASE");
     let mut stmt = connection.prepare(&sql).map_err(error)?;
@@ -250,7 +267,7 @@ fn authors_sql(connection: &Connection, category_id: Option<String>, filter: Opt
             cover_asset_id:latest,banner_asset_id:r.get(4)? })
     }).map_err(error)?;
     let mut result = rows.collect::<Result<Vec<_>,_>>().map_err(error)?;
-    let sql = format!("SELECT EXISTS(SELECT 1 {JOINS} WHERE asset.missing=0 AND metadata.author_id IS NULL AND ({category}) AND ({filter}) LIMIT 1)");
+    let sql = format!("SELECT EXISTS(SELECT 1 {JOINS} WHERE asset.missing=0 AND metadata.author_id IS NULL AND {VISIBLE_PATH} AND {NOT_IN_SCRAPE_WHITELIST} AND ({category}) AND ({filter}) LIMIT 1)");
     let unassigned: bool = connection.query_row(&sql, params_from_iter(values.iter()), |r|r.get(0)).map_err(error)?;
     if unassigned { result.push(LibraryAuthor { id:"unassigned".into(),name:"未识别作者".into(),aliases:vec![],media_count:0,collection_count:0,avatar_asset_id:None,cover_asset_id:None,banner_asset_id:None }); }
     Ok(result)
@@ -273,22 +290,31 @@ pub fn list_library_categories(app:AppHandle,filter:Option<String>,parent_id:Opt
     categories_sql(&database(&app)?,filter,parent_id)
 }
 fn categories_sql(connection:&Connection,filter:Option<String>,parent_id:Option<String>)->Result<Vec<LibraryCategory>,String> {
+    ensure_catalog_schema(connection).map_err(error)?;
     let parent=parent_id.filter(|s|!s.is_empty());
     let values:Vec<Value>=parent.iter().cloned().map(Value::from).collect();
     let parent_clause=if parent.is_some() { "category.parent_id=?" } else { "category.parent_id IS NULL" };
     // Preserve legacy behavior: real category counts are not media-filtered.
     let sql=format!("WITH RECURSIVE target AS (SELECT id,name,parent_id FROM categories category WHERE {parent_clause}),
       tree(root_id,id) AS (SELECT id,id FROM target UNION SELECT t.root_id,c.id FROM categories c JOIN tree t ON c.parent_id=t.id)
-      SELECT t.id,t.name,t.parent_id,COUNT(DISTINCT a.id),COUNT(DISTINCT m.author_id),COUNT(DISTINCT m.collection_id)
+      SELECT t.id,t.name,t.parent_id,COUNT(DISTINCT a.id),
+        COUNT(DISTINCT CASE WHEN a.id IS NOT NULL THEN m.author_id END),
+        COUNT(DISTINCT CASE WHEN a.id IS NOT NULL THEN m.collection_id END)
       FROM target t LEFT JOIN tree tr ON tr.root_id=t.id LEFT JOIN vault_items m ON m.category_id=tr.id
-      LEFT JOIN assets a ON a.id=m.asset_id AND a.missing=0 GROUP BY t.id ORDER BY t.name COLLATE NOCASE");
+      LEFT JOIN assets a ON a.id=m.asset_id AND a.missing=0
+        AND a.remote_path NOT LIKE '%inbox%' AND a.remote_path NOT LIKE '%暂存%'
+        AND a.remote_path NOT LIKE '%未分类%' AND a.remote_path NOT LIKE '%pending%'
+        AND {NOT_IN_SCRAPE_WHITELIST_A}
+      GROUP BY t.id
+      HAVING COUNT(DISTINCT a.id) > 0
+      ORDER BY t.name COLLATE NOCASE");
     let mut stmt=connection.prepare(&sql).map_err(error)?;
     let rows=stmt.query_map(params_from_iter(values),|r|Ok(LibraryCategory { id:r.get(0)?,name:r.get(1)?,parent_id:r.get(2)?,media_count:r.get(3)?,author_count:r.get(4)?,collection_count:r.get(5)? })).map_err(error)?;
     let mut result=rows.collect::<Result<Vec<_>,_>>().map_err(error)?;
     result.sort_by(|a,b|natural_category_cmp(&a.name,&b.name));
     if parent.is_none() {
         let filter=media_filter(filter.as_deref())?;
-        let sql=format!("SELECT COUNT(DISTINCT asset.id),COUNT(DISTINCT metadata.author_id) {JOINS} WHERE asset.missing=0 AND metadata.category_id IS NULL AND {filter}");
+        let sql=format!("SELECT COUNT(DISTINCT asset.id),COUNT(DISTINCT metadata.author_id) {JOINS} WHERE asset.missing=0 AND metadata.category_id IS NULL AND {VISIBLE_PATH} AND {NOT_IN_SCRAPE_WHITELIST} AND {filter}");
         let (media_count,author_count):(i64,i64)=connection.query_row(&sql,[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(error)?;
         if media_count>0 { result.push(LibraryCategory { id:"uncategorized".into(),name:"未分类".into(),parent_id:None,media_count,author_count,collection_count:0 }); }
     }
@@ -299,7 +325,12 @@ pub fn list_library_collections(app:AppHandle,author_id:Option<String>,parent_id
     collections_sql(&database(&app)?,author_id,parent_id,category_id)
 }
 fn collections_sql(connection:&Connection,author_id:Option<String>,parent_id:Option<String>,category_id:Option<String>)->Result<Vec<LibraryCollection>,String> {
-    let mut clauses: Vec<String> = vec!["asset.missing=0 AND asset.domain != 'comics'".into()];
+    ensure_catalog_schema(connection).map_err(error)?;
+    let mut clauses: Vec<String> = vec![
+        "asset.missing=0 AND asset.domain != 'comics'".into(),
+        VISIBLE_PATH.into(),
+        NOT_IN_SCRAPE_WHITELIST.into(),
+    ];
     let mut values=Vec::<Value>::new();
     if let Some(id)=author_id.filter(|s|!s.is_empty()) {
         if id=="unassigned" { clauses.push("collection.author_id IS NULL".into()); }
@@ -480,5 +511,35 @@ mod tests {
         assert_eq!(collections[0].media_count,0); // intentional legacy DTO semantics
         let assets=list_assets_sql(&c,None,None,None,Some("col".into()),Some("cat".into()),None,None,None).unwrap();
         assert_eq!(assets[0].metadata_origin.as_deref(),Some("user"));
+    }
+    #[test]
+    fn scrape_whitelist_paths_are_excluded_from_creator_views() {
+        let c = db();
+        c.execute_batch(
+            "INSERT INTO authors(id,name,origin,created_at) VALUES('creator','Creator','user',0),('actor','MovieActor','user',0);
+             INSERT INTO categories(id,name,origin,created_at) VALUES('art','Art',NULL,'user',0),('movies','Movies',NULL,'user',0);
+             INSERT INTO collections(id,root_id,author_id,name,parent_id,origin,created_at) VALUES('c_art','root','creator','ArtCol',NULL,'user',0),('c_movie','root','actor','MovieCol',NULL,'user',0);
+             INSERT INTO scrape_whitelist(path,enabled,created_at) VALUES('/已整理/影视',1,0);"
+        ).unwrap();
+        add(&c, "art1", "vault", "image", "art.jpg", "/已整理/画师/art.jpg");
+        c.execute_batch("INSERT INTO vault_items(asset_id,category_id,author_id,collection_id,source,updated_at) VALUES('art1','art','creator','c_art','user',0)").unwrap();
+        add(&c, "mov1", "vault", "video", "mov.mp4", "/已整理/影视/SSIS-001/mov.mp4");
+        c.execute_batch("INSERT INTO vault_items(asset_id,category_id,author_id,collection_id,source,updated_at) VALUES('mov1','movies','actor','c_movie','user',0)").unwrap();
+
+        let authors = authors_sql(&c, None, None).unwrap();
+        assert_eq!(authors.len(), 1);
+        assert_eq!(authors[0].id, "creator");
+
+        let categories = categories_sql(&c, None, None).unwrap();
+        assert_eq!(categories.len(), 1);
+        assert_eq!(categories[0].id, "art");
+
+        let collections = collections_sql(&c, None, None, None).unwrap();
+        assert_eq!(collections.len(), 1);
+        assert_eq!(collections[0].id, "c_art");
+
+        let assets = list_assets_sql(&c, None, None, None, None, None, None, None, None).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].id, "art1");
     }
 }

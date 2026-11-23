@@ -23,6 +23,23 @@ struct TelegramFeedView: View {
     @State private var showChannelFilterSheet = false
     @State private var currentConfig = TelegramNativeChannelConfig()
     
+    // 浏览模式：对话框 (chat) | 视频流 (videos) | 下载区 (downloads)
+    enum TelegramFeedMode: String, CaseIterable, Identifiable {
+        case chat = "对话框"
+        case videos = "视频流"
+        case downloads = "下载区"
+        var id: String { rawValue }
+    }
+
+    @AppStorage("pml_tg_feed_mode") private var feedMode: TelegramFeedMode = .chat
+    @State private var selectedDownloadMsgIds: Set<Int64> = []
+    @State private var copiedLinksStore: Set<String> = {
+        if let saved = UserDefaults.standard.stringArray(forKey: "pml_tg_copied_links") {
+            return Set(saved)
+        }
+        return []
+    }()
+
     // 播放器状态
     @State private var activeVideoTarget: VideoTarget?
     @State private var activeImageTarget: ImageTarget?
@@ -110,30 +127,8 @@ struct TelegramFeedView: View {
             )
         }
         .sheet(item: $activeImageTarget) { target in
-            NavigationStack {
-                AsyncImage(url: target.url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .scaledToFit()
-                    case .failure:
-                        Image(systemName: "photo")
-                            .font(.largeTitle)
-                            .foregroundStyle(.secondary)
-                    default:
-                        ProgressView()
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black)
-                .navigationTitle("图片预览")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("关闭") { activeImageTarget = nil }
-                    }
-                }
+            TelegramZoomableImageViewer(url: target.url) {
+                activeImageTarget = nil
             }
         }
         .sheet(item: $activeCommentsMsg) { msg in
@@ -211,11 +206,42 @@ struct TelegramFeedView: View {
                 Divider()
             }
 
-            // 垂直消息流
+            // 模式选择分段选择器 (对话框 / 视频流 / 下载区)
+            Picker("浏览模式", selection: $feedMode) {
+                ForEach(TelegramFeedMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(Color(uiColor: .systemBackground))
+            .overlay(alignment: .bottom) {
+                Divider()
+            }
+
+            // 内容视图区域
             if loadingMessages && messages.isEmpty {
                 ProgressView("加载消息与资源...")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if messages.isEmpty {
+            } else {
+                switch feedMode {
+                case .chat:
+                    chatMessagesView
+                case .videos:
+                    videoStreamView
+                case .downloads:
+                    downloadsHubView
+                }
+            }
+        }
+    }
+
+    // MARK: - 对话框模式视图
+
+    private var chatMessagesView: some View {
+        Group {
+            if messages.isEmpty {
                 VStack(spacing: 12) {
                     Image(systemName: "tray")
                         .font(.system(size: 40))
@@ -1327,6 +1353,526 @@ struct TelegramCommentsSheet: View {
         case "aliyun": return .purple
         case "uc": return .green
         default: return .secondary
+        }
+    }
+
+    // MARK: - 模式 2: 视频流视图与卡片
+
+    private var videoMessages: [TelegramNativeMessage] {
+        messages.filter { $0.isVideo == true || $0.video != nil || ($0.mediaList?.contains(where: { $0.isVideo == true }) ?? false) }
+    }
+
+    private var videoStreamView: some View {
+        VStack(spacing: 0) {
+            if videoMessages.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "video.slash")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.secondary)
+                    Text("当前频道暂无视频内容")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 14) {
+                        ForEach(videoMessages) { msg in
+                            videoStreamCard(msg)
+                        }
+                    }
+                    .padding(16)
+                }
+            }
+        }
+    }
+
+    private func videoStreamCard(_ msg: TelegramNativeMessage) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(getMessageFirstLine(msg.text))
+                    .font(.subheadline.bold())
+                    .lineLimit(1)
+                Spacer()
+                if let d = msg.date {
+                    Text(formatDate(d))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // 视频缩略图与快速点击播放
+            if let chatId = selectedDialog?.id,
+               let streamURL = model.apiClient?.telegramUserStreamURL(chatId: chatId, messageId: msg.id) {
+                let thumbURL = model.apiClient?.telegramUserThumbURL(chatId: chatId, messageId: msg.id)
+                Button {
+                    activeVideoTarget = VideoTarget(url: streamURL, title: msg.video?.fileName ?? getMessageFirstLine(msg.text))
+                } label: {
+                    ZStack {
+                        Color.black
+                        if let thumbURL {
+                            AsyncImage(url: thumbURL) { phase in
+                                if let img = phase.image {
+                                    img.resizable().scaledToFit()
+                                }
+                            }
+                        }
+                        Circle()
+                            .fill(.black.opacity(0.6))
+                            .frame(width: 48, height: 48)
+                            .overlay(Image(systemName: "play.fill").font(.title3).foregroundStyle(.white))
+                    }
+                    .frame(height: 190)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+
+                HStack {
+                    if let size = msg.video?.fileSize {
+                        Text(formatFileSize(size))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let dur = msg.video?.duration {
+                        Text("⏱ \(formatDuration(Double(dur)))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        UIPasteboard.general.string = streamURL.absoluteString
+                        triggerToast("已复制视频原画直链")
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "doc.on.doc")
+                            Text("复制直链")
+                        }
+                        .font(.caption.weight(.medium))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color(uiColor: .secondarySystemBackground), in: Capsule())
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(uiColor: .separator).opacity(0.4), lineWidth: 0.8)
+        )
+    }
+
+    // MARK: - 模式 3: 下载区专区视图与卡片
+
+    private var downloadableMessages: [TelegramNativeMessage] {
+        messages.filter { !extractOfflineLinks(from: $0).isEmpty }
+    }
+
+    private func isLinkCopied(_ url: String) -> Bool {
+        copiedLinksStore.contains(url)
+    }
+
+    private func markLinkCopied(_ url: String) {
+        copiedLinksStore.insert(url)
+        UserDefaults.standard.set(Array(copiedLinksStore), forKey: "pml_tg_copied_links")
+    }
+
+    private func copySingleLink(_ url: String) {
+        UIPasteboard.general.string = url
+        markLinkCopied(url)
+        triggerToast("已复制下载链接")
+    }
+
+    private func toggleSelectDownloadMsg(_ id: Int64) {
+        if selectedDownloadMsgIds.contains(id) {
+            selectedDownloadMsgIds.remove(id)
+        } else {
+            selectedDownloadMsgIds.insert(id)
+        }
+    }
+
+    private func toggleSelectAllDownloads() {
+        if selectedDownloadMsgIds.count >= downloadableMessages.count {
+            selectedDownloadMsgIds.removeAll()
+        } else {
+            selectedDownloadMsgIds = Set(downloadableMessages.map { $0.id })
+        }
+    }
+
+    private func batchCopySelectedLinks() {
+        guard !selectedDownloadMsgIds.isEmpty else {
+            triggerToast("请先勾选需要复制的资源项")
+            return
+        }
+        var urlsToCopy: [String] = []
+        for msg in downloadableMessages {
+            if selectedDownloadMsgIds.contains(msg.id) {
+                let lks = extractOfflineLinks(from: msg)
+                for lk in lks {
+                    if !lk.url.isEmpty {
+                        urlsToCopy.append(lk.url)
+                        markLinkCopied(lk.url)
+                    }
+                }
+            }
+        }
+        guard !urlsToCopy.isEmpty else {
+            triggerToast("所选项未找到有效下载链接")
+            return
+        }
+        UIPasteboard.general.string = urlsToCopy.joined(separator: "\n")
+        triggerToast("✓ 已批量多行复制 \(urlsToCopy.count) 条下载链接")
+    }
+
+    private func getMessageFirstLine(_ text: String?) -> String {
+        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            return "未命名资源"
+        }
+        let lines = text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let first = lines.first else { return "未命名资源" }
+        var cleaned = first
+        while cleaned.hasPrefix("#") || cleaned.hasPrefix("*") || cleaned.hasPrefix("-") || cleaned.hasPrefix("•") || cleaned.hasPrefix(">") || cleaned.hasPrefix(" ") {
+            cleaned.removeFirst()
+        }
+        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? first : cleaned
+    }
+
+    private func extractOfflineLinks(from msg: TelegramNativeMessage) -> [TelegramNativeOfflineLink] {
+        if let links = msg.offlineLinks, !links.isEmpty {
+            return links
+        }
+        guard let text = msg.text else { return [] }
+        var result: [TelegramNativeOfflineLink] = []
+        let magnetPattern = #"magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}[^\s]*"#
+        if let regex = try? NSRegularExpression(pattern: magnetPattern, options: .caseInsensitive) {
+            let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count))
+            for m in matches {
+                if let r = Range(m.range, in: text) {
+                    let url = String(text[r])
+                    result.append(TelegramNativeOfflineLink(name: "磁力链接", url: url, code: nil, type: "magnet", copyText: url, textWithoutLinks: nil, source: "message"))
+                }
+            }
+        }
+        let ed2kPattern = #"ed2k://[^\s]+"#
+        if let regex = try? NSRegularExpression(pattern: ed2kPattern, options: .caseInsensitive) {
+            let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count))
+            for m in matches {
+                if let r = Range(m.range, in: text) {
+                    let url = String(text[r])
+                    result.append(TelegramNativeOfflineLink(name: "电驴链接", url: url, code: nil, type: "ed2k", copyText: url, textWithoutLinks: nil, source: "message"))
+                }
+            }
+        }
+        return result
+    }
+
+    private var downloadsHubView: some View {
+        VStack(spacing: 0) {
+            // 顶部批量操作栏
+            HStack {
+                Button {
+                    toggleSelectAllDownloads()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: selectedDownloadMsgIds.count > 0 && selectedDownloadMsgIds.count >= downloadableMessages.count ? "checkmark.circle.fill" : (selectedDownloadMsgIds.count > 0 ? "minus.circle.fill" : "circle"))
+                            .foregroundStyle(Color.accentColor)
+                        Text("全选 (\(downloadableMessages.count))")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.primary)
+                    }
+                }
+
+                Spacer()
+
+                Text("已选 \(selectedDownloadMsgIds.count) 项")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color(uiColor: .secondarySystemBackground), in: Capsule())
+
+                Button {
+                    batchCopySelectedLinks()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.on.doc.fill")
+                        Text("批量复制 (多行)")
+                    }
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(selectedDownloadMsgIds.isEmpty ? Color.gray.opacity(0.5) : Color.green, in: Capsule())
+                }
+                .disabled(selectedDownloadMsgIds.isEmpty)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(Color(uiColor: .systemBackground))
+            .overlay(alignment: .bottom) {
+                Divider()
+            }
+
+            if downloadableMessages.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "arrow.down.doc")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.secondary)
+                    Text("当前频道暂无可下载资源")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(downloadableMessages) { msg in
+                            downloadCard(msg)
+                        }
+                    }
+                    .padding(16)
+                }
+            }
+        }
+    }
+
+    private func downloadCard(_ msg: TelegramNativeMessage) -> some View {
+        let isSelected = selectedDownloadMsgIds.contains(msg.id)
+        let links = extractOfflineLinks(from: msg)
+        return HStack(alignment: .top, spacing: 12) {
+            // 选择复选框
+            Button {
+                toggleSelectDownloadMsg(msg.id)
+            } label: {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            }
+            .padding(.top, 4)
+
+            VStack(alignment: .leading, spacing: 10) {
+                // 1. 文字标题：严格只显示第一行内容
+                HStack {
+                    Text(getMessageFirstLine(msg.text))
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer()
+                    if let d = msg.date {
+                        Text(formatDate(d))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack(alignment: .top, spacing: 10) {
+                    // 2. 图片参考 (点击可缩放放大预览)
+                    if let chatId = selectedDialog?.id,
+                       let thumbURL = model.apiClient?.telegramUserThumbURL(chatId: chatId, messageId: msg.id) {
+                        Button {
+                            activeImageTarget = ImageTarget(url: thumbURL)
+                        } label: {
+                            ZStack(alignment: .bottomTrailing) {
+                                AsyncImage(url: thumbURL) { phase in
+                                    switch phase {
+                                    case .success(let img):
+                                        img.resizable().scaledToFill()
+                                    case .failure:
+                                        Color(uiColor: .secondarySystemBackground)
+                                            .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                                    default:
+                                        ProgressView().controlSize(.small)
+                                    }
+                                }
+                                .frame(width: 80, height: 60)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+                                Image(systemName: "plus.magnifyingglass")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .padding(3)
+                                    .background(.black.opacity(0.6), in: Circle())
+                                    .padding(2)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // 3. 下载链接展示
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(links.enumerated()), id: \.offset) { _, lk in
+                            HStack(spacing: 6) {
+                                Text(lk.type.uppercased())
+                                    .font(.system(size: 9, weight: .bold))
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 3))
+                                    .foregroundStyle(.blue)
+
+                                if isLinkCopied(lk.url) {
+                                    Text("✓ 已复制")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1)
+                                        .background(Color.green.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
+                                        .foregroundStyle(.green)
+                                }
+
+                                Text(lk.url)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+
+                                Spacer()
+
+                                Button {
+                                    copySingleLink(lk.url)
+                                } label: {
+                                    HStack(spacing: 2) {
+                                        Image(systemName: isLinkCopied(lk.url) ? "checkmark" : "doc.on.doc")
+                                        Text(isLinkCopied(lk.url) ? "已复制" : "复制")
+                                    }
+                                    .font(.system(size: 11, weight: .medium))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(isLinkCopied(lk.url) ? Color.green.opacity(0.15) : Color(uiColor: .tertiarySystemFill), in: Capsule())
+                                    .foregroundStyle(isLinkCopied(lk.url) ? Color.green : Color.primary)
+                                }
+                            }
+                            .padding(6)
+                            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 6))
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(isSelected ? Color.accentColor : Color(uiColor: .separator).opacity(0.4), lineWidth: isSelected ? 1.5 : 0.8)
+        )
+    }
+}
+
+// MARK: - 原生手势缩放图片查看器 (双击放大 / 捏合缩放 / 拖拽平移)
+
+struct TelegramZoomableImageViewer: View {
+    let url: URL
+    let onClose: () -> Void
+
+    @State private var scale: CGFloat = 1.0
+    @State private var lastScale: CGFloat = 1.0
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        NavigationStack {
+            GeometryReader { geo in
+                ZStack {
+                    Color.black.ignoresSafeArea()
+
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image
+                                .resizable()
+                                .scaledToFit()
+                                .scaleEffect(scale)
+                                .offset(offset)
+                                .gesture(
+                                    MagnificationGesture()
+                                        .onChanged { value in
+                                            let delta = value / lastScale
+                                            lastScale = value
+                                            scale = min(max(scale * delta, 1.0), 5.0)
+                                        }
+                                        .onEnded { _ in
+                                            lastScale = 1.0
+                                            if scale < 1.0 {
+                                                withAnimation(.spring()) {
+                                                    scale = 1.0
+                                                    offset = .zero
+                                                    lastOffset = .zero
+                                                }
+                                            }
+                                        }
+                                        .simultaneously(with:
+                                            DragGesture()
+                                                .onChanged { value in
+                                                    if scale > 1.0 {
+                                                        offset = CGSize(
+                                                            width: lastOffset.width + value.translation.width,
+                                                            height: lastOffset.height + value.translation.height
+                                                        )
+                                                    }
+                                                }
+                                                .onEnded { _ in
+                                                    if scale > 1.0 {
+                                                        lastOffset = offset
+                                                    } else {
+                                                        withAnimation(.spring()) {
+                                                            offset = .zero
+                                                            lastOffset = .zero
+                                                        }
+                                                    }
+                                                }
+                                        )
+                                )
+                                .onTapGesture(count: 2) {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                        if scale > 1.2 {
+                                            scale = 1.0
+                                            offset = .zero
+                                            lastOffset = .zero
+                                        } else {
+                                            scale = 2.5
+                                        }
+                                    }
+                                }
+                        case .failure:
+                            VStack(spacing: 8) {
+                                Image(systemName: "photo")
+                                    .font(.system(size: 40))
+                                    .foregroundStyle(.white.opacity(0.6))
+                                Text("图片加载失败")
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.6))
+                            }
+                        default:
+                            ProgressView()
+                                .tint(.white)
+                        }
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
+                }
+            }
+            .navigationTitle("图片预览")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.black, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("关闭") {
+                        onClose()
+                    }
+                    .foregroundStyle(.white)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        UIPasteboard.general.string = url.absoluteString
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .foregroundStyle(.white)
+                    }
+                    .accessibilityLabel("复制图片链接")
+                }
+            }
         }
     }
 }

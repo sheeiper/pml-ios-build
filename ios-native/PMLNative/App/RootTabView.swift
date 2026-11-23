@@ -2,10 +2,10 @@ import SwiftUI
 
 enum AppTab: Hashable {
     case home
-    case browse
+    case mediaLibrary
     case shorts
     case creators
-    case profile
+    case appCenter
 }
 
 struct RootTabView: View {
@@ -17,12 +17,12 @@ struct RootTabView: View {
         // 使用系统 TabView：使用 iOS 26 SDK 构建后，TabBar 会自动采用 Liquid Glass 悬浮样式。
         TabView(selection: $selection) {
             HomeView()
-                .tabItem { Label("首页", systemImage: "house.fill") }
+                .tabItem { Label("主页", systemImage: "house.fill") }
                 .tag(AppTab.home)
 
-            BrowseView()
-                .tabItem { Label("浏览", systemImage: "folder.fill") }
-                .tag(AppTab.browse)
+            MovieLibraryView()
+                .tabItem { Label("媒体库", systemImage: "film.stack.fill") }
+                .tag(AppTab.mediaLibrary)
 
             ShortVideosView()
                 .tabItem { Label("短视频", systemImage: "play.rectangle.fill") }
@@ -36,7 +36,7 @@ struct RootTabView: View {
                 AppCenterView()
             }
             .tabItem { Label("应用中心", systemImage: "square.grid.2x2.fill") }
-            .tag(AppTab.profile)
+            .tag(AppTab.appCenter)
         }
         .id(model.settingsRevision)
         .onChange(of: scenePhase) { _, phase in
@@ -144,7 +144,7 @@ struct ProfilePlaceholderView: View {
 
 struct AppCenterView: View {
     private enum Destination: String, Identifiable {
-        case movies, pending, history, favorites, duplicates, scan, settings, telegram
+        case movies, browse, pending, history, favorites, duplicates, scan, settings, telegram
         var id: String { rawValue }
     }
 
@@ -155,6 +155,7 @@ struct AppCenterView: View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 12) {
                 tile("影视库", "film.stack.fill", .movies)
+                tile("文件浏览", "folder.fill", .browse)
                 tile("Telegram 订阅", "paperplane.fill", .telegram)
                 tile("待整理", "tray.and.arrow.down.fill", .pending)
                 tile("播放记录", "clock.arrow.circlepath", .history)
@@ -170,6 +171,7 @@ struct AppCenterView: View {
         .navigationDestination(item: $destination) { dest in
             switch dest {
             case .movies: MovieLibraryView()
+            case .browse: BrowseView()
             case .telegram: TelegramFeedView()
             case .pending: PendingCurationView()
             case .history: HistoryView()

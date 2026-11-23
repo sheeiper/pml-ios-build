@@ -363,6 +363,12 @@ fn schema_sql() -> &'static str {
         updated_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS scrape_whitelist (
+        path TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS scan_runs (
         id TEXT PRIMARY KEY,
         domain TEXT NOT NULL,

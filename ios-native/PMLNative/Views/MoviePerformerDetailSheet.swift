@@ -6,6 +6,7 @@ struct MoviePerformerDetailSheet: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let performer: MoviePerformer
+    var onBack: (() -> Void)? = nil
     var onFilterMovies: ((String) -> Void)? = nil
     var onPlay: ((String, String) -> Void)? = nil
 
@@ -141,7 +142,25 @@ struct MoviePerformerDetailSheet: View {
             }
             .navigationTitle(detail?.person.name ?? performer.name)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
+            .toolbar {
+                if let onBack {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            onBack()
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: "chevron.left")
+                                Text("演员列表")
+                            }
+                            .font(.body.weight(.medium))
+                        }
+                    }
+                } else {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("完成") { dismiss() }
+                    }
+                }
+            }
             .task {
                 await load()
             }
@@ -156,7 +175,9 @@ struct MoviePerformerDetailSheet: View {
             .sheet(item: $selectedMovie) { movie in
                 MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
                     selectedMovie = nil
-                    dismiss()
+                    if onBack == nil {
+                        dismiss()
+                    }
                     onPlay?(targetId, movie.title)
                 }
                 .environmentObject(model)

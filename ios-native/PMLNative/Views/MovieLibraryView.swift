@@ -67,111 +67,114 @@ public struct MovieLibraryView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            Picker("内容", selection: $mode) {
-                ForEach(LibraryMode.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal)
-            .padding(.top, 8)
-            .onChange(of: mode) { _, _ in resetAndLoad() }
+        Group {
+            if let performer = selectedPerformer {
+                MoviePerformerDetailSheet(
+                    performer: performer,
+                    onBack: { selectedPerformer = nil },
+                    onFilterMovies: { actorName in
+                        selectedPerformer = nil
+                        mode = .movies
+                        selectedActor = actorName
+                        resetAndLoad()
+                    },
+                    onPlay: { targetId, title in
+                        Task {
+                            try? await Task.sleep(nanoseconds: 380_000_000)
+                            await playAsset(targetId, title: title)
+                        }
+                    }
+                )
+                .environmentObject(model)
+            } else {
+                VStack(spacing: 0) {
+                    Picker("内容", selection: $mode) {
+                        ForEach(LibraryMode.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+                    .onChange(of: mode) { _, _ in resetAndLoad() }
 
-            if mode == .movies, activeMovieFilterCount > 0 { activeMovieFilterStrip }
-            else if mode == .performers, activePerformerFilterCount > 0 { activePerformerFilterStrip }
-            else if mode == .issues { issueFilters }
+                    if mode == .movies, activeMovieFilterCount > 0 { activeMovieFilterStrip }
+                    else if mode == .performers, activePerformerFilterCount > 0 { activePerformerFilterStrip }
+                    else if mode == .issues { issueFilters }
 
-            if let errorMessage {
-                Label(errorMessage, systemImage: "exclamationmark.triangle")
-                    .font(.footnote).foregroundStyle(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal).padding(.vertical, 8)
-            }
+                    if let errorMessage {
+                        Label(errorMessage, systemImage: "exclamationmark.triangle")
+                            .font(.footnote).foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal).padding(.vertical, 8)
+                    }
 
-            content
-        }
-        .navigationTitle(mode == .movies ? "影视库 (\(total))" : mode.rawValue)
-        .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $searchQuery, prompt: mode == .performers ? "搜索演员姓名或别名" : "搜索番号、片名、演员或片厂")
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if mode == .movies || mode == .performers {
-                    let count = mode == .movies ? activeMovieFilterCount : activePerformerFilterCount
-                    Button { showFilterDrawer = true } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: count > 0 ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-                            if count > 0 {
-                                Text("\(count)")
-                                    .font(.caption2.bold())
+                    content
+                }
+                .navigationTitle(mode == .movies ? "影视库 (\(total))" : mode.rawValue)
+                .navigationBarTitleDisplayMode(.inline)
+                .searchable(text: $searchQuery, prompt: mode == .performers ? "搜索演员姓名或别名" : "搜索番号、片名、演员或片厂")
+                .toolbar {
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        if mode == .movies || mode == .performers {
+                            let count = mode == .movies ? activeMovieFilterCount : activePerformerFilterCount
+                            Button { showFilterDrawer = true } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: count > 0 ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                                    if count > 0 {
+                                        Text("\(count)")
+                                            .font(.caption2.bold())
+                                    }
+                                }
+                                .foregroundStyle(count > 0 ? .purple : .primary)
                             }
                         }
-                        .foregroundStyle(count > 0 ? .purple : .primary)
+                        Button { showScrapeSheet = true } label: {
+                            Label("数据管理", systemImage: "bolt.badge.clock.fill").foregroundStyle(.purple)
+                        }
                     }
                 }
-                Button { showScrapeSheet = true } label: {
-                    Label("数据管理", systemImage: "bolt.badge.clock.fill").foregroundStyle(.purple)
+                .task {
+                    await reload()
+                    await loadDiscoveryData()
+                }
+                .task(id: searchQuery) {
+                    // Debounce both typing and clearing the search field so an empty query reloads the full server page.
+                    try? await Task.sleep(for: .milliseconds(350))
+                    guard !Task.isCancelled else { return }
+                    await reload()
+                }
+                .refreshable {
+                    await reload()
+                    if mode == .movies { await loadDiscoveryData() }
+                }
+                .onDisappear { scrapePollTask?.cancel() }
+                .sheet(item: $selectedMovie) { movie in
+                    MovieDetailSheet(
+                        number: movie.number,
+                        assetId: movie.assetId,
+                        fileName: movie.title,
+                        remotePath: nil,
+                        onPlay: { target in
+                            selectedMovie = nil
+                            selectedPerformer = nil
+                            Task {
+                                try? await Task.sleep(nanoseconds: 380_000_000)
+                                await playAsset(target, title: movie.title)
+                            }
+                        },
+                        onFilterActor: { actorName in
+                            mode = .movies
+                            selectedActor = actorName
+                            resetAndLoad()
+                        },
+                        onFilterMaker: { makerName in
+                            mode = .movies
+                            selectedMaker = makerName
+                            resetAndLoad()
+                        }
+                    )
+                    .environmentObject(model)
                 }
             }
-        }
-        .task {
-            await reload()
-            await loadDiscoveryData()
-        }
-        .task(id: searchQuery) {
-            // Debounce both typing and clearing the search field so an empty query reloads the full server page.
-            try? await Task.sleep(for: .milliseconds(350))
-            guard !Task.isCancelled else { return }
-            await reload()
-        }
-        .refreshable {
-            await reload()
-            if mode == .movies { await loadDiscoveryData() }
-        }
-        .onDisappear { scrapePollTask?.cancel() }
-        .sheet(item: $selectedMovie) { movie in
-            MovieDetailSheet(
-                number: movie.number,
-                assetId: movie.assetId,
-                fileName: movie.title,
-                remotePath: nil,
-                onPlay: { target in
-                    selectedMovie = nil
-                    selectedPerformer = nil
-                    Task {
-                        try? await Task.sleep(nanoseconds: 380_000_000)
-                        await playAsset(target, title: movie.title)
-                    }
-                },
-                onFilterActor: { actorName in
-                    mode = .movies
-                    selectedActor = actorName
-                    resetAndLoad()
-                },
-                onFilterMaker: { makerName in
-                    mode = .movies
-                    selectedMaker = makerName
-                    resetAndLoad()
-                }
-            )
-            .environmentObject(model)
-        }
-        .sheet(item: $selectedPerformer) { performer in
-            MoviePerformerDetailSheet(
-                performer: performer,
-                onFilterMovies: { actorName in
-                    mode = .movies
-                    selectedActor = actorName
-                    resetAndLoad()
-                },
-                onPlay: { targetId, title in
-                    selectedMovie = nil
-                    selectedPerformer = nil
-                    Task {
-                        try? await Task.sleep(nanoseconds: 380_000_000)
-                        await playAsset(targetId, title: title)
-                    }
-                }
-            )
-            .environmentObject(model)
         }
         .fullScreenCover(item: $preview) { item in
             GestureVideoPlayerSheet(url: item.url, title: item.title, assetId: item.assetId, startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel, remotePath: item.remotePath)
@@ -1126,27 +1129,36 @@ public struct MovieLibraryView: View {
                     if batchProgress?.running == true {
                         Button("停止影片刮削", role: .destructive) { Task { await stopScrape() } }
                     } else {
-                        Button(syncingRemote ? "正在同步 115…" : "同步 115 变动并仅刮新增（跳过失败项）") {
+                        Button {
                             Task { await runRemoteSync(autoScrape: true, mode: "fast") }
+                        } label: {
+                            Label(syncingRemote ? "正在同步 115…" : "一键同步 115 变动并刮新增（推荐）", systemImage: "bolt.fill")
+                                .font(.body.weight(.semibold))
                         }
                         .disabled(syncingRemote)
+                        .tint(.purple)
+
                         Button("仅刮变动/新增（跳过失败项）") { Task { await startManualScrape(mode: "new") } }
-                        Button("快速检测 115 变动") {
-                            Task { await runRemoteSync(autoScrape: false, mode: "fast") }
+
+                        DisclosureGroup("更多高级运维选项...") {
+                            Button("快速检测 115 变动") {
+                                Task { await runRemoteSync(autoScrape: false, mode: "fast") }
+                            }
+                            .disabled(syncingRemote)
+                            Button("仅刷新失败项目录") {
+                                Task { await runRemoteSync(autoScrape: false, mode: "issues") }
+                            }
+                            .disabled(syncingRemote)
+                            Button("深度全量校验") {
+                                Task { await runRemoteSync(autoScrape: false, mode: "deep") }
+                            }
+                            .disabled(syncingRemote)
+                            Button("全量增量刮削（含失败项）") { Task { await startManualScrape(mode: "all") } }
+                            if (batchStats?.failedCount ?? 0) > 0 {
+                                Button("仅重试失败项（含 FC2 兜底）") { Task { await startManualScrape(mode: "failed") } }
+                            }
                         }
-                        .disabled(syncingRemote)
-                        Button("仅刷新失败项目录") {
-                            Task { await runRemoteSync(autoScrape: false, mode: "issues") }
-                        }
-                        .disabled(syncingRemote)
-                        Button("深度全量校验") {
-                            Task { await runRemoteSync(autoScrape: false, mode: "deep") }
-                        }
-                        .disabled(syncingRemote)
-                        Button("全量增量刮削（含失败项）") { Task { await startManualScrape(mode: "all") } }
-                        if (batchStats?.failedCount ?? 0) > 0 {
-                            Button("仅重试失败项（含 FC2 兜底）") { Task { await startManualScrape(mode: "failed") } }
-                        }
+                        .font(.subheadline)
                     }
                 }
 

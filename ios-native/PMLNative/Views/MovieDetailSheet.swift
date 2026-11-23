@@ -27,6 +27,7 @@ public struct MovieDetailSheet: View {
     @State private var subtitleError: String?
     @State private var subtitleDownloadingId: String?
     @State private var subtitleDeletingId: String?
+    @State private var copyToast: String?
 
     public init(
         number: String? = nil,
@@ -48,8 +49,9 @@ public struct MovieDetailSheet: View {
 
     public var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+            ZStack(alignment: .top) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
                     if loading {
                         HStack {
                             Spacer()
@@ -99,18 +101,46 @@ public struct MovieDetailSheet: View {
                         // Title & Badges
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 6) {
-                                Text(meta.number)
-                                    .font(.caption.bold())
+                                Button {
+                                    UIPasteboard.general.string = meta.number
+                                    copyToast = "已复制番号 \(meta.number)"
+                                    Task {
+                                        try? await Task.sleep(nanoseconds: 1_800_000_000)
+                                        copyToast = nil
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Text(meta.number)
+                                            .font(.caption.bold())
+                                        Image(systemName: "doc.on.doc")
+                                            .font(.system(size: 9))
+                                    }
                                     .padding(.horizontal, 8)
-                                    .padding(.vertical, 3)
+                                    .padding(.vertical, 4)
                                     .background(LinearGradient(colors: [.purple, .pink], startPoint: .leading, endPoint: .trailing))
                                     .foregroundStyle(.white)
                                     .clipShape(RoundedRectangle(cornerRadius: 5))
+                                }
+                                .buttonStyle(.plain)
 
                                 if let date = meta.releaseDate, !date.isEmpty {
-                                    Text(date)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "calendar")
+                                            .font(.system(size: 9))
+                                        Text("发布：\(date)")
+                                    }
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+
+                                if meta.updatedAt > 0 {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "arrow.down.circle")
+                                            .font(.system(size: 9))
+                                        Text("入库：\(formatTimestamp(meta.updatedAt))")
+                                    }
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                                 }
 
                                 if let duration = meta.durationMinutes, duration > 0 {
@@ -373,7 +403,21 @@ public struct MovieDetailSheet: View {
                 }
                 .padding()
             }
-            .navigationTitle(metadata?.number ?? "影视百科详情")
+
+            if let toast = copyToast {
+                Text(toast)
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.85), in: Capsule())
+                    .padding(.top, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(100)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: copyToast)
+        .navigationTitle(metadata?.number ?? "影视百科详情")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -475,6 +519,13 @@ public struct MovieDetailSheet: View {
         let gb = Double(bytes) / 1_073_741_824.0
         if gb >= 1.0 { return String(format: "%.2f GB", gb) }
         return "\(bytes / 1_048_576) MB"
+    }
+
+    private func formatTimestamp(_ ts: Int64) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(ts))
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: date)
     }
 
     private func openPerformer(named name: String) async {
