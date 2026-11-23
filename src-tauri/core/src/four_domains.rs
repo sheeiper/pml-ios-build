@@ -485,7 +485,7 @@ fn ensure_domain_roots(connection: &Connection, app: &AppHandle) -> Result<(), S
     let configured = |key: &str| settings.get(key).map(|value| value.trim_end_matches('/').to_owned());
     let recent = configured("dir_recent");
     let pending = configured("dir_pending");
-    let vault = configured("dir_vault");
+    let _vault = configured("dir_vault");
     let comics = configured("dir_comics");
 
     let mut chosen: HashMap<&str, (String, String)> = HashMap::new();

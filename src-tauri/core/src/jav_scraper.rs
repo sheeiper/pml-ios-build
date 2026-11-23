@@ -1355,25 +1355,22 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         return Err(format!("JavDB 搜索状态码异常：{}", search_resp.status()));
     }
 
-    let search_html = search_resp.text().await.map_err(|e| format!("读取搜索响应失败：{e}"))?;
+    let mut search_html = search_resp.text().await.map_err(|e| format!("读取搜索响应失败：{e}"))?;
 
-    let card_match = javdb_exact_card(&search_html, number);
-    let (detail_path, card) = match card_match {
-        Some(m) => m,
-        None => {
-            if let Some(fallback) = fallback_search {
-                let resp2 = fetch_search(fallback).await.map_err(|e| format!("请求 JavDB 搜索失败：{e}"))?;
+    if javdb_exact_card(&search_html, number).is_none() {
+        if let Some(fallback) = fallback_search {
+            if let Ok(resp2) = fetch_search(fallback).await {
                 if resp2.status().is_success() {
-                    let html2 = resp2.text().await.map_err(|e| format!("读取搜索响应失败：{e}"))?;
-                    javdb_exact_card(&html2, number).ok_or_else(|| format!("JavDB 未找到精确番号【{number}】"))?
-                } else {
-                    return Err(format!("JavDB 未找到精确番号【{number}】"));
+                    if let Ok(html2) = resp2.text().await {
+                        search_html = html2;
+                    }
                 }
-            } else {
-                return Err(format!("JavDB 未找到精确番号【{number}】"));
             }
         }
-    };
+    }
+
+    let (detail_path, card) = javdb_exact_card(&search_html, number)
+        .ok_or_else(|| format!("JavDB 未找到精确番号【{number}】"))?;
     let search_title = card.split("class=\"video-title\"").nth(1)
         .and_then(|s| s.split_once('>')).and_then(|(_, s)| s.split_once("</div>"))
         .map(|(s, _)| plain_text(s));
