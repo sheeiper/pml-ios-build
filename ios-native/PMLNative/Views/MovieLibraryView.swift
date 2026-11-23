@@ -933,20 +933,23 @@ public struct MovieLibraryView: View {
         Button { selectedPerformer = person } label: {
             VStack(alignment: .leading, spacing: 6) {
                 ZStack(alignment: .bottomTrailing) {
-                    Group {
-                        if let raw = person.avatarUrl, !raw.isEmpty, let url = model.proxyScraperImageURL(rawUrl: raw) {
-                            CachedImageView(url: url, contentMode: .fill, minHeight: 110, maxPixel: 360)
-                        } else {
-                            ZStack {
-                                LinearGradient(colors: [.indigo, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
-                                Text(String(person.name.prefix(1)))
-                                    .font(.title2.bold())
-                                    .foregroundStyle(.white)
+                    Color.black.opacity(0.85)
+                        .aspectRatio(1, contentMode: .fit)
+                        .overlay(
+                            Group {
+                                if let raw = person.avatarUrl, !raw.isEmpty, let url = model.proxyScraperImageURL(rawUrl: raw) {
+                                    CachedImageView(url: url, contentMode: .fill, minHeight: 110, maxPixel: 360)
+                                } else {
+                                    ZStack {
+                                        LinearGradient(colors: [.indigo, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
+                                        Text(String(person.name.prefix(1)))
+                                            .font(.title2.bold())
+                                            .foregroundStyle(.white)
+                                    }
+                                }
                             }
-                        }
-                    }
-                    .aspectRatio(1, contentMode: .fit)
-                    .clipped()
+                        )
+                        .clipped()
 
                     Text("\(person.movieCount) 部")
                         .font(.system(size: 10, weight: .bold))

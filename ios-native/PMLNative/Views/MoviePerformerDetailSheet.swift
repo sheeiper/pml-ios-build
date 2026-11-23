@@ -21,6 +21,7 @@ struct MoviePerformerDetailSheet: View {
 
     @State private var detailTab: PerformerWorkTab = .library
     @State private var showEditor = false
+    @State private var showAvatarViewer = false
     @State private var selectedMovie: MovieMetadata?
     @State private var recentResult: PerformerRecentReleasesResult?
     @State private var recentLoading = false
@@ -160,6 +161,11 @@ struct MoviePerformerDetailSheet: View {
                 }
                 .environmentObject(model)
             }
+            .fullScreenCover(isPresented: $showAvatarViewer) {
+                if let person = detail?.person ?? Optional(performer) {
+                    PerformerAvatarViewer(person: person, avatarUrl: avatarURL(person.avatarUrl))
+                }
+            }
         }
     }
 
@@ -247,9 +253,20 @@ struct MoviePerformerDetailSheet: View {
                                     .lineLimit(2)
                                     .foregroundStyle(.primary)
                                 if let d = rel.releaseDate, !d.isEmpty {
-                                    Text(d)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                    let isFuture = d > ISO8601DateFormatter().string(from: Date()).prefix(10)
+                                    HStack(spacing: 3) {
+                                        if isFuture {
+                                            Text("预定")
+                                                .font(.system(size: 8, weight: .bold))
+                                                .padding(.horizontal, 4)
+                                                .padding(.vertical, 1)
+                                                .background(Color.orange.opacity(0.25), in: RoundedRectangle(cornerRadius: 3))
+                                                .foregroundStyle(.orange)
+                                        }
+                                        Text(d)
+                                            .font(.caption2)
+                                            .foregroundStyle(isFuture ? .orange : .secondary)
+                                    }
                                 }
                             }
                             .opacity(rel.inLibrary ? 0.65 : 1.0)
@@ -285,10 +302,30 @@ struct MoviePerformerDetailSheet: View {
 
     private func profileHeader(_ person: MoviePerformer) -> some View {
         HStack(spacing: 14) {
-            PerformerAvatarView(value: person.avatarUrl, proxy: avatarURL(person.avatarUrl), fallbackName: person.name)
-                .frame(width: 82, height: 82)
-                .clipShape(Circle())
-                .overlay(Circle().stroke(Color.purple.opacity(0.4), lineWidth: 2))
+            Button {
+                if let avatar = person.avatarUrl, !avatar.isEmpty {
+                    showAvatarViewer = true
+                }
+            } label: {
+                ZStack(alignment: .bottomTrailing) {
+                    PerformerAvatarView(value: person.avatarUrl, proxy: avatarURL(person.avatarUrl), fallbackName: person.name)
+                        .frame(width: 82, height: 82)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(Color.purple.opacity(0.4), lineWidth: 2))
+
+                    if let avatar = person.avatarUrl, !avatar.isEmpty {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(4)
+                            .background(Circle().fill(Color.purple))
+                            .offset(x: 2, y: 2)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled((person.avatarUrl ?? "").isEmpty)
+
             VStack(alignment: .leading, spacing: 5) {
                 Text(person.name).font(.title2.bold())
                 if !person.aliases.isEmpty {
@@ -574,6 +611,64 @@ struct PerformerAvatarView: View {
                 Text(String(fallbackName.prefix(1)))
                     .font(.title2.bold())
                     .foregroundStyle(.white)
+            }
+        }
+    }
+}
+
+struct PerformerAvatarViewer: View {
+    let person: MoviePerformer
+    let avatarUrl: URL?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black.ignoresSafeArea()
+
+            VStack(spacing: 16) {
+                Spacer()
+                if let raw = person.avatarUrl, raw.hasPrefix("data:image/"),
+                   let comma = raw.firstIndex(of: ","),
+                   let data = Data(base64Encoded: String(raw[raw.index(after: comma)...])),
+                   let image = UIImage(data: data) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .padding(20)
+                } else if let avatarUrl {
+                    CachedImageView(url: avatarUrl, contentMode: .fit, minHeight: 240, maxPixel: 2048)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .padding(20)
+                } else {
+                    Text("暂无头像图片")
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(spacing: 4) {
+                    Text(person.name)
+                        .font(.title3.bold())
+                        .foregroundStyle(.white)
+                    if !person.aliases.isEmpty {
+                        Text(person.aliases.joined(separator: " / "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onTapGesture { dismiss() }
+
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 28))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .padding(20)
             }
         }
     }
