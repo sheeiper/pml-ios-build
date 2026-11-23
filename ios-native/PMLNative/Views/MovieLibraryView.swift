@@ -22,6 +22,12 @@ public struct MovieLibraryView: View {
     @State private var selectedMaker = ""
     @State private var selectedActor = ""
     @State private var sort = "release_date_desc"
+    @State private var performerSort = "latest_release"
+    @State private var performerAgeRange = ""
+    @State private var performerHeightRange = ""
+    @State private var performerCup = ""
+    @State private var performerMinMovies = 0
+    @State private var performerProfileFilter = ""
     @State private var mode: LibraryMode = .movies
     @State private var offset = 0
     @State private var loading = false
@@ -31,6 +37,7 @@ public struct MovieLibraryView: View {
     @State private var selectedPerformer: MoviePerformer?
     @State private var preview: PreviewItem?
     @State private var showScrapeSheet = false
+    @State private var showFilterDrawer = false
     @State private var batchStats: BatchScrapeStats?
     @State private var batchProgress: BatchScrapeProgress?
     @State private var enrichStats: PerformerEnrichStats?
@@ -69,7 +76,8 @@ public struct MovieLibraryView: View {
             .padding(.top, 8)
             .onChange(of: mode) { _, _ in resetAndLoad() }
 
-            if mode == .movies { movieFilters }
+            if mode == .movies, activeMovieFilterCount > 0 { activeMovieFilterStrip }
+            else if mode == .performers, activePerformerFilterCount > 0 { activePerformerFilterStrip }
             else if mode == .issues { issueFilters }
 
             if let errorMessage {
@@ -85,7 +93,20 @@ public struct MovieLibraryView: View {
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $searchQuery, prompt: mode == .performers ? "搜索演员姓名或别名" : "搜索番号、片名、演员或片厂")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if mode == .movies || mode == .performers {
+                    let count = mode == .movies ? activeMovieFilterCount : activePerformerFilterCount
+                    Button { showFilterDrawer = true } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: count > 0 ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                            if count > 0 {
+                                Text("\(count)")
+                                    .font(.caption2.bold())
+                            }
+                        }
+                        .foregroundStyle(count > 0 ? .purple : .primary)
+                    }
+                }
                 Button { showScrapeSheet = true } label: {
                     Label("数据管理", systemImage: "bolt.badge.clock.fill").foregroundStyle(.purple)
                 }
@@ -157,6 +178,11 @@ public struct MovieLibraryView: View {
                 .id(item.id).environmentObject(model)
         }
         .sheet(isPresented: $showScrapeSheet) { manualScrapeSheet }
+        .sheet(isPresented: $showFilterDrawer) {
+            filterDrawerSheet
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
         .alert("指定番号并刮削", isPresented: Binding(
             get: { manualTargetVideo != nil },
             set: { if !$0 { manualTargetVideo = nil } }
@@ -204,7 +230,11 @@ public struct MovieLibraryView: View {
                     case .unrecognized:
                         ForEach(unrecognized) { item in unrecognizedCell(item).onAppear { loadMoreIfNeeded(item) } }
                     case .performers:
-                        ForEach(performers) { person in performerCell(person).onAppear { loadMoreIfNeeded(person) } }
+                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                            ForEach(performers) { person in
+                                performerCell(person).onAppear { loadMoreIfNeeded(person) }
+                            }
+                        }
                     }
                     if loadingMore { ProgressView().padding() }
                 }
@@ -435,6 +465,283 @@ public struct MovieLibraryView: View {
         .onChange(of: sort) { _, _ in resetAndLoad() }
     }
 
+    private var activeMovieFilterCount: Int {
+        (sort != "release_date_desc" ? 1 : 0) + (!selectedMaker.isEmpty ? 1 : 0) + (!selectedActor.isEmpty ? 1 : 0)
+    }
+
+    private var activePerformerFilterCount: Int {
+        (performerSort != "latest_release" ? 1 : 0)
+            + (!performerAgeRange.isEmpty ? 1 : 0)
+            + (!performerHeightRange.isEmpty ? 1 : 0)
+            + (!performerCup.isEmpty ? 1 : 0)
+            + (performerMinMovies > 0 ? 1 : 0)
+            + (!performerProfileFilter.isEmpty ? 1 : 0)
+    }
+
+    private var activeMovieFilterStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                if sort != "release_date_desc" {
+                    activeTagChip(sortLabel) { sort = "release_date_desc"; resetAndLoad() }
+                }
+                if !selectedMaker.isEmpty {
+                    activeTagChip("片厂: \(selectedMaker)") { selectedMaker = ""; resetAndLoad() }
+                }
+                if !selectedActor.isEmpty {
+                    activeTagChip("演员: \(selectedActor)") { selectedActor = ""; resetAndLoad() }
+                }
+                Button("清空") {
+                    sort = "release_date_desc"
+                    selectedMaker = ""
+                    selectedActor = ""
+                    resetAndLoad()
+                }
+                .font(.caption2.bold())
+                .foregroundStyle(.red)
+            }
+            .padding(.horizontal)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private var activePerformerFilterStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                if performerSort != "latest_release" {
+                    activeTagChip(performerSortLabel) { performerSort = "latest_release"; resetAndLoad() }
+                }
+                if !performerAgeRange.isEmpty {
+                    activeTagChip("年龄: \(performerAgeRange)") { performerAgeRange = ""; resetAndLoad() }
+                }
+                if !performerHeightRange.isEmpty {
+                    activeTagChip("身高: \(performerHeightRange)") { performerHeightRange = ""; resetAndLoad() }
+                }
+                if !performerCup.isEmpty {
+                    activeTagChip("\(performerCup)罩杯") { performerCup = ""; resetAndLoad() }
+                }
+                if performerMinMovies > 0 {
+                    activeTagChip("≥\(performerMinMovies)部") { performerMinMovies = 0; resetAndLoad() }
+                }
+                if !performerProfileFilter.isEmpty {
+                    activeTagChip(performerProfileFilter == "has_avatar" ? "已有头像" : "待补全") { performerProfileFilter = ""; resetAndLoad() }
+                }
+                Button("清空") {
+                    performerSort = "latest_release"
+                    performerAgeRange = ""
+                    performerHeightRange = ""
+                    performerCup = ""
+                    performerMinMovies = 0
+                    performerProfileFilter = ""
+                    resetAndLoad()
+                }
+                .font(.caption2.bold())
+                .foregroundStyle(.red)
+            }
+            .padding(.horizontal)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func activeTagChip(_ title: String, onClear: @escaping () -> Void) -> some View {
+        HStack(spacing: 4) {
+            Text(title)
+            Button(action: onClear) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.caption2)
+            }
+            .buttonStyle(.plain)
+        }
+        .font(.caption2.weight(.semibold))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(Color.purple.opacity(0.18), in: Capsule())
+        .foregroundStyle(.purple)
+    }
+
+    private func drawerChoiceChip(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 9)
+                .padding(.horizontal, 6)
+                .background(active ? Color.purple : Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .foregroundStyle(active ? .white : .primary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var filterDrawerSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if mode == .movies {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("排序方式").font(.footnote.bold()).foregroundStyle(.secondary)
+                            let opts: [(String, String)] = [
+                                ("release_date_desc", "发行日期：最新"),
+                                ("release_date_asc", "发行日期：最早"),
+                                ("updated_at_desc", "入库时间：最新"),
+                                ("updated_at_asc", "入库时间：最早"),
+                                ("number", "番号：A - Z"),
+                                ("title", "片名：A - Z"),
+                            ]
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                ForEach(opts, id: \.0) { val, label in
+                                    drawerChoiceChip(label, active: sort == val) {
+                                        sort = val
+                                        resetAndLoad()
+                                    }
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("片厂筛选").font(.footnote.bold()).foregroundStyle(.secondary)
+                            Picker("片厂", selection: Binding(
+                                get: { selectedMaker },
+                                set: { selectedMaker = $0; resetAndLoad() }
+                            )) {
+                                Text("全部片厂").tag("")
+                                ForEach(makers, id: \.self) { m in Text(m).tag(m) }
+                            }
+                            .pickerStyle(.menu)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("演员筛选").font(.footnote.bold()).foregroundStyle(.secondary)
+                            Picker("演员", selection: Binding(
+                                get: { selectedActor },
+                                set: { selectedActor = $0; resetAndLoad() }
+                            )) {
+                                Text("全部演员").tag("")
+                                ForEach(actors, id: \.self) { a in Text(a).tag(a) }
+                            }
+                            .pickerStyle(.menu)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("排序方式").font(.footnote.bold()).foregroundStyle(.secondary)
+                            let opts: [(String, String)] = [
+                                ("latest_release", "最新作品时间（默认）"),
+                                ("latest_added", "最新入库时间"),
+                                ("age_asc", "年龄：年轻优先"),
+                                ("age_desc", "年龄：年长优先"),
+                                ("movie_count_desc", "作品数：多 → 少"),
+                                ("movie_count_asc", "作品数：少 → 多"),
+                            ]
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                ForEach(opts, id: \.0) { val, label in
+                                    drawerChoiceChip(label, active: performerSort == val) {
+                                        performerSort = val
+                                        resetAndLoad()
+                                    }
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("年龄段").font(.footnote.bold()).foregroundStyle(.secondary)
+                            let ages: [(String, String)] = [("", "全部"), ("under22", "<22岁"), ("22_25", "22-25岁"), ("26_30", "26-30岁"), ("over30", "30岁+")]
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                ForEach(ages, id: \.0) { val, label in
+                                    drawerChoiceChip(label, active: performerAgeRange == val) {
+                                        performerAgeRange = val
+                                        resetAndLoad()
+                                    }
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("身高").font(.footnote.bold()).foregroundStyle(.secondary)
+                            let heights: [(String, String)] = [("", "全部"), ("under155", "<155cm"), ("155_165", "155-165cm"), ("over165", ">165cm")]
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                ForEach(heights, id: \.0) { val, label in
+                                    drawerChoiceChip(label, active: performerHeightRange == val) {
+                                        performerHeightRange = val
+                                        resetAndLoad()
+                                    }
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("罩杯").font(.footnote.bold()).foregroundStyle(.secondary)
+                            let cups = ["", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+                            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 5), spacing: 8) {
+                                ForEach(cups, id: \.self) { c in
+                                    drawerChoiceChip(c.isEmpty ? "全部" : c, active: performerCup == c) {
+                                        performerCup = c
+                                        resetAndLoad()
+                                    }
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("作品数门槛").font(.footnote.bold()).foregroundStyle(.secondary)
+                            let mins: [(Int, String)] = [(0, "全部"), (3, "≥3部"), (5, "≥5部"), (10, "≥10部"), (20, "≥20部")]
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                ForEach(mins, id: \.0) { val, label in
+                                    drawerChoiceChip(label, active: performerMinMovies == val) {
+                                        performerMinMovies = val
+                                        resetAndLoad()
+                                    }
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("档案状态").font(.footnote.bold()).foregroundStyle(.secondary)
+                            let profiles: [(String, String)] = [("", "全部"), ("has_avatar", "已有头像"), ("missing_profile", "待补全")]
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                ForEach(profiles, id: \.0) { val, label in
+                                    drawerChoiceChip(label, active: performerProfileFilter == val) {
+                                        performerProfileFilter = val
+                                        resetAndLoad()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(16)
+            }
+            .navigationTitle(mode == .movies ? "影视筛选与排序" : "演员筛选与排序")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("重置") {
+                        if mode == .movies {
+                            sort = "release_date_desc"
+                            selectedMaker = ""
+                            selectedActor = ""
+                        } else {
+                            performerSort = "latest_release"
+                            performerAgeRange = ""
+                            performerHeightRange = ""
+                            performerCup = ""
+                            performerMinMovies = 0
+                            performerProfileFilter = ""
+                        }
+                        resetAndLoad()
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { showFilterDrawer = false }
+                        .bold()
+                }
+            }
+        }
+    }
+
     private var issueFilters: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack {
@@ -442,6 +749,88 @@ public struct MovieLibraryView: View {
                 ForEach(issueCounts) { item in issueChip("\(item.category) (\(item.count))", value: item.category) }
             }.padding(.horizontal)
         }.padding(.vertical, 6)
+    }
+
+    private var performerSortLabel: String {
+        switch performerSort {
+        case "latest_added": return "最新入库"
+        case "age_asc": return "年龄升序"
+        case "age_desc": return "年龄降序"
+        case "movie_count_desc": return "作品最多"
+        case "movie_count_asc": return "作品最少"
+        default: return "最新作品"
+        }
+    }
+
+    private var performerFilters: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                Menu {
+                    Button("最新作品时间（默认）") { performerSort = "latest_release"; resetAndLoad() }
+                    Button("最新入库时间") { performerSort = "latest_added"; resetAndLoad() }
+                    Button("年龄：年轻优先") { performerSort = "age_asc"; resetAndLoad() }
+                    Button("年龄：年长优先") { performerSort = "age_desc"; resetAndLoad() }
+                    Button("作品数：多 → 少") { performerSort = "movie_count_desc"; resetAndLoad() }
+                    Button("作品数：少 → 多") { performerSort = "movie_count_asc"; resetAndLoad() }
+                } label: {
+                    Label(performerSortLabel, systemImage: "arrow.up.arrow.down")
+                }
+
+                Menu {
+                    Button("全部年龄") { performerAgeRange = ""; resetAndLoad() }
+                    Button("22岁以下") { performerAgeRange = "under22"; resetAndLoad() }
+                    Button("22 - 25岁") { performerAgeRange = "22_25"; resetAndLoad() }
+                    Button("26 - 30岁") { performerAgeRange = "26_30"; resetAndLoad() }
+                    Button("30岁以上") { performerAgeRange = "over30"; resetAndLoad() }
+                } label: {
+                    Label(performerAgeRange.isEmpty ? "年龄" : performerAgeRange, systemImage: "calendar")
+                }
+
+                Menu {
+                    Button("全部身高") { performerHeightRange = ""; resetAndLoad() }
+                    Button("155cm以下") { performerHeightRange = "under155"; resetAndLoad() }
+                    Button("155 - 165cm") { performerHeightRange = "155_165"; resetAndLoad() }
+                    Button("165cm以上") { performerHeightRange = "over165"; resetAndLoad() }
+                } label: {
+                    Label(performerHeightRange.isEmpty ? "身高" : performerHeightRange, systemImage: "ruler")
+                }
+
+                Menu {
+                    Button("全部罩杯") { performerCup = ""; resetAndLoad() }
+                    ForEach(["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"], id: \.self) { c in
+                        Button("\(c) 罩杯") { performerCup = c; resetAndLoad() }
+                    }
+                } label: {
+                    Label(performerCup.isEmpty ? "罩杯" : "\(performerCup)杯", systemImage: "sparkles")
+                }
+
+                Menu {
+                    Button("全部作品数") { performerMinMovies = 0; resetAndLoad() }
+                    Button("≥ 3 部") { performerMinMovies = 3; resetAndLoad() }
+                    Button("≥ 5 部") { performerMinMovies = 5; resetAndLoad() }
+                    Button("≥ 10 部") { performerMinMovies = 10; resetAndLoad() }
+                    Button("≥ 20 部") { performerMinMovies = 20; resetAndLoad() }
+                } label: {
+                    Label(performerMinMovies > 0 ? "≥\(performerMinMovies)部" : "作品数", systemImage: "film")
+                }
+
+                if !performerAgeRange.isEmpty || !performerHeightRange.isEmpty || !performerCup.isEmpty || performerMinMovies > 0 || performerSort != "latest_release" {
+                    Button("重置") {
+                        performerSort = "latest_release"
+                        performerAgeRange = ""
+                        performerHeightRange = ""
+                        performerCup = ""
+                        performerMinMovies = 0
+                        performerProfileFilter = ""
+                        resetAndLoad()
+                    }
+                    .foregroundStyle(.purple)
+                }
+            }
+            .font(.caption)
+            .padding(.horizontal)
+        }
+        .padding(.vertical, 6)
     }
     private func issueChip(_ title: String, value: String) -> some View {
         Button(title) { issueCategory = value; resetAndLoad() }
@@ -542,38 +931,57 @@ public struct MovieLibraryView: View {
 
     private func performerCell(_ person: MoviePerformer) -> some View {
         Button { selectedPerformer = person } label: {
-            HStack(spacing: 12) {
-                Group {
-                    if let raw = person.avatarUrl, !raw.isEmpty, let url = model.proxyScraperImageURL(rawUrl: raw) {
-                        CachedImageView(url: url, contentMode: .fill, minHeight: 52, maxPixel: 240)
-                    } else {
-                        ZStack {
-                            LinearGradient(colors: [.indigo, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
-                            Text(String(person.name.prefix(1))).font(.headline.bold()).foregroundStyle(.white)
+            VStack(alignment: .leading, spacing: 6) {
+                ZStack(alignment: .bottomTrailing) {
+                    Group {
+                        if let raw = person.avatarUrl, !raw.isEmpty, let url = model.proxyScraperImageURL(rawUrl: raw) {
+                            CachedImageView(url: url, contentMode: .fill, minHeight: 110, maxPixel: 360)
+                        } else {
+                            ZStack {
+                                LinearGradient(colors: [.indigo, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
+                                Text(String(person.name.prefix(1)))
+                                    .font(.title2.bold())
+                                    .foregroundStyle(.white)
+                            }
                         }
                     }
-                }
-                .frame(width: 52, height: 52)
-                .clipShape(Circle())
+                    .aspectRatio(1, contentMode: .fit)
+                    .clipped()
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(person.name).font(.subheadline.bold())
-                    if !person.aliases.isEmpty {
-                        Text(person.aliases.joined(separator: " / ")).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    HStack(spacing: 6) {
-                        Text("\(person.movieCount) 部作品")
-                        if let h = person.heightCm, h > 0 { Text("· \(h)cm") }
-                        if let b = person.birthDate, !b.isEmpty { Text("· \(b)") }
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    Text("\(person.movieCount) 部")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.black.opacity(0.75), in: Capsule())
+                        .foregroundStyle(.white)
+                        .padding(6)
                 }
-                Spacer()
-                Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(person.name)
+                        .font(.caption.bold())
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if let d = person.latestReleaseDate, !d.isEmpty {
+                        Text(d)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else if let h = person.heightCm, h > 0 {
+                        Text("\(h)cm")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else {
+                        Text("\(person.movieCount) 部作品")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 2)
             }
-            .padding(10)
-            .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
     }
@@ -651,7 +1059,17 @@ public struct MovieLibraryView: View {
                 guard version == requestVersion else { return }
                 unrecognized = reset ? result.items : unrecognized + result.items; unrecognizedTotal = result.total; offset += result.items.count
             case .performers:
-                let result = try await client.listMoviePerformers(query: searchQuery, limit: pageSize, offset: offset)
+                let result = try await client.listMoviePerformers(
+                    query: searchQuery,
+                    sort: performerSort,
+                    minMovies: performerMinMovies > 0 ? performerMinMovies : nil,
+                    ageRange: performerAgeRange,
+                    heightRange: performerHeightRange,
+                    cup: performerCup,
+                    profileFilter: performerProfileFilter,
+                    limit: pageSize,
+                    offset: offset
+                )
                 guard version == requestVersion else { return }
                 performers = reset ? result.items : performers + result.items; performerTotal = result.total; offset += result.items.count
             }

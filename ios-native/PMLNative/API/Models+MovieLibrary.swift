@@ -76,6 +76,39 @@ public struct MoviePerformer: Codable, Identifiable, Hashable {
     public let bloodType: String?
     public let debutYear: String?
     public let agency: String?
+    public let latestReleaseDate: String?
+    public let latestAddedAt: Int64?
+}
+
+public struct PerformerRecentRelease: Codable, Identifiable, Hashable {
+    public var id: String { number }
+    public let number: String
+    public let title: String
+    public let releaseDate: String?
+    public let coverUrl: String?
+    public let detailUrl: String
+    public let inLibrary: Bool
+    public let source: String
+}
+
+public struct PerformerRecentReleasesResult: Codable {
+    public let performerId: String
+    public let performerName: String
+    public let sourceUrl: String?
+    public let totalFetched: Int
+    public let unownedCount: Int
+    public let items: [PerformerRecentRelease]
+}
+
+public struct MovieMagnetItem: Codable, Identifiable, Hashable {
+    public var id: String { magnet }
+    public let title: String
+    public let magnet: String
+    public let size: String?
+    public let date: String?
+    public let tags: [String]
+    public let seeders: Int?
+    public let source: String
 }
 
 public struct MoviePerformerList: Codable {

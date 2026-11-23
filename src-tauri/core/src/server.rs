@@ -840,7 +840,7 @@ async fn dispatch_command(
                     .map_err(|e| format!("查询元数据失败：{e}"))
             }).await
         }
-        "query_movie_library" | "list_scrape_issues" | "list_unrecognized_videos" | "list_movie_performers" => {
+        "query_movie_library" | "list_scrape_issues" | "list_unrecognized_videos" => {
             let operation = command.to_owned();
             let query = payload.get("query").and_then(Value::as_str).unwrap_or("").to_owned();
             let maker = payload.get("maker").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -855,10 +855,77 @@ async fn dispatch_command(
                 match operation.as_str() {
                     "query_movie_library" => serde_json::to_value(crate::jav_scraper::query_movie_library(&conn, &query, &maker, &actor, &sort, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
                     "list_scrape_issues" => serde_json::to_value(crate::jav_scraper::list_scrape_issues(&conn, &category, &query, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
-                    "list_unrecognized_videos" => serde_json::to_value(crate::jav_scraper::list_unrecognized_videos(&conn, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
-                    _ => serde_json::to_value(crate::performers::list_performers(&conn, &query, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
+                    _ => serde_json::to_value(crate::jav_scraper::list_unrecognized_videos(&conn, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
                 }
             }).await
+        }
+        "list_movie_performers" => {
+            let fq = crate::performers::PerformerFilterQuery {
+                query: payload.get("query").and_then(Value::as_str).unwrap_or("").to_owned(),
+                sort: payload.get("sort").and_then(Value::as_str).unwrap_or("latest_release").to_owned(),
+                min_movies: payload.get("minMovies").and_then(Value::as_u64),
+                age_range: payload.get("ageRange").and_then(Value::as_str).unwrap_or("").to_owned(),
+                height_range: payload.get("heightRange").and_then(Value::as_str).unwrap_or("").to_owned(),
+                cup: payload.get("cup").and_then(Value::as_str).unwrap_or("").to_owned(),
+                profile_filter: payload.get("profileFilter").and_then(Value::as_str).unwrap_or("").to_owned(),
+                limit: payload.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 100) as u32,
+                offset: payload.get("offset").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
+            };
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::performers::list_performers_filtered(&conn, &fq).map_err(|e| e.to_string())
+            }).await
+        }
+        "get_performer_recent_releases" => {
+            let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let include_owned = payload.get("includeOwned").and_then(Value::as_bool).unwrap_or(false);
+            let force_refresh = payload.get("forceRefresh").and_then(Value::as_bool).unwrap_or(false);
+            let app_read = app.clone();
+            let id_read = id.clone();
+            let target = tokio::task::spawn_blocking(move || -> Result<(String, Vec<String>), String> {
+                let conn = four_domains::open_v2(&app_read)?;
+                let detail = crate::performers::get_performer(&conn, &id_read)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("人物不存在")?;
+                let mut names = vec![detail.person.name.clone()];
+                for alias in detail.person.aliases {
+                    if !names.contains(&alias) {
+                        names.push(alias);
+                    }
+                }
+                Ok((detail.person.name, names))
+            }).await;
+            let (performer_name, names) = match target {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return error_response(&e),
+                Err(e) => return error_response(&e.to_string()),
+            };
+            let (source_url, raw_items) = match crate::performers::fetch_performer_recent_releases(&names, force_refresh).await {
+                Ok(v) => v,
+                Err(e) => return error_response(&e),
+            };
+            let app_check = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app_check)?;
+                let (total_fetched, unowned_count, items) =
+                    crate::performers::mark_library_ownership(&conn, raw_items, include_owned)
+                        .map_err(|e| e.to_string())?;
+                Ok(crate::performers::PerformerRecentReleasesResult {
+                    performer_id: id,
+                    performer_name,
+                    source_url,
+                    total_fetched,
+                    unowned_count,
+                    items,
+                })
+            }).await
+        }
+        "get_movie_magnets" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let detail_url = payload.get("detailUrl").and_then(Value::as_str).map(|s| s.to_owned());
+            let force_refresh = payload.get("forceRefresh").and_then(Value::as_bool).unwrap_or(false);
+            result_response(crate::performers::fetch_movie_magnets(&number, detail_url.as_deref(), force_refresh).await)
         }
         "preview_movie_performer_profile" => {
             let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();

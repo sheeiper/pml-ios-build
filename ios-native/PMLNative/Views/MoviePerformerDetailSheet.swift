@@ -14,8 +14,19 @@ struct MoviePerformerDetailSheet: View {
     @State private var saving = false
     @State private var enriching = false
     @State private var errorMessage: String?
+    private enum PerformerWorkTab: String, CaseIterable {
+        case library = "库内作品"
+        case recent = "近期新作"
+    }
+
+    @State private var detailTab: PerformerWorkTab = .library
     @State private var showEditor = false
     @State private var selectedMovie: MovieMetadata?
+    @State private var recentResult: PerformerRecentReleasesResult?
+    @State private var recentLoading = false
+    @State private var recentError: String?
+    @State private var includeOwnedRecent = false
+    @State private var selectedReleaseForMagnets: PerformerRecentRelease?
 
     var body: some View {
         NavigationStack {
@@ -98,25 +109,30 @@ struct MoviePerformerDetailSheet: View {
                                 .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
                         }
 
-                        HStack {
-                            Text("参演作品 (\(detail?.total ?? person.movieCount))")
-                                .font(.headline)
-                            Spacer()
-                            if let movies = detail?.movies, (detail?.total ?? person.movieCount) > movies.count {
-                                Text("前 \(movies.count) 部")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                        // 库内作品 / 近期新作 分段切换（默认库内作品，切换后才懒加载近期新作）
+                        Picker("作品分区", selection: $detailTab) {
+                            Text("库内作品 (\(detail?.total ?? person.movieCount))").tag(PerformerWorkTab.library)
+                            Text(recentResult.map { "近期新作 (\($0.unownedCount))" } ?? "近期新作").tag(PerformerWorkTab.recent)
+                        }
+                        .pickerStyle(.segmented)
+                        .onChange(of: detailTab) { _, next in
+                            if next == .recent && recentResult == nil && !recentLoading {
+                                Task { await loadRecentReleases(forceRefresh: false) }
                             }
                         }
 
-                        if let movies = detail?.movies, !movies.isEmpty {
-                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                                ForEach(movies) { movie in
-                                    movieCard(movie)
+                        if detailTab == .library {
+                            if let movies = detail?.movies, !movies.isEmpty {
+                                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                                    ForEach(movies) { movie in
+                                        movieCard(movie)
+                                    }
                                 }
+                            } else if !loading {
+                                Text("暂无关联作品").font(.footnote).foregroundStyle(.secondary)
                             }
-                        } else if !loading {
-                            Text("暂无关联作品").font(.footnote).foregroundStyle(.secondary)
+                        } else {
+                            recentReleasesSection
                         }
                     }
                 }
@@ -125,9 +141,15 @@ struct MoviePerformerDetailSheet: View {
             .navigationTitle(detail?.person.name ?? performer.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
-            .task { await load() }
+            .task {
+                await load()
+            }
             .sheet(isPresented: $showEditor) {
                 MoviePerformerEditor(person: detail?.person ?? performer) { await save($0) }
+                    .environmentObject(model)
+            }
+            .sheet(item: $selectedReleaseForMagnets) { rel in
+                MovieMagnetsSheet(release: rel)
                     .environmentObject(model)
             }
             .sheet(item: $selectedMovie) { movie in
@@ -139,6 +161,126 @@ struct MoviePerformerDetailSheet: View {
                 .environmentObject(model)
             }
         }
+    }
+
+    @ViewBuilder
+    private var recentReleasesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("近期新作（未入库）", systemImage: "sparkles")
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.purple)
+                if let res = recentResult {
+                    Text("\(res.unownedCount)/\(res.totalFetched)")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.purple.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.purple)
+                }
+                Spacer()
+                Button {
+                    includeOwnedRecent.toggle()
+                    Task { await loadRecentReleases(forceRefresh: false) }
+                } label: {
+                    Text(includeOwnedRecent ? "仅看未入库" : "含已入库")
+                        .font(.caption2)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+
+                Button {
+                    Task { await loadRecentReleases(forceRefresh: true) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(recentLoading)
+            }
+
+            if let err = recentError {
+                Text(err).font(.caption).foregroundStyle(.red)
+            } else if recentLoading && recentResult == nil {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.8)
+                    Text("正在查询近期新作并比对本地库…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if let items = recentResult?.items, !items.isEmpty {
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                    ForEach(items) { rel in
+                        Button {
+                            selectedReleaseForMagnets = rel
+                        } label: {
+                            VStack(alignment: .leading, spacing: 5) {
+                                ZStack(alignment: .topLeading) {
+                                    Color.black.opacity(0.85)
+                                    CachedImageView(
+                                        url: rel.coverUrl.flatMap { model.proxyScraperImageURL(rawUrl: $0) },
+                                        contentMode: .fit,
+                                        minHeight: 96,
+                                        maxPixel: 540
+                                    )
+                                    HStack {
+                                        Text(rel.number)
+                                            .font(.system(size: 9, weight: .bold))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 2)
+                                            .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 4))
+                                            .foregroundStyle(.white)
+                                        Spacer()
+                                        Text(rel.inLibrary ? "已入库" : "磁力")
+                                            .font(.system(size: 9, weight: .bold))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 2)
+                                            .background((rel.inLibrary ? Color.green : Color.purple).opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
+                                            .foregroundStyle(.white)
+                                    }
+                                    .padding(5)
+                                }
+                                .aspectRatio(3 / 2, contentMode: .fit)
+                                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+                                Text(rel.title)
+                                    .font(.caption.weight(.semibold))
+                                    .lineLimit(2)
+                                    .foregroundStyle(.primary)
+                                if let d = rel.releaseDate, !d.isEmpty {
+                                    Text(d)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .opacity(rel.inLibrary ? 0.65 : 1.0)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            } else if let res = recentResult {
+                Text(res.totalFetched > 0 ? "近期发布的 \(res.totalFetched) 部作品已全部入库！" : "暂未查到该演员的近期线上作品。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func loadRecentReleases(forceRefresh: Bool) async {
+        guard let client = model.apiClient else { return }
+        recentLoading = true
+        recentError = nil
+        do {
+            recentResult = try await client.getPerformerRecentReleases(
+                id: performer.id,
+                includeOwned: includeOwnedRecent,
+                forceRefresh: forceRefresh
+            )
+        } catch {
+            recentError = error.localizedDescription
+        }
+        recentLoading = false
     }
 
     private func profileHeader(_ person: MoviePerformer) -> some View {
@@ -283,7 +425,140 @@ struct MoviePerformerDetailSheet: View {
     }
 }
 
-private struct PerformerAvatarView: View {
+private struct MovieMagnetsSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let release: PerformerRecentRelease
+
+    @State private var magnets: [MovieMagnetItem] = []
+    @State private var loading = false
+    @State private var errorMessage: String?
+    @State private var copiedMagnet: String?
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let raw = release.coverUrl, let url = model.proxyScraperImageURL(rawUrl: raw) {
+                        ZStack {
+                            Color.black
+                            CachedImageView(url: url, contentMode: .fit, minHeight: 180, maxPixel: 1000)
+                        }
+                        .aspectRatio(3 / 2, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text(release.number)
+                                .font(.caption.bold())
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(LinearGradient(colors: [.purple, .pink], startPoint: .leading, endPoint: .trailing))
+                                .foregroundStyle(.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 5))
+                            if let d = release.releaseDate, !d.isEmpty {
+                                Text(d).font(.caption).foregroundStyle(.secondary)
+                            }
+                            if release.inLibrary {
+                                Text("库内已有")
+                                    .font(.caption2.bold())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.green.opacity(0.18), in: Capsule())
+                                    .foregroundStyle(.green)
+                            }
+                        }
+                        Text(release.title).font(.subheadline.bold())
+                    }
+
+                    if let err = errorMessage {
+                        Text(err).font(.caption).foregroundStyle(.red)
+                    } else if loading {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                            Text("正在聚合 JavDB / Sukebei 磁力链接…").font(.caption).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 24)
+                    } else if magnets.isEmpty {
+                        Text("暂无可用磁力链接（可能尚未发售或暂无公开种子）。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 16)
+                    } else {
+                        ForEach(magnets) { item in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(item.title)
+                                    .font(.caption.weight(.semibold))
+                                    .lineLimit(3)
+                                HStack(spacing: 6) {
+                                    ForEach(item.tags, id: \.self) { tag in
+                                        Text(tag)
+                                            .font(.caption2.bold())
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background((tag.contains("字幕") ? Color.orange : Color.blue).opacity(0.2), in: Capsule())
+                                            .foregroundStyle(tag.contains("字幕") ? .orange : .blue)
+                                    }
+                                    if let size = item.size { Text(size).font(.caption2).foregroundStyle(.secondary) }
+                                    if let seed = item.seeders { Text("做种 \(seed)").font(.caption2).foregroundStyle(.secondary) }
+                                    Spacer()
+                                    Text(item.source).font(.caption2).foregroundStyle(.purple)
+                                }
+                                Button {
+                                    UIPasteboard.general.string = item.magnet
+                                    copiedMagnet = item.magnet
+                                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                } label: {
+                                    Label(copiedMagnet == item.magnet ? "已复制磁力链接" : "复制磁力链接", systemImage: copiedMagnet == item.magnet ? "checkmark" : "doc.on.doc")
+                                        .font(.caption.bold())
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(copiedMagnet == item.magnet ? .green : .purple)
+                                .controlSize(.small)
+                            }
+                            .padding(12)
+                            .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+                        }
+                    }
+                }
+                .padding(16)
+            }
+            .navigationTitle("\(release.number) 磁力")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        Task { await loadMagnets(forceRefresh: true) }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(loading)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+            .task { await loadMagnets(forceRefresh: false) }
+        }
+    }
+
+    private func loadMagnets(forceRefresh: Bool) async {
+        guard let client = model.apiClient else { return }
+        loading = true
+        errorMessage = nil
+        do {
+            magnets = try await client.getMovieMagnets(number: release.number, detailUrl: release.detailUrl, forceRefresh: forceRefresh)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        loading = false
+    }
+}
+
+struct PerformerAvatarView: View {
     let value: String?
     let proxy: URL?
     let fallbackName: String

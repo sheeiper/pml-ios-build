@@ -81,6 +81,10 @@ pub struct Performer {
     pub debut_year: Option<String>,
     #[serde(default)]
     pub agency: Option<String>,
+    #[serde(default)]
+    pub latest_release_date: Option<String>,
+    #[serde(default)]
+    pub latest_added_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,7 +272,12 @@ fn person_select() -> String {
     format!("SELECT p.id,p.name,p.aliases_json,p.avatar_url,p.profile_url,p.source,p.status,p.updated_at,
         (SELECT COUNT(DISTINCT c.number) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number
          WHERE c.person_id=p.id AND {VERIFIED}) AS movie_count,
-        p.birth_date,p.height_cm,p.measurements,p.hometown,p.hobby,p.bio,p.blood_type,p.debut_year,p.agency FROM performers p")
+        p.birth_date,p.height_cm,p.measurements,p.hometown,p.hobby,p.bio,p.blood_type,p.debut_year,p.agency,
+        (SELECT MAX(replace(m.release_date, '/', '-')) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number
+         WHERE c.person_id=p.id AND {VERIFIED} AND m.release_date IS NOT NULL AND trim(m.release_date) != '') AS latest_release_date,
+        (SELECT MAX(m.updated_at) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number
+         WHERE c.person_id=p.id AND {VERIFIED}) AS latest_added_at
+        FROM performers p")
 }
 
 fn person_from_row(row: &Row<'_>) -> rusqlite::Result<Performer> {
@@ -281,6 +290,7 @@ fn person_from_row(row: &Row<'_>) -> rusqlite::Result<Performer> {
         birth_date: row.get(9)?, height_cm: row.get(10)?, measurements: row.get(11)?,
         hometown: row.get(12)?, hobby: row.get(13)?, bio: row.get(14)?,
         blood_type: row.get(15)?, debut_year: row.get(16)?, agency: row.get(17)?,
+        latest_release_date: row.get(18)?, latest_added_at: row.get(19)?,
     })
 }
 
@@ -288,18 +298,130 @@ fn read_person(conn: &Connection, id: &str) -> Result<Option<Performer>, Perform
     Ok(conn.query_row(&format!("{} WHERE p.id=?1", person_select()), [id], person_from_row).optional()?)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PerformerFilterQuery {
+    pub query: String,
+    pub sort: String,
+    pub min_movies: Option<u64>,
+    pub age_range: String,
+    pub height_range: String,
+    pub cup: String,
+    pub profile_filter: String,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+fn birth_cutoff_iso(years_ago: i32) -> String {
+    use chrono::Datelike;
+    let today = chrono::Utc::now().date_naive();
+    let y = today.year() - years_ago;
+    let m = today.month();
+    let d = today.day().min(28);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Search current names and aliases as literal substrings (not SQL wildcards).
 /// Limit is capped at 100; zero requests an empty page with an accurate total.
 /// Retains edited zero-credit profiles rather than silently deleting user data.
 pub fn list_performers(conn: &Connection, query: &str, limit: u32, offset: u32) -> Result<PerformerList, PerformerError> {
-    if query.chars().count() > 200 { return Err(PerformerError::Validation("Search query is too long".into())); }
+    list_performers_filtered(
+        conn,
+        &PerformerFilterQuery {
+            query: query.to_string(),
+            sort: "latest_release".to_string(),
+            limit,
+            offset,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn list_performers_filtered(conn: &Connection, fq: &PerformerFilterQuery) -> Result<PerformerList, PerformerError> {
+    if fq.query.chars().count() > 200 {
+        return Err(PerformerError::Validation("Search query is too long".into()));
+    }
     sync_performers(conn)?;
-    let query = query.trim();
-    let filter = "(?1='' OR instr(lower(p.name),lower(?1))>0 OR EXISTS(
-        SELECT 1 FROM json_each(p.aliases_json) a WHERE instr(lower(a.value),lower(?1))>0))";
-    let total = conn.query_row(&format!("SELECT COUNT(*) FROM performers p WHERE {filter}"), [query], |row| row.get(0))?;
-    let mut stmt = conn.prepare(&format!("{} WHERE {filter} ORDER BY movie_count DESC,p.name COLLATE NOCASE,p.id LIMIT ?2 OFFSET ?3", person_select()))?;
-    let items = stmt.query_map(params![query, limit.min(100), offset], person_from_row)?.collect::<Result<Vec<_>, _>>()?;
+    let query = fq.query.trim();
+    let mut clauses: Vec<String> = vec![
+        "(?1='' OR instr(lower(p.name),lower(?1))>0 OR EXISTS(SELECT 1 FROM json_each(p.aliases_json) a WHERE instr(lower(a.value),lower(?1))>0))".to_string()
+    ];
+
+    if let Some(min_m) = fq.min_movies {
+        if min_m > 0 {
+            clauses.push(format!(
+                "(SELECT COUNT(DISTINCT c.number) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number WHERE c.person_id=p.id AND {VERIFIED}) >= {min_m}"
+            ));
+        }
+    }
+
+    match fq.age_range.trim() {
+        "under22" => {
+            let cut = birth_cutoff_iso(22);
+            clauses.push(format!("p.birth_date IS NOT NULL AND trim(p.birth_date) != '' AND replace(p.birth_date, '/', '-') > '{cut}'"));
+        }
+        "22_25" => {
+            let hi = birth_cutoff_iso(22);
+            let lo = birth_cutoff_iso(26);
+            clauses.push(format!("p.birth_date IS NOT NULL AND trim(p.birth_date) != '' AND replace(p.birth_date, '/', '-') <= '{hi}' AND replace(p.birth_date, '/', '-') > '{lo}'"));
+        }
+        "26_30" => {
+            let hi = birth_cutoff_iso(26);
+            let lo = birth_cutoff_iso(31);
+            clauses.push(format!("p.birth_date IS NOT NULL AND trim(p.birth_date) != '' AND replace(p.birth_date, '/', '-') <= '{hi}' AND replace(p.birth_date, '/', '-') > '{lo}'"));
+        }
+        "over30" => {
+            let cut = birth_cutoff_iso(31);
+            clauses.push(format!("p.birth_date IS NOT NULL AND trim(p.birth_date) != '' AND replace(p.birth_date, '/', '-') <= '{cut}'"));
+        }
+        _ => {}
+    }
+
+    match fq.height_range.trim() {
+        "under155" => clauses.push("p.height_cm IS NOT NULL AND p.height_cm > 0 AND p.height_cm < 155".to_string()),
+        "155_165" => clauses.push("p.height_cm IS NOT NULL AND p.height_cm >= 155 AND p.height_cm <= 165".to_string()),
+        "over165" => clauses.push("p.height_cm IS NOT NULL AND p.height_cm > 165".to_string()),
+        _ => {}
+    }
+
+    let cup_clean = fq.cup.trim().to_ascii_uppercase();
+    if cup_clean.len() == 1 && cup_clean.as_bytes()[0].is_ascii_alphabetic() {
+        let ch = cup_clean.as_bytes()[0] as char;
+        clauses.push(format!(
+            "p.measurements IS NOT NULL AND (instr(upper(p.measurements), '({ch})') > 0 OR instr(upper(p.measurements), '（{ch}）') > 0 OR instr(upper(p.measurements), '{ch}罩杯') > 0 OR instr(upper(p.measurements), '{ch}杯') > 0 OR instr(upper(p.measurements), '{ch}-CUP') > 0 OR instr(upper(p.measurements), ' {ch} ') > 0)"
+        ));
+    }
+
+    match fq.profile_filter.trim() {
+        "has_avatar" => clauses.push("p.avatar_url IS NOT NULL AND trim(p.avatar_url) != ''".to_string()),
+        "missing_profile" => clauses.push("(p.avatar_url IS NULL OR trim(p.avatar_url) = '' OR p.birth_date IS NULL OR trim(p.birth_date) = '')".to_string()),
+        _ => {}
+    }
+
+    let where_sql = clauses.join(" AND ");
+    let order_sql = match fq.sort.trim() {
+        "latest_added" => {
+            "CASE WHEN latest_added_at IS NULL THEN 1 ELSE 0 END ASC, latest_added_at DESC, movie_count DESC, p.name COLLATE NOCASE, p.id"
+        }
+        "age_asc" => {
+            "CASE WHEN p.birth_date IS NULL OR trim(p.birth_date) = '' THEN 1 ELSE 0 END ASC, replace(p.birth_date, '/', '-') DESC, movie_count DESC, p.name COLLATE NOCASE, p.id"
+        }
+        "age_desc" => {
+            "CASE WHEN p.birth_date IS NULL OR trim(p.birth_date) = '' THEN 1 ELSE 0 END ASC, replace(p.birth_date, '/', '-') ASC, movie_count DESC, p.name COLLATE NOCASE, p.id"
+        }
+        "movie_count_desc" => {
+            "movie_count DESC, CASE WHEN latest_release_date IS NULL OR trim(latest_release_date) = '' THEN 1 ELSE 0 END ASC, latest_release_date DESC, p.name COLLATE NOCASE, p.id"
+        }
+        "movie_count_asc" => {
+            "movie_count ASC, CASE WHEN latest_release_date IS NULL OR trim(latest_release_date) = '' THEN 1 ELSE 0 END ASC, latest_release_date DESC, p.name COLLATE NOCASE, p.id"
+        }
+        _ => {
+            "CASE WHEN latest_release_date IS NULL OR trim(latest_release_date) = '' THEN 1 ELSE 0 END ASC, latest_release_date DESC, movie_count DESC, p.name COLLATE NOCASE, p.id"
+        }
+    };
+
+    let total: u64 = conn.query_row(&format!("SELECT COUNT(*) FROM performers p WHERE {where_sql}"), [query], |row| row.get(0))?;
+    let mut stmt = conn.prepare(&format!("{} WHERE {where_sql} ORDER BY {order_sql} LIMIT ?2 OFFSET ?3", person_select()))?;
+    let items = stmt.query_map(params![query, fq.limit.min(100), fq.offset], person_from_row)?.collect::<Result<Vec<_>, _>>()?;
     Ok(PerformerList { items, total })
 }
 
@@ -1617,6 +1739,503 @@ where
     });
 
     Ok(get_performer_enrich_progress())
+}
+
+// ============================================================================
+// 演员近期线上新作 & 磁力链接聚合（JavDB 主源 + Sukebei Nyaa 兜底，6小时内存缓存）
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformerRecentRelease {
+    pub number: String,
+    pub title: String,
+    pub release_date: Option<String>,
+    pub cover_url: Option<String>,
+    pub detail_url: String,
+    pub in_library: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformerRecentReleasesResult {
+    pub performer_id: String,
+    pub performer_name: String,
+    pub source_url: Option<String>,
+    pub total_fetched: usize,
+    pub unowned_count: usize,
+    pub items: Vec<PerformerRecentRelease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieMagnetItem {
+    pub title: String,
+    pub magnet: String,
+    pub size: Option<String>,
+    pub date: Option<String>,
+    pub tags: Vec<String>,
+    pub seeders: Option<u32>,
+    pub source: String,
+}
+
+const RECENT_CACHE_TTL_SECS: i64 = 6 * 3600;
+
+fn recent_releases_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (i64, Option<String>, Vec<PerformerRecentRelease>)>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (i64, Option<String>, Vec<PerformerRecentRelease>)>>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn movie_magnets_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (i64, Vec<MovieMagnetItem>)>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (i64, Vec<MovieMagnetItem>)>>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn javdb_public_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("创建网络客户端失败：{e}"))
+}
+
+fn decode_basic_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    decode_basic_entities(&out).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_html_attr<'a>(tag_slice: &'a str, attr: &str) -> Option<&'a str> {
+    let pat_dq = format!("{attr}=\"");
+    if let Some(pos) = tag_slice.find(&pat_dq) {
+        let rest = &tag_slice[pos + pat_dq.len()..];
+        if let Some(end) = rest.find('"') {
+            return Some(&rest[..end]);
+        }
+    }
+    let pat_sq = format!("{attr}='");
+    if let Some(pos) = tag_slice.find(&pat_sq) {
+        let rest = &tag_slice[pos + pat_sq.len()..];
+        if let Some(end) = rest.find('\'') {
+            return Some(&rest[..end]);
+        }
+    }
+    None
+}
+
+fn extract_between<'a>(haystack: &'a str, start_marker: &str, end_marker: &str) -> Option<&'a str> {
+    let s = haystack.find(start_marker)? + start_marker.len();
+    let rest = &haystack[s..];
+    let e = rest.find(end_marker)?;
+    Some(&rest[..e])
+}
+
+fn find_javdb_actor_path(html: &str) -> Option<String> {
+    let mut cursor = html;
+    while let Some(pos) = cursor.find("href=\"/actors/") {
+        let rest = &cursor[pos + 6..];
+        let Some(end) = rest.find('"') else { break; };
+        let path = &rest[..end];
+        cursor = &rest[end..];
+        if !path.starts_with("/actors/") {
+            continue;
+        }
+        let slug = &path["/actors/".len()..];
+        if slug.is_empty()
+            || slug.contains('/')
+            || slug.contains('?')
+            || matches!(slug, "censored" | "uncensored" | "western")
+        {
+            continue;
+        }
+        if slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+fn parse_javdb_actor_releases(html: &str) -> Vec<PerformerRecentRelease> {
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for chunk in html.split("<div class=\"item\">").skip(1) {
+        let card = if let Some(cut) = chunk.find("<div class=\"item\">") {
+            &chunk[..cut]
+        } else {
+            chunk
+        };
+        let Some(href) = extract_between(card, "href=\"", "\"") else { continue; };
+        if !href.starts_with("/v/") {
+            continue;
+        }
+        let detail_url = format!("https://javdb.com{href}");
+        let raw_num = extract_between(card, "<strong>", "</strong>").map(strip_html_tags).unwrap_or_default();
+        if raw_num.is_empty() {
+            continue;
+        }
+        let number = crate::jav_scraper::normalize_jav_number(&raw_num).unwrap_or_else(|| raw_num.to_uppercase());
+        if !seen.insert(number.clone()) {
+            continue;
+        }
+        let title = extract_html_attr(card, "title")
+            .map(|t| decode_basic_entities(t).trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| {
+                extract_between(card, "class=\"video-title\">", "</div>")
+                    .map(strip_html_tags)
+                    .unwrap_or_else(|| number.clone())
+            });
+        let cover_url = extract_between(card, "<img", ">")
+            .and_then(|img| extract_html_attr(img, "src").or_else(|| extract_html_attr(img, "data-src")))
+            .map(|u| {
+                let u = decode_basic_entities(u);
+                if u.starts_with("//") { format!("https:{u}") } else { u }
+            })
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"));
+        let release_date = extract_between(card, "class=\"meta\">", "</div>")
+            .map(strip_html_tags)
+            .filter(|d| d.len() >= 8 && d.chars().any(|c| c.is_ascii_digit()));
+        items.push(PerformerRecentRelease {
+            number,
+            title,
+            release_date,
+            cover_url,
+            detail_url,
+            in_library: false,
+            source: "JavDB".to_string(),
+        });
+        if items.len() >= 40 {
+            break;
+        }
+    }
+    items
+}
+
+pub async fn fetch_performer_recent_releases(
+    names: &[String],
+    force_refresh: bool,
+) -> Result<(Option<String>, Vec<PerformerRecentRelease>), String> {
+    let clean_names: Vec<String> = names
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_names.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let cache_key = clean_names[0].to_lowercase();
+    let now = chrono::Utc::now().timestamp();
+    if !force_refresh {
+        if let Ok(guard) = recent_releases_cache().lock() {
+            if let Some((ts, url, items)) = guard.get(&cache_key) {
+                if now - *ts < RECENT_CACHE_TTL_SECS {
+                    return Ok((url.clone(), items.clone()));
+                }
+            }
+        }
+    }
+
+    let client = javdb_public_client()?;
+    let mut actor_path: Option<String> = None;
+    for candidate_name in clean_names.iter().take(4) {
+        let encoded = percent_encoding::utf8_percent_encode(candidate_name, percent_encoding::NON_ALPHANUMERIC).to_string();
+        let search_url = format!("https://javdb.com/search?q={encoded}&f=actor");
+        let Ok(resp) = client.get(&search_url).header("Cookie", "over18=1").send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(html) = resp.text().await else { continue; };
+        if let Some(found) = find_javdb_actor_path(&html) {
+            actor_path = Some(found);
+            break;
+        }
+    }
+
+    let Some(path) = actor_path else {
+        if let Ok(mut guard) = recent_releases_cache().lock() {
+            guard.insert(cache_key, (now, None, Vec::new()));
+        }
+        return Ok((None, Vec::new()));
+    };
+
+    let actor_url = format!("https://javdb.com{path}");
+    let resp = client
+        .get(&actor_url)
+        .header("Cookie", "over18=1")
+        .send()
+        .await
+        .map_err(|e| format!("请求 JavDB 演员页失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("JavDB 演员页返回 HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| format!("读取 JavDB 演员页失败：{e}"))?;
+    let items = parse_javdb_actor_releases(&html);
+
+    if let Ok(mut guard) = recent_releases_cache().lock() {
+        guard.insert(cache_key, (now, Some(actor_url.clone()), items.clone()));
+    }
+    Ok((Some(actor_url), items))
+}
+
+pub fn mark_library_ownership(
+    conn: &Connection,
+    mut items: Vec<PerformerRecentRelease>,
+    include_owned: bool,
+) -> Result<(usize, usize, Vec<PerformerRecentRelease>), rusqlite::Error> {
+    let total_fetched = items.len();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT 1 FROM movie_metadata m WHERE m.number = ?1 AND {VERIFIED} LIMIT 1"
+    ))?;
+    let mut unowned_count = 0usize;
+    for item in &mut items {
+        let owned = stmt.exists(params![item.number])?;
+        item.in_library = owned;
+        if !owned {
+            unowned_count += 1;
+        }
+    }
+    if !include_owned {
+        items.retain(|item| !item.in_library);
+    }
+    Ok((total_fetched, unowned_count, items))
+}
+
+fn extract_btih_key(magnet: &str) -> String {
+    let lower = magnet.to_ascii_lowercase();
+    if let Some(pos) = lower.find("xt=urn:btih:") {
+        let rest = &lower[pos + "xt=urn:btih:".len()..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        return rest[..end].to_string();
+    }
+    lower
+}
+
+fn parse_javdb_magnets(html: &str) -> Vec<MovieMagnetItem> {
+    let mut items = Vec::new();
+    let Some(start) = html.find("id=\"magnets-content\"") else {
+        return items;
+    };
+    let section = &html[start..];
+    for block in section.split("<div class=\"item ").skip(1) {
+        let Some(mag_pos) = block.find("href=\"magnet:?xt=") else { continue; };
+        let after = &block[mag_pos + 6..];
+        let Some(mag_end) = after.find('"') else { continue; };
+        let magnet = decode_basic_entities(&after[..mag_end]);
+        if !magnet.starts_with("magnet:?xt=") {
+            continue;
+        }
+        let title = extract_between(block, "<span class=\"name\">", "</span>")
+            .map(strip_html_tags)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "磁力资源".to_string());
+        let size = extract_between(block, "<span class=\"meta\">", "</span>")
+            .map(strip_html_tags)
+            .filter(|s| !s.is_empty());
+        let date = extract_between(block, "<span class=\"time\">", "</span>")
+            .map(strip_html_tags)
+            .filter(|s| !s.is_empty());
+        let mut tags = Vec::new();
+        if let Some(tags_block) = extract_between(block, "<div class=\"tags\">", "</div>") {
+            for t in tags_block.split("<span class=\"tag").skip(1) {
+                if let Some(gt) = t.find('>') {
+                    if let Some(end) = t[gt + 1..].find("</span>") {
+                        let label = strip_html_tags(&t[gt + 1..gt + 1 + end]);
+                        if !label.is_empty() && !tags.contains(&label) {
+                            tags.push(label);
+                        }
+                    }
+                }
+            }
+        }
+        items.push(MovieMagnetItem {
+            title,
+            magnet,
+            size,
+            date,
+            tags,
+            seeders: None,
+            source: "JavDB".to_string(),
+        });
+        if items.len() >= 30 {
+            break;
+        }
+    }
+    items
+}
+
+fn parse_sukebei_magnets(html: &str) -> Vec<MovieMagnetItem> {
+    let mut items = Vec::new();
+    for row in html.split("<tr class=\"").skip(1) {
+        let row_end = row.find("</tr>").unwrap_or(row.len());
+        let tr = &row[..row_end];
+        let Some(mag_pos) = tr.find("href=\"magnet:?xt=") else { continue; };
+        let after = &tr[mag_pos + 6..];
+        let Some(mag_end) = after.find('"') else { continue; };
+        let magnet = decode_basic_entities(&after[..mag_end]);
+        if !magnet.starts_with("magnet:?xt=") {
+            continue;
+        }
+        // Title from <a href="/view/..." title="...">
+        let title = if let Some(vpos) = tr.find("href=\"/view/") {
+            let vslice = &tr[vpos..];
+            let tend = vslice.find('>').unwrap_or(vslice.len());
+            extract_html_attr(&vslice[..tend], "title")
+                .map(decode_basic_entities)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        // Collect <td class="text-center"> values: [links, size, date, seeders, leechers, completed]
+        let mut center_cells: Vec<String> = Vec::new();
+        for cell in tr.split("<td class=\"text-center").skip(1) {
+            if let Some(gt) = cell.find('>') {
+                if let Some(end) = cell[gt + 1..].find("</td>") {
+                    center_cells.push(strip_html_tags(&cell[gt + 1..gt + 1 + end]));
+                }
+            }
+        }
+        let size = center_cells.get(1).cloned().filter(|s| !s.is_empty());
+        let date = center_cells.get(2).cloned().map(|s| s.chars().take(10).collect::<String>()).filter(|s| !s.is_empty());
+        let seeders = center_cells.get(3).and_then(|s| s.parse::<u32>().ok());
+        let mut tags = Vec::new();
+        let upper = title.to_uppercase();
+        if upper.contains("1080P") || upper.contains("FHD") || upper.contains("4K") || upper.contains("2160P") {
+            tags.push("高清".to_string());
+        }
+        if upper.contains("-C") || upper.contains("中字") || upper.contains("字幕") || upper.contains("CHINESE") || upper.contains("SUB") {
+            tags.push("字幕".to_string());
+        }
+        items.push(MovieMagnetItem {
+            title: if title.is_empty() { "Sukebei 磁力".to_string() } else { title },
+            magnet,
+            size,
+            date,
+            tags,
+            seeders,
+            source: "Sukebei".to_string(),
+        });
+        if items.len() >= 20 {
+            break;
+        }
+    }
+    items
+}
+
+pub async fn fetch_movie_magnets(
+    number: &str,
+    detail_url: Option<&str>,
+    force_refresh: bool,
+) -> Result<Vec<MovieMagnetItem>, String> {
+    let clean_num = crate::jav_scraper::normalize_jav_number(number)
+        .unwrap_or_else(|| number.trim().to_uppercase());
+    if clean_num.is_empty() {
+        return Err("缺少番号参数".to_string());
+    }
+    let now = chrono::Utc::now().timestamp();
+    if !force_refresh {
+        if let Ok(guard) = movie_magnets_cache().lock() {
+            if let Some((ts, cached)) = guard.get(&clean_num) {
+                if now - *ts < RECENT_CACHE_TTL_SECS {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+    }
+
+    let client = javdb_public_client()?;
+    let mut all: Vec<MovieMagnetItem> = Vec::new();
+    let mut seen_hashes = std::collections::HashSet::new();
+
+    // 1. Primary: JavDB detail page
+    let resolved_javdb_url: Option<String> = if let Some(u) = detail_url.map(str::trim).filter(|s| s.starts_with("https://javdb.com/v/")) {
+        Some(u.to_string())
+    } else {
+        let encoded = percent_encoding::utf8_percent_encode(&clean_num, percent_encoding::NON_ALPHANUMERIC).to_string();
+        let search_url = format!("https://javdb.com/search?q={encoded}&f=all");
+        if let Ok(resp) = client.get(&search_url).header("Cookie", "over18=1").send().await {
+            if let Ok(html) = resp.text().await {
+                parse_javdb_actor_releases(&html)
+                    .into_iter()
+                    .find(|item| item.number.eq_ignore_ascii_case(&clean_num))
+                    .map(|item| item.detail_url)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(jurl) = resolved_javdb_url {
+        if let Ok(resp) = client.get(&jurl).header("Cookie", "over18=1").send().await {
+            if resp.status().is_success() {
+                if let Ok(html) = resp.text().await {
+                    for m in parse_javdb_magnets(&html) {
+                        let key = extract_btih_key(&m.magnet);
+                        if seen_hashes.insert(key) {
+                            all.push(m);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Supplement / Fallback: Sukebei Nyaa if JavDB returned fewer than 4 magnets
+    if all.len() < 4 {
+        let encoded = percent_encoding::utf8_percent_encode(&clean_num, percent_encoding::NON_ALPHANUMERIC).to_string();
+        let sukebei_url = format!("https://sukebei.nyaa.si/?f=0&c=0_0&q={encoded}");
+        if let Ok(resp) = client.get(&sukebei_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(html) = resp.text().await {
+                    for m in parse_sukebei_magnets(&html) {
+                        let key = extract_btih_key(&m.magnet);
+                        if seen_hashes.insert(key) {
+                            all.push(m);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort: 字幕+高清 > 字幕 > 高清 > seeders desc > date desc
+    all.sort_by(|a, b| {
+        let score = |m: &MovieMagnetItem| -> u8 {
+            let has_sub = m.tags.iter().any(|t| t.contains("字幕"));
+            let has_hd = m.tags.iter().any(|t| t.contains("高清"));
+            (if has_sub { 2 } else { 0 }) + (if has_hd { 1 } else { 0 })
+        };
+        score(b)
+            .cmp(&score(a))
+            .then_with(|| b.seeders.unwrap_or(0).cmp(&a.seeders.unwrap_or(0)))
+            .then_with(|| b.date.cmp(&a.date))
+    });
+
+    if let Ok(mut guard) = movie_magnets_cache().lock() {
+        guard.insert(clean_num, (now, all.clone()));
+    }
+    Ok(all)
 }
 
 #[cfg(test)]

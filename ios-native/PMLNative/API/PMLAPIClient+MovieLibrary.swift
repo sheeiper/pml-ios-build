@@ -41,8 +41,38 @@ extension PMLAPIClient {
         try await command("start_batch_scrape_new")
     }
 
-    func listMoviePerformers(query: String = "", limit: Int = 50, offset: Int = 0) async throws -> MoviePerformerList {
-        try await command("list_movie_performers", arguments: ["query": query, "limit": limit, "offset": offset], as: MoviePerformerList.self)
+    func listMoviePerformers(
+        query: String = "",
+        sort: String = "latest_release",
+        minMovies: Int? = nil,
+        ageRange: String = "",
+        heightRange: String = "",
+        cup: String = "",
+        profileFilter: String = "",
+        limit: Int = 50,
+        offset: Int = 0
+    ) async throws -> MoviePerformerList {
+        var args: [String: Any] = ["query": query, "sort": sort, "limit": limit, "offset": offset]
+        if let minMovies, minMovies > 0 { args["minMovies"] = minMovies }
+        if !ageRange.isEmpty { args["ageRange"] = ageRange }
+        if !heightRange.isEmpty { args["heightRange"] = heightRange }
+        if !cup.isEmpty { args["cup"] = cup }
+        if !profileFilter.isEmpty { args["profileFilter"] = profileFilter }
+        return try await command("list_movie_performers", arguments: args, as: MoviePerformerList.self)
+    }
+
+    func getPerformerRecentReleases(id: String, includeOwned: Bool = false, forceRefresh: Bool = false) async throws -> PerformerRecentReleasesResult {
+        try await command(
+            "get_performer_recent_releases",
+            arguments: ["id": id, "includeOwned": includeOwned, "forceRefresh": forceRefresh],
+            as: PerformerRecentReleasesResult.self
+        )
+    }
+
+    func getMovieMagnets(number: String, detailUrl: String? = nil, forceRefresh: Bool = false) async throws -> [MovieMagnetItem] {
+        var args: [String: Any] = ["number": number, "forceRefresh": forceRefresh]
+        if let detailUrl, !detailUrl.isEmpty { args["detailUrl"] = detailUrl }
+        return try await command("get_movie_magnets", arguments: args, as: [MovieMagnetItem].self)
     }
 
     func getMoviePerformer(id: String) async throws -> MoviePerformerDetail {
