@@ -77,6 +77,26 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS idx_movie_subtitles_number ON movie_subtitles(number);"
     )?;
+
+    // Automatically quarantine promotional clips and ad videos from unrecognized lists
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO scrape_ignored_assets (asset_id, created_at)
+         SELECT id, strftime('%s','now') FROM assets
+         WHERE missing = 0 AND media_type = 'video'
+           AND (
+               size_bytes < 52428800
+               OR file_name LIKE '%直播%'
+               OR file_name LIKE '%社 區%'
+               OR file_name LIKE '%社区%'
+               OR file_name LIKE '%最新情報%'
+               OR file_name LIKE '%最新情报%'
+               OR file_name LIKE '%决胜负%'
+               OR file_name LIKE '%決勝負%'
+               OR file_name LIKE '%xuu92%'
+               OR file_name LIKE '%.com.mp4'
+           );"
+    ).ok();
+
     let has_version = {
         let mut stmt = conn.prepare("PRAGMA table_info(movie_metadata)")?;
         let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -737,6 +757,19 @@ fn valid_number_tail(upper: &str, pos: usize) -> bool {
     false
 }
 
+fn normalize_digits(digits: &str) -> String {
+    if digits.len() > 3 && digits.starts_with('0') {
+        let stripped = digits.trim_start_matches('0');
+        if stripped.len() < 3 {
+            format!("{:0>3}", stripped)
+        } else {
+            stripped.to_string()
+        }
+    } else {
+        digits.to_string()
+    }
+}
+
 /// Extract an identity from a filename, stripping promotional domain prefixes and common noise tags.
 /// Date identities retain their delimiter: 1pondo uses `_`, Caribbeancom uses `-`.
 pub fn extract_jav_number(raw_name: &str) -> Option<String> {
@@ -799,7 +832,7 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
                         let n = i;
                         while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
                         if (2..=5).contains(&(i - n)) && valid_number_tail(&upper, i) {
-                            candidates.insert(format!("{}-{}", prefix, &upper[n..i]));
+                            candidates.insert(format!("{}-{}", prefix, normalize_digits(&upper[n..i])));
                         }
                     }
                 }
@@ -820,7 +853,7 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
                 let mut k = n;
                 while k < bytes.len() && bytes[k].is_ascii_digit() { k += 1; }
                 if (2..=5).contains(&(k - n)) && valid_number_tail(&upper, k) {
-                    candidates.insert(format!("{}-{}", prefix, &upper[n..k]));
+                    candidates.insert(format!("{}-{}", prefix, normalize_digits(&upper[n..k])));
                     continue;
                 }
             }
@@ -830,7 +863,7 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
         let n = i;
         while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
         if (2..=6).contains(&(i - n)) && valid_number_tail(&upper, i) {
-            candidates.insert(format!("{}-{}", letters, &upper[n..i]));
+            candidates.insert(format!("{}-{}", letters, normalize_digits(&upper[n..i])));
         }
     }
     if candidates.len() == 1 {
@@ -1005,8 +1038,16 @@ fn javdb_exact_card<'a>(html: &'a str, number: &str) -> Option<(String, &'a str)
         let Some((_, strong)) = body.split_once("<strong") else { continue; };
         let Some((_, strong)) = strong.split_once('>') else { continue; };
         let Some((identity, _)) = strong.split_once("</strong>") else { continue; };
-        if normalize_jav_number(&plain_text(identity)).as_deref() == Some(number) {
+        let parsed = normalize_jav_number(&plain_text(identity));
+        if parsed.as_deref() == Some(number) {
             return Some((path, body));
+        }
+        if number.starts_with("FC2-") {
+            let num_id = number.trim_start_matches("FC2-");
+            let norm = plain_text(identity).replace(['-', '_', ' '], "").to_ascii_uppercase();
+            if norm == format!("FC2PPV{num_id}") || norm == format!("FC2{num_id}") {
+                return Some((path, body));
+            }
         }
     }
     None
@@ -1284,20 +1325,29 @@ pub async fn scrape_from_javbus(number: &str) -> Result<MovieMetadata, String> {
 pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
     let client = scraper_client()?;
 
-    let search_term = if number.starts_with("FC2-") {
-        number.trim_start_matches("FC2-").to_string()
+    let (primary_search, fallback_search) = if number.starts_with("FC2-") {
+        let id = number.trim_start_matches("FC2-");
+        (format!("FC2-PPV-{}", id), Some(id.to_string()))
     } else {
-        number.to_string()
+        (number.to_string(), None)
     };
 
-    let search_url = format!("https://javdb.com/search?q={}&f=all", search_term);
-    let search_resp = client
-        .get(&search_url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        .header("Accept-Language", "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7")
-        .header("Cookie", "over18=1; locale=zh;")
-        .send()
+    let fetch_search = |term: String| {
+        let client = client.clone();
+        async move {
+            let search_url = format!("https://javdb.com/search?q={}&f=all", term);
+            client
+                .get(&search_url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7")
+                .header("Cookie", "over18=1; locale=zh;")
+                .send()
+                .await
+        }
+    };
+
+    let search_resp = fetch_search(primary_search)
         .await
         .map_err(|e| format!("请求 JavDB 搜索失败：{e}"))?;
 
@@ -1307,8 +1357,23 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
 
     let search_html = search_resp.text().await.map_err(|e| format!("读取搜索响应失败：{e}"))?;
 
-    let (detail_path, card) = javdb_exact_card(&search_html, number)
-        .ok_or_else(|| format!("JavDB 未找到精确番号【{number}】"))?;
+    let card_match = javdb_exact_card(&search_html, number);
+    let (detail_path, card) = match card_match {
+        Some(m) => m,
+        None => {
+            if let Some(fallback) = fallback_search {
+                let resp2 = fetch_search(fallback).await.map_err(|e| format!("请求 JavDB 搜索失败：{e}"))?;
+                if resp2.status().is_success() {
+                    let html2 = resp2.text().await.map_err(|e| format!("读取搜索响应失败：{e}"))?;
+                    javdb_exact_card(&html2, number).ok_or_else(|| format!("JavDB 未找到精确番号【{number}】"))?
+                } else {
+                    return Err(format!("JavDB 未找到精确番号【{number}】"));
+                }
+            } else {
+                return Err(format!("JavDB 未找到精确番号【{number}】"));
+            }
+        }
+    };
     let search_title = card.split("class=\"video-title\"").nth(1)
         .and_then(|s| s.split_once('>')).and_then(|(_, s)| s.split_once("</div>"))
         .map(|(s, _)| plain_text(s));
@@ -1337,7 +1402,14 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
     if is_captcha {
         return Err(format!("JavDB 详情页需要验证或加载失败【{number}】"));
     }
-    if detail_identity(&html, &["<strong>番號:</strong>", "<strong>番号:</strong>"]).as_deref() != Some(number) {
+    let normalized_detail = detail_identity(&html, &["<strong>番號:</strong>", "<strong>番号:</strong>"]);
+    let matches = normalized_detail.as_deref() == Some(number)
+        || (number.starts_with("FC2-") && normalized_detail.as_deref().is_some_and(|d| {
+            let num_id = number.trim_start_matches("FC2-");
+            let norm = d.replace(['-', '_', ' '], "").to_ascii_uppercase();
+            norm == format!("FC2PPV{num_id}") || norm == format!("FC2{num_id}")
+        }));
+    if !matches {
         return Err(format!("JavDB 详情番号不匹配【{number}】"));
     }
 
@@ -2274,22 +2346,41 @@ pub struct UnrecognizedVideo { pub id: String, pub file_name: String, pub remote
 #[serde(rename_all = "camelCase")]
 pub struct UnrecognizedVideoPage { pub items: Vec<UnrecognizedVideo>, pub total: usize }
 
+pub fn is_ad_or_promo_asset(file_name: &str, _remote_path: &str, size_bytes: i64) -> bool {
+    // 1. Files smaller than 50MB (52,428,800 bytes) are considered promotional clips/ads
+    if size_bytes > 0 && size_bytes < 52_428_800 {
+        return true;
+    }
+    // 2. Typical promo / ad keywords in filename
+    let lower = file_name.to_lowercase();
+    let keywords = [
+        "直播", "社區", "社区", "最新情報", "最新情报", "決勝負", "决胜负",
+        "妹子", "网址", "xuu92", "免费", "首发",
+    ];
+    if keywords.iter().any(|k| lower.contains(k)) {
+        return true;
+    }
+    false
+}
+
 /// Return only current, non-missing video assets under the configured whitelist
 /// whose filename extractor cannot establish one unambiguous identity.
 pub fn list_unrecognized_videos(conn: &Connection, limit: u32, offset: u32) -> Result<UnrecognizedVideoPage, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
     let whitelist = get_scrape_whitelist(conn)?;
     let mut stmt = conn.prepare(
-        "SELECT id, file_name, remote_path FROM assets
+        "SELECT id, file_name, remote_path, size_bytes FROM assets
          WHERE missing = 0 AND media_type = 'video'
            AND id NOT IN (SELECT asset_id FROM scrape_ignored_assets)
          ORDER BY id ASC"
     )?;
-    let rows = stmt.query_map([], |r| Ok(UnrecognizedVideo { id: r.get(0)?, file_name: r.get(1)?, remote_path: r.get(2)? }))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))?;
     let mut all = Vec::new();
     for row in rows {
-        let item = row?;
-        if whitelist.iter().any(|prefix| path_under(&item.remote_path, prefix)) && extract_jav_number_with_path(&item.file_name, &item.remote_path).is_none() { all.push(item); }
+        let (id, file_name, remote_path, size_bytes) = row?;
+        if !whitelist.iter().any(|prefix| path_under(&remote_path, prefix)) { continue; }
+        if is_ad_or_promo_asset(&file_name, &remote_path, size_bytes) { continue; }
+        if extract_jav_number_with_path(&file_name, &remote_path).is_none() { all.push(UnrecognizedVideo { id, file_name, remote_path }); }
     }
     let total = all.len();
     let start = offset as usize;
@@ -2578,17 +2669,18 @@ pub fn is_path_whitelisted(conn: &Connection, path: &str) -> bool {
 fn whitelisted_number_assets(conn: &Connection) -> Result<(usize, std::collections::BTreeMap<String, Vec<String>>), rusqlite::Error> {
     let whitelist = get_scrape_whitelist(conn)?;
     let mut stmt = conn.prepare(
-        "SELECT id, file_name, remote_path FROM assets
+        "SELECT id, file_name, remote_path, size_bytes FROM assets
          WHERE missing = 0 AND media_type = 'video'
            AND id NOT IN (SELECT asset_id FROM scrape_ignored_assets)
          ORDER BY id"
     )?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?)))?;
     let mut total = 0;
     let mut numbers = std::collections::BTreeMap::<String, Vec<String>>::new();
     for row in rows {
-        let (id, name, path) = row?;
+        let (id, name, path, size_bytes) = row?;
         if !whitelist.iter().any(|p| path_under(&path, p)) { continue; }
+        if is_ad_or_promo_asset(&name, &path, size_bytes) { continue; }
         total += 1;
         if let Some(number) = extract_jav_number_with_path(&name, &path) { numbers.entry(number).or_default().push(id); }
     }
@@ -2928,7 +3020,7 @@ mod tests {
 
     fn database() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE assets(id TEXT PRIMARY KEY, file_name TEXT, remote_path TEXT, missing INTEGER, media_type TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE assets(id TEXT PRIMARY KEY, file_name TEXT, remote_path TEXT, missing INTEGER, media_type TEXT, size_bytes INTEGER DEFAULT 0);").unwrap();
         ensure_scraper_schema(&conn).unwrap();
         conn
     }
@@ -2966,7 +3058,11 @@ mod tests {
         for (input, expected) in [
             ("[中文字幕] SSIS-123_4K.mp4", "SSIS-123"),
             ("midv-045.mkv", "MIDV-045"), ("ABW001", "ABW-001"),
+            ("JUR00841_4K60FPS.mp4", "JUR-841"),
+            ("SERO-0273.mp4", "SERO-273"),
+            ("IPZ-00931.mp4", "IPZ-931"),
             ("FC2-PPV-2839102_1080p.mp4", "FC2-2839102"),
+            ("FC2PPV- 4832090.mp4", "FC2-4832090"),
             ("1pondo-010123_001.mp4", "010123_001"),
             ("CARIB-010123-001.mkv", "010123-001"),
             ("D:\\parent.ABP-444\\MIDV-045.mkv", "MIDV-045"),
@@ -2978,6 +3074,14 @@ mod tests {
         assert_eq!(normalize_jav_number("fc2 ppv 2839102").as_deref(), Some("FC2-2839102"));
         assert_eq!(normalize_jav_number("SSIS-123 title"), None);
         assert_ne!(normalize_jav_number("010123_001"), normalize_jav_number("010123-001"));
+    }
+
+    #[test]
+    fn promo_and_ad_videos_are_filtered() {
+        assert!(is_ad_or_promo_asset("社 區 最 新 情 報.mp4", "/path/ad.mp4", 15_000_000));
+        assert!(is_ad_or_promo_asset("sample.mp4", "/path/sample.mp4", 20_000_000));
+        assert!(is_ad_or_promo_asset("台 妹 子 線 上 現 場 直 播 各 式 花 式 表 演.mp4", "/path/ad.mp4", 100_000_000));
+        assert!(!is_ad_or_promo_asset("SSIS-123.mp4", "/path/SSIS-123.mp4", 2_000_000_000));
     }
 
     #[test]
