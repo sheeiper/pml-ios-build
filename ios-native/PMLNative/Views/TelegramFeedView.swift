@@ -1049,313 +1049,6 @@ struct TelegramFeedView: View {
         let res = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         return res.isEmpty ? text : res
     }
-}
-
-// MARK: - 专属评论区讨论抽屉 (按需点击展开)
-struct TelegramCommentsSheet: View {
-    @EnvironmentObject private var model: AppModel
-    @Environment(\.dismiss) private var dismiss
-
-    let message: TelegramNativeMessage
-    let onPlayVideo: (URL, String) -> Void
-    let onShowImage: (URL) -> Void
-    let onToast: (String) -> Void
-
-    @State private var loading = true
-    @State private var comments: [TelegramNativeComment] = []
-    @State private var offlineLinks: [TelegramNativeOfflineLink] = []
-    @State private var parentTitle: String = ""
-    @State private var errorText: String?
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if loading && comments.isEmpty {
-                    ProgressView("正在加载评论讨论...")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if let errorText {
-                    VStack(spacing: 12) {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.system(size: 36))
-                            .foregroundStyle(.orange)
-                        Text(errorText)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        Button("重试") {
-                            loadComments()
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    List {
-                        // 1. 原帖信息卡片
-                        Section {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text("📌 原帖摘要")
-                                        .font(.caption.weight(.bold))
-                                        .foregroundStyle(.blue)
-                                    Spacer()
-                                    if let date = message.date {
-                                        Text(date)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                if let text = message.text, !text.isEmpty {
-                                    Text(text)
-                                        .font(.subheadline)
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(4)
-                                }
-                            }
-                            .padding(.vertical, 4)
-                        }
-
-                        // 2. 评论区提取的离线下载资源
-                        if !offlineLinks.isEmpty {
-                            Section(header: Label("评论区提取资源 (\(offlineLinks.count))", systemImage: "bolt.fill").foregroundStyle(.purple)) {
-                                ForEach(offlineLinks) { lk in
-                                    offlineLinkCard(lk, parentText: message.text)
-                                }
-                            }
-                        }
-
-                        // 3. 评论讨论列表
-                        Section(header: Label("评论讨论 (\(comments.count))", systemImage: "bubble.left.and.bubble.right.fill")) {
-                            if comments.isEmpty {
-                                Text("暂无评论内容")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                ForEach(comments) { c in
-                                    commentRow(c)
-                                }
-                            }
-                        }
-                    }
-                    .listStyle(.insetGrouped)
-                }
-            }
-            .navigationTitle("评论讨论")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("完成") {
-                        dismiss()
-                    }
-                }
-            }
-            .task {
-                loadComments()
-            }
-        }
-    }
-
-    private func loadComments() {
-        guard let client = model.apiClient else { return }
-        loading = true
-        errorText = nil
-        Task {
-            do {
-                let resp = try await client.telegramUserComments(
-                    chatId: message.chatId,
-                    messageId: message.id
-                )
-                await MainActor.run {
-                    self.comments = resp.comments ?? []
-                    self.offlineLinks = resp.offlineLinks ?? []
-                    self.parentTitle = resp.parentTitle ?? ""
-                    self.loading = false
-                }
-            } catch {
-                await MainActor.run {
-                    self.errorText = error.localizedDescription
-                    self.loading = false
-                }
-            }
-        }
-    }
-
-    private func offlineLinkCard(_ lk: TelegramNativeOfflineLink, parentText: String?) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Text(linkBadgeTitle(lk.type))
-                    .font(.caption2.weight(.bold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(linkBadgeColor(lk.type).opacity(0.18), in: Capsule())
-                    .foregroundStyle(linkBadgeColor(lk.type))
-
-                if let code = lk.code, !code.isEmpty {
-                    Text("提取码: \(code)")
-                        .font(.caption2.weight(.bold).monospaced())
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.orange.opacity(0.15), in: Capsule())
-                        .foregroundStyle(.orange)
-                }
-                Spacer()
-            }
-
-            Text(lk.name)
-                .font(.subheadline.weight(.semibold))
-                .lineLimit(2)
-
-            Text(lk.url)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            HStack(spacing: 8) {
-                Button {
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    let clean = lk.textWithoutLinks ?? removeURLs(parentText ?? lk.name)
-                    let textToCopy = (lk.code != nil && !clean.contains(lk.code!)) ? "\(clean)\n提取码: \(lk.code!)" : clean
-                    UIPasteboard.general.string = textToCopy
-                    onToast("📄 已复制文本（无链接）")
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "doc.text")
-                        Text("复制文本")
-                    }
-                    .font(.caption.weight(.bold))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.blue, in: Capsule())
-                    .foregroundStyle(.white)
-                }
-
-                Button {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    let isDirect = lk.url.hasPrefix("magnet:") || lk.url.hasPrefix("ed2k:") || lk.url.hasPrefix("thunder:")
-                    let linkStr = (!isDirect && lk.code != nil) ? "\(lk.url) 提取码: \(lk.code!)" : lk.url
-                    UIPasteboard.general.string = linkStr
-                    onToast("🔗 已复制下载链接")
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "link")
-                        Text("复制链接")
-                    }
-                    .font(.caption.weight(.medium))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
-                    .foregroundStyle(.primary)
-                }
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func commentRow(_ c: TelegramNativeComment) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(Color.accentColor.opacity(0.8))
-                    .frame(width: 24, height: 24)
-                    .overlay {
-                        Text((c.senderName ?? "U").prefix(1).uppercased())
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.white)
-                    }
-                Text(c.senderName ?? "Telegram 用户")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                if let date = c.date {
-                    Text(date.suffix(8))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            if let text = c.text, !text.isEmpty {
-                Text(text)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-            }
-
-            if c.isVideo == true, let video = c.video, let url = model.apiClient?.telegramUserStreamURL(chatId: c.chatId ?? message.chatId, messageId: c.id) {
-                Button {
-                    onPlayVideo(url, video.fileName ?? "评论区视频")
-                } label: {
-                    HStack {
-                        Image(systemName: "play.circle.fill")
-                        Text("播放视频: \(video.fileName ?? "视频")")
-                    }
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.blue)
-                }
-            }
-
-            if c.hasPhoto == true, let thumbURL = model.apiClient?.telegramUserThumbURL(chatId: c.chatId ?? message.chatId, messageId: c.id) {
-                AsyncImage(url: thumbURL) { phase in
-                    if let image = phase.image {
-                        image.resizable().scaledToFit().frame(maxHeight: 160).cornerRadius(8)
-                            .onTapGesture { onShowImage(thumbURL) }
-                    }
-                }
-            }
-
-            if let cLinks = c.offlineLinks, !cLinks.isEmpty {
-                ForEach(cLinks) { cl in
-                    offlineLinkCard(cl, parentText: c.text)
-                }
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func removeURLs(_ text: String) -> String {
-        var t = text
-        // 1. 解开 Markdown 链接 [标签](链接) -> 标签
-        t = t.replacingOccurrences(of: #"\x5B([^\x5D\r\n]+)\x5D\([^\)\r\n]+\)"#, with: "$1", options: .regularExpression)
-        // 2. 剥离 Markdown 格式装饰字符
-        t = t.replacingOccurrences(of: #"[`\*_~]"#, with: "", options: .regularExpression)
-        // 3. 剥离网络与离线协议链接
-        t = t.replacingOccurrences(of: "https?://\\S+", with: "", options: .regularExpression)
-        t = t.replacingOccurrences(of: "magnet:\\?\\S+", with: "", options: .regularExpression)
-        t = t.replacingOccurrences(of: "ed2k://\\S+", with: "", options: .regularExpression)
-        t = t.replacingOccurrences(of: "thunder://\\S+", with: "", options: .regularExpression)
-        let lines = t.components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        let res = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return res.isEmpty ? text : res
-    }
-
-    private func linkBadgeTitle(_ type: String) -> String {
-        switch type {
-        case "magnet": return "🧲 磁力链"
-        case "115": return "📦 115网盘"
-        case "quark": return "⚡ 夸克网盘"
-        case "baidu": return "☁️ 百度网盘"
-        case "pikpak": return "🚀 PikPak"
-        case "ed2k": return "🐴 电驴"
-        case "thunder": return "⚡ 迅雷"
-        case "aliyun": return "📂 阿里"
-        case "uc": return "🛸 UC"
-        case "xunlei": return "🌩️ 迅雷云"
-        default: return "🔗 离线下载"
-        }
-    }
-
-    private func linkBadgeColor(_ type: String) -> Color {
-        switch type {
-        case "magnet": return .red
-        case "115": return .orange
-        case "quark": return .blue
-        case "baidu": return .teal
-        case "pikpak": return .indigo
-        case "ed2k": return .brown
-        case "thunder", "xunlei": return .cyan
-        case "aliyun": return .purple
-        case "uc": return .green
-        default: return .secondary
-        }
-    }
-
     // MARK: - 模式 2: 视频流视图与卡片
 
     private var videoMessages: [TelegramNativeMessage] {
@@ -1759,6 +1452,315 @@ struct TelegramCommentsSheet: View {
         )
     }
 }
+
+
+// MARK: - 专属评论区讨论抽屉 (按需点击展开)
+struct TelegramCommentsSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    let message: TelegramNativeMessage
+    let onPlayVideo: (URL, String) -> Void
+    let onShowImage: (URL) -> Void
+    let onToast: (String) -> Void
+
+    @State private var loading = true
+    @State private var comments: [TelegramNativeComment] = []
+    @State private var offlineLinks: [TelegramNativeOfflineLink] = []
+    @State private var parentTitle: String = ""
+    @State private var errorText: String?
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if loading && comments.isEmpty {
+                    ProgressView("正在加载评论讨论...")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let errorText {
+                    VStack(spacing: 12) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.orange)
+                        Text(errorText)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Button("重试") {
+                            loadComments()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        // 1. 原帖信息卡片
+                        Section {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("📌 原帖摘要")
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(.blue)
+                                    Spacer()
+                                    if let date = message.date {
+                                        Text(date)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                if let text = message.text, !text.isEmpty {
+                                    Text(text)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(4)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+
+                        // 2. 评论区提取的离线下载资源
+                        if !offlineLinks.isEmpty {
+                            Section(header: Label("评论区提取资源 (\(offlineLinks.count))", systemImage: "bolt.fill").foregroundStyle(.purple)) {
+                                ForEach(offlineLinks) { lk in
+                                    offlineLinkCard(lk, parentText: message.text)
+                                }
+                            }
+                        }
+
+                        // 3. 评论讨论列表
+                        Section(header: Label("评论讨论 (\(comments.count))", systemImage: "bubble.left.and.bubble.right.fill")) {
+                            if comments.isEmpty {
+                                Text("暂无评论内容")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(comments) { c in
+                                    commentRow(c)
+                                }
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            }
+            .navigationTitle("评论讨论")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") {
+                        dismiss()
+                    }
+                }
+            }
+            .task {
+                loadComments()
+            }
+        }
+    }
+
+    private func loadComments() {
+        guard let client = model.apiClient else { return }
+        loading = true
+        errorText = nil
+        Task {
+            do {
+                let resp = try await client.telegramUserComments(
+                    chatId: message.chatId,
+                    messageId: message.id
+                )
+                await MainActor.run {
+                    self.comments = resp.comments ?? []
+                    self.offlineLinks = resp.offlineLinks ?? []
+                    self.parentTitle = resp.parentTitle ?? ""
+                    self.loading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = error.localizedDescription
+                    self.loading = false
+                }
+            }
+        }
+    }
+
+    private func offlineLinkCard(_ lk: TelegramNativeOfflineLink, parentText: String?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(linkBadgeTitle(lk.type))
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(linkBadgeColor(lk.type).opacity(0.18), in: Capsule())
+                    .foregroundStyle(linkBadgeColor(lk.type))
+
+                if let code = lk.code, !code.isEmpty {
+                    Text("提取码: \(code)")
+                        .font(.caption2.weight(.bold).monospaced())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.orange)
+                }
+                Spacer()
+            }
+
+            Text(lk.name)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(2)
+
+            Text(lk.url)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            HStack(spacing: 8) {
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    let clean = lk.textWithoutLinks ?? removeURLs(parentText ?? lk.name)
+                    let textToCopy = (lk.code != nil && !clean.contains(lk.code!)) ? "\(clean)\n提取码: \(lk.code!)" : clean
+                    UIPasteboard.general.string = textToCopy
+                    onToast("📄 已复制文本（无链接）")
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.text")
+                        Text("复制文本")
+                    }
+                    .font(.caption.weight(.bold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.blue, in: Capsule())
+                    .foregroundStyle(.white)
+                }
+
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    let isDirect = lk.url.hasPrefix("magnet:") || lk.url.hasPrefix("ed2k:") || lk.url.hasPrefix("thunder:")
+                    let linkStr = (!isDirect && lk.code != nil) ? "\(lk.url) 提取码: \(lk.code!)" : lk.url
+                    UIPasteboard.general.string = linkStr
+                    onToast("🔗 已复制下载链接")
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "link")
+                        Text("复制链接")
+                    }
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
+                    .foregroundStyle(.primary)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func commentRow(_ c: TelegramNativeComment) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.8))
+                    .frame(width: 24, height: 24)
+                    .overlay {
+                        Text((c.senderName ?? "U").prefix(1).uppercased())
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white)
+                    }
+                Text(c.senderName ?? "Telegram 用户")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                if let date = c.date {
+                    Text(date.suffix(8))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let text = c.text, !text.isEmpty {
+                Text(text)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+            }
+
+            if c.isVideo == true, let video = c.video, let url = model.apiClient?.telegramUserStreamURL(chatId: c.chatId ?? message.chatId, messageId: c.id) {
+                Button {
+                    onPlayVideo(url, video.fileName ?? "评论区视频")
+                } label: {
+                    HStack {
+                        Image(systemName: "play.circle.fill")
+                        Text("播放视频: \(video.fileName ?? "视频")")
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.blue)
+                }
+            }
+
+            if c.hasPhoto == true, let thumbURL = model.apiClient?.telegramUserThumbURL(chatId: c.chatId ?? message.chatId, messageId: c.id) {
+                AsyncImage(url: thumbURL) { phase in
+                    if let image = phase.image {
+                        image.resizable().scaledToFit().frame(maxHeight: 160).cornerRadius(8)
+                            .onTapGesture { onShowImage(thumbURL) }
+                    }
+                }
+            }
+
+            if let cLinks = c.offlineLinks, !cLinks.isEmpty {
+                ForEach(cLinks) { cl in
+                    offlineLinkCard(cl, parentText: c.text)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func removeURLs(_ text: String) -> String {
+        var t = text
+        // 1. 解开 Markdown 链接 [标签](链接) -> 标签
+        t = t.replacingOccurrences(of: #"\x5B([^\x5D\r\n]+)\x5D\([^\)\r\n]+\)"#, with: "$1", options: .regularExpression)
+        // 2. 剥离 Markdown 格式装饰字符
+        t = t.replacingOccurrences(of: #"[`\*_~]"#, with: "", options: .regularExpression)
+        // 3. 剥离网络与离线协议链接
+        t = t.replacingOccurrences(of: "https?://\\S+", with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: "magnet:\\?\\S+", with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: "ed2k://\\S+", with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: "thunder://\\S+", with: "", options: .regularExpression)
+        let lines = t.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let res = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return res.isEmpty ? text : res
+    }
+
+    private func linkBadgeTitle(_ type: String) -> String {
+        switch type {
+        case "magnet": return "🧲 磁力链"
+        case "115": return "📦 115网盘"
+        case "quark": return "⚡ 夸克网盘"
+        case "baidu": return "☁️ 百度网盘"
+        case "pikpak": return "🚀 PikPak"
+        case "ed2k": return "🐴 电驴"
+        case "thunder": return "⚡ 迅雷"
+        case "aliyun": return "📂 阿里"
+        case "uc": return "🛸 UC"
+        case "xunlei": return "🌩️ 迅雷云"
+        default: return "🔗 离线下载"
+        }
+    }
+
+    private func linkBadgeColor(_ type: String) -> Color {
+        switch type {
+        case "magnet": return .red
+        case "115": return .orange
+        case "quark": return .blue
+        case "baidu": return .teal
+        case "pikpak": return .indigo
+        case "ed2k": return .brown
+        case "thunder", "xunlei": return .cyan
+        case "aliyun": return .purple
+        case "uc": return .green
+        default: return .secondary
+        }
+    }
+
+}
+
 
 // MARK: - 原生手势缩放图片查看器 (双击放大 / 捏合缩放 / 拖拽平移)
 
