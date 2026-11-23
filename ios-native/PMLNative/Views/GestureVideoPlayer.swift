@@ -224,7 +224,7 @@ struct GestureVideoPlayerSheet: View {
                             Button {
                                 switchEngine(toVLC: !useVLC, preserveTime: true)
                             } label: {
-                                Text(useVLC ? "KS" : "AV")
+                                Text(useVLC ? "VLC" : "AV")
                                     .font(.caption2.weight(.bold))
                                     .foregroundStyle(useVLC ? Color.orange : Color.white.opacity(0.9))
                                     .padding(.horizontal, 8)
@@ -239,7 +239,7 @@ struct GestureVideoPlayerSheet: View {
                                     switchEngine(toVLC: !useVLC, preserveTime: true)
                                 } label: {
                                     Label(
-                                        useVLC ? "切换原生内核 (AVPlayer)" : "切换兼容内核 (KSPlayer / Metal)",
+                                        useVLC ? "切换原生内核 (AVPlayer)" : "切换兼容内核 (VLC，解决黑屏/抽搐)",
                                         systemImage: useVLC ? "play.rectangle" : "cpu"
                                     )
                                 }
@@ -795,7 +795,7 @@ struct GestureVideoPlayerSheet: View {
             isBuffering = true
             bindVLCCallbacks()
             vlcEngine.load(url: currentURL, startAt: targetTime, rate: rate, volume: volume, muted: muted)
-            showHUD(automatic ? "已自动切换兼容内核 (KSPlayer)" : "已切换兼容内核 (KSPlayer)", seconds: 2.0)
+            showHUD(automatic ? "已自动切换兼容内核 (VLC)" : "已切换兼容内核 (VLC)", seconds: 2.0)
         } else {
             vlcEngine.stop()
             useVLC = false
@@ -857,7 +857,7 @@ struct GestureVideoPlayerSheet: View {
             isBuffering = true
             bindVLCCallbacks()
             vlcEngine.load(url: currentURL, startAt: initialTime, rate: rate, volume: volume, muted: muted)
-            showHUD("兼容内核 (KSPlayer) 播放", seconds: 1.6)
+            showHUD("兼容内核 (VLC) 播放", seconds: 1.6)
         } else {
             vlcEngine.stop()
             useVLC = false

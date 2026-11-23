@@ -7,9 +7,9 @@ options:
   createIntermediateGroups: true
 
 packages:
-  KSPlayer:
-    url: https://github.com/kingslay/KSPlayer.git
-    exactVersion: 2.3.4
+  VLCKitSPM:
+    url: https://github.com/tylerjonesio/vlckit-spm
+    from: 3.6.0
 
 settings:
   base:
@@ -28,7 +28,7 @@ targets:
         excludes:
           - Info.plist
     dependencies:
-      - package: KSPlayer
+      - package: VLCKitSPM
     info:
       path: PMLNative/Info.plist
       properties:
