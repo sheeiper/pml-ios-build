@@ -42,6 +42,13 @@ struct SettingsView: View {
                 }
             }
             mediaSourceLink
+            Section("多模块资料库") {
+                NavigationLink {
+                    LibraryModulesSettingsView()
+                } label: {
+                    Label("五大模块路径与同步", systemImage: "square.stack.3d.up.fill")
+                }
+            }
             if model.settings.mode == .server {
                 accelSection
             }

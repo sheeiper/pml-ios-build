@@ -1696,8 +1696,9 @@ pub fn list_library_authors(
     app: AppHandle,
     category_id: Option<String>,
     filter: Option<String>,
+    author_id: Option<String>,
 ) -> Result<Vec<LibraryAuthor>, String> {
-    crate::v2_catalog::list_library_authors(app, category_id, filter)
+    crate::v2_catalog::list_library_authors(app, category_id, filter, author_id)
 }
 
 #[cfg_attr(feature = "tauri", tauri::command)]

@@ -8,7 +8,7 @@ struct HomeView: View {
 
     @State private var overview: LibraryOverview?
     @State private var recent: [LibraryAsset] = []
-    @State private var authors: [LibraryAuthor] = []
+    @State private var creatorsV2: [CreatorSummaryV2] = []
     @State private var comics: [LibraryAsset] = []
     @State private var roots: [LibraryRoot] = []
     @State private var favorites: Int64 = 0
@@ -124,7 +124,7 @@ struct HomeView: View {
             statCard("图片", "\(overview.images)", "photo.fill")
             statCard("视频", "\(overview.videos)", "play.rectangle.fill")
             statCard("漫画", "\(overview.comics)", "book.closed.fill")
-            statCard("创作者", "\(overview.authors)", "person.2.fill")
+            statCard("创作者", "\(creatorsV2.isEmpty ? overview.authors : Int64(creatorsV2.count))", "person.2.fill")
             statCard("收藏", "\(favorites)", "heart.fill")
             statCard("未播放", "\(overview.unplayed)", "eye.slash")
             statCard("占用", pmlFormatBytes(overview.totalBytes), "internaldrive")
@@ -229,32 +229,27 @@ struct HomeView: View {
 
     @ViewBuilder
     private var creatorsSection: some View {
-        if !authors.isEmpty {
+        if !creatorsV2.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 Text("常看创作者").font(.headline)
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 14) {
-                        ForEach(authors.prefix(10)) { author in
+                        ForEach(creatorsV2.prefix(12)) { creator in
                             NavigationLink {
-                                AuthorProfileView(author: author)
+                                AuthorProfileView(creator: creator)
                                     .environmentObject(model)
                             } label: {
                                 VStack(spacing: 6) {
-                                    avatarView(author)
+                                    creatorAvatarView(creator)
                                         .frame(width: 60, height: 60)
                                         .clipShape(Circle())
-                                    Text(author.name)
+                                    Text(creator.name)
                                         .font(.caption)
                                         .lineLimit(1)
                                         .frame(width: 68)
                                 }
                             }
                             .buttonStyle(.plain)
-                            .task {
-                                if let id = author.avatarAssetId {
-                                    await thumbs.image(assetId: id, client: model.apiClient)
-                                }
-                            }
                         }
                     }
                 }
@@ -287,15 +282,15 @@ struct HomeView: View {
     }
 
     @ViewBuilder
-    private func avatarView(_ author: LibraryAuthor) -> some View {
-        if let id = author.avatarAssetId, let image = thumbs.images[id] {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
+    private func creatorAvatarView(_ creator: CreatorSummaryV2) -> some View {
+        if let url = model.apiClient?.v2CoverURL(assetId: creator.avatarAssetId ?? creator.coverAssetId) {
+            CachedImageView(url: url, contentMode: .fill, minHeight: 60, maxPixel: 200)
         } else {
             ZStack {
                 Circle().fill(.quaternary.opacity(0.35))
-                Image(systemName: "person.fill").foregroundStyle(.tint)
+                Text(String(creator.name.prefix(1)))
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(.tint)
             }
         }
     }
@@ -362,13 +357,13 @@ struct HomeView: View {
             async let overviewTask = client.libraryOverview()
             async let recentTask = client.libraryAssets(filter: "recent", limit: 14)
             async let favoriteTask = client.favoriteCount()
-            async let authorsTask = client.libraryAuthors(filter: "all")
+            async let authorsTask = client.listCreatorsV2(sort: "count")
             async let comicsTask = client.libraryAssets(filter: "comics", limit: 16)
             async let rootsTask = client.libraryRoots()
             overview = try await overviewTask
             recent = try await recentTask
             favorites = try await favoriteTask
-            authors = try await authorsTask
+            creatorsV2 = (try? await authorsTask) ?? []
             comics = try await comicsTask
             roots = try await rootsTask
         } catch {

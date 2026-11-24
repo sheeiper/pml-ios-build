@@ -7,9 +7,10 @@ extension PMLAPIClient {
         try await command("get_library_overview")
     }
 
-    func libraryAuthors(categoryId: String? = nil, filter: String = "all") async throws -> [LibraryAuthor] {
+    func libraryAuthors(categoryId: String? = nil, filter: String = "all", authorId: String? = nil) async throws -> [LibraryAuthor] {
         var arguments: [String: Any] = ["filter": filter]
         if let categoryId { arguments["categoryId"] = categoryId }
+        if let authorId { arguments["authorId"] = authorId }
         return try await command("list_library_authors", arguments: arguments)
     }
 

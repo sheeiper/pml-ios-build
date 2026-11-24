@@ -204,6 +204,8 @@ struct CategoriesRequest {
 struct AuthorsRequest {
     category_id: Option<String>,
     filter: Option<String>,
+    #[serde(default)]
+    author_id: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Default)]
@@ -650,6 +652,278 @@ async fn dispatch_command(
         "four_domain_summaries" => {
             let app = app.clone();
             blocking_result_response(move || four_domains::summaries(&app)).await
+        }
+        "list_library_modules" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::library_modules::list_modules(&app)).await
+        }
+        "upsert_library_module" => {
+            let req: crate::library_modules::UpsertModuleRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let app = app.clone();
+            blocking_result_response(move || crate::library_modules::upsert_module(&app, req)).await
+        }
+        "scan_library_module" => {
+            let module_id = payload
+                .get("moduleId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let full = payload.get("full").and_then(Value::as_bool).unwrap_or(false);
+            result_response(
+                crate::library_modules::scan_module(
+                    app.clone(),
+                    app.state::<MediaLibraryState>(),
+                    &module_id,
+                    full,
+                )
+                .await,
+            )
+        }
+        "rebuild_module_indexes" => {
+            let module_id = payload
+                .get("moduleId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let app = app.clone();
+            blocking_result_response(move || match module_id {
+                Some(id) if !id.trim().is_empty() => {
+                    crate::library_modules::rebuild_module_index(&app, id.trim()).map(|r| vec![r])
+                }
+                _ => crate::library_modules::rebuild_all_module_indexes(&app),
+            })
+            .await
+        }
+        "list_creator_studios" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::library_modules::list_creator_studios(&app)).await
+        }
+        "list_creators_v2" => {
+            let studio = payload.get("studio").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::list_creators_v2(
+                    &app,
+                    studio.as_deref(),
+                    query.as_deref(),
+                    sort.as_deref(),
+                )
+            })
+            .await
+        }
+        "get_creator_profile_v2" => {
+            let author_id = payload
+                .get("authorId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let studio = payload.get("studio").and_then(Value::as_str).map(str::to_owned);
+            let media_type = payload.get("mediaType").and_then(Value::as_str).map(str::to_owned);
+            let album_name = payload.get("albumName").and_then(Value::as_str).map(str::to_owned);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(120);
+            let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::get_creator_profile_v2(
+                    &app,
+                    &author_id,
+                    studio.as_deref(),
+                    media_type.as_deref(),
+                    album_name.as_deref(),
+                    limit,
+                    offset,
+                )
+            })
+            .await
+        }
+        "update_creator_profile" => {
+            let req: crate::library_modules::UpdateCreatorProfileRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let app = app.clone();
+            blocking_result_response(move || crate::library_modules::update_creator_profile(&app, req)).await
+        }
+        "list_creator_merge_suggestions" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::library_modules::list_creator_merge_suggestions(&app)).await
+        }
+        "ignore_creator_merge_pair" => {
+            let author_id_a = payload
+                .get("authorIdA")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let author_id_b = payload
+                .get("authorIdB")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::ignore_creator_merge_pair(&app, &author_id_a, &author_id_b)
+            })
+            .await
+        }
+        "verify_creator_merge" => {
+            let keep_author_id = payload
+                .get("keepAuthorId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let merged_author_id = payload
+                .get("mergedAuthorId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let keep_alias = payload.get("keepAlias").and_then(Value::as_bool).unwrap_or(true);
+            result_response(
+                crate::library_modules::verify_creator_merge(
+                    app.clone(),
+                    app.state::<MediaLibraryState>(),
+                    &keep_author_id,
+                    &merged_author_id,
+                    keep_alias,
+                )
+                .await,
+            )
+        }
+        "list_collection_channels" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::library_modules::list_collection_channels(&app)).await
+        }
+        "list_collection_albums" => {
+            let channel = payload.get("channel").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(80);
+            let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::list_collection_albums(
+                    &app,
+                    channel.as_deref(),
+                    query.as_deref(),
+                    sort.as_deref(),
+                    limit,
+                    offset,
+                )
+            })
+            .await
+        }
+        "list_collection_items" => {
+            let channel = payload.get("channel").and_then(Value::as_str).map(str::to_owned);
+            let album_id = payload.get("albumId").and_then(Value::as_str).map(str::to_owned);
+            let media_type = payload.get("mediaType").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(80);
+            let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::list_collection_items(
+                    &app,
+                    channel.as_deref(),
+                    album_id.as_deref(),
+                    media_type.as_deref(),
+                    query.as_deref(),
+                    sort.as_deref(),
+                    limit,
+                    offset,
+                )
+            })
+            .await
+        }
+        "list_gallery_models" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::library_modules::list_gallery_models(&app)).await
+        }
+        "list_gallery_sets" => {
+            let model_name = payload.get("modelName").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(80);
+            let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::list_gallery_sets(
+                    &app,
+                    model_name.as_deref(),
+                    query.as_deref(),
+                    sort.as_deref(),
+                    limit,
+                    offset,
+                )
+            })
+            .await
+        }
+        "get_gallery_set_items" => {
+            let set_id = payload
+                .get("setId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::get_gallery_set_items(&app, &set_id)
+            })
+            .await
+        }
+        "browse_creator_folder" => {
+            let author_id = payload
+                .get("authorId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let studio = payload.get("studio").and_then(Value::as_str).map(str::to_owned);
+            let sub_path = payload.get("subPath").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(80);
+            let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::browse_creator_folder(
+                    &app,
+                    &author_id,
+                    studio.as_deref(),
+                    sub_path.as_deref(),
+                    query.as_deref(),
+                    sort.as_deref(),
+                    limit,
+                    offset,
+                )
+            })
+            .await
+        }
+        "browse_collection_folder" => {
+            let album_id = payload
+                .get("albumId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let sub_path = payload.get("subPath").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(80);
+            let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::browse_collection_folder(
+                    &app,
+                    &album_id,
+                    sub_path.as_deref(),
+                    query.as_deref(),
+                    sort.as_deref(),
+                    limit,
+                    offset,
+                )
+            })
+            .await
         }
         "refresh_domain_path" => {
             let domain = payload.get("domain").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -1530,7 +1804,7 @@ async fn dispatch_command(
             };
             let app = app.clone();
             blocking_result_response(move || {
-                media_library::list_library_authors(app, args.category_id, args.filter)
+                media_library::list_library_authors(app, args.category_id, args.filter, args.author_id)
             })
             .await
         }

@@ -3,6 +3,9 @@ import SwiftUI
 struct ScanCenterView: View {
     @EnvironmentObject private var model: AppModel
 
+    @State private var modules: [LibraryModuleInfo] = []
+    @State private var syncingModuleId: String? = nil
+    @State private var rebuilding = false
     @State private var progress: ScanProgress?
     @State private var cache: CacheStats?
     @State private var busy = false
@@ -12,7 +15,73 @@ struct ScanCenterView: View {
 
     var body: some View {
         List {
-            Section("扫描状态") {
+            Section {
+                if modules.isEmpty {
+                    Text("加载模块列表…").foregroundStyle(.secondary)
+                } else {
+                    ForEach(modules) { mod in
+                        HStack(spacing: 12) {
+                            Image(systemName: mod.symbol)
+                                .font(.title3)
+                                .foregroundStyle(.tint)
+                                .frame(width: 28)
+
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(mod.name)
+                                        .font(.subheadline.weight(.semibold))
+                                    if !mod.enabled {
+                                        Text("已停用")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Text("\(mod.entityCount) \(mod.entityUnitLabel) · \(mod.assetCount) 文件 · \(PMLFormatters.bytes(mod.totalBytes))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(mod.remotePath)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+
+                            Spacer(minLength: 6)
+
+                            Button {
+                                Task { await scanSingleModule(mod) }
+                            } label: {
+                                if syncingModuleId == mod.id {
+                                    ProgressView()
+                                } else {
+                                    Text("同步")
+                                        .font(.caption.weight(.semibold))
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(syncingModuleId != nil || rebuilding || busy)
+                        }
+                        .padding(.vertical, 3)
+                    }
+
+                    Button {
+                        Task { await rebuildAllIndexes() }
+                    } label: {
+                        HStack {
+                            Label(rebuilding ? "重建索引中…" : "仅重建全部模块索引", systemImage: "arrow.triangle.2.circlepath")
+                            Spacer()
+                            if rebuilding { ProgressView() }
+                        }
+                    }
+                    .disabled(syncingModuleId != nil || rebuilding || busy)
+                }
+            } header: {
+                Text("五大模块独立同步")
+            } footer: {
+                Text("可单独同步某个模块目录，避免全库扫描耗时。")
+            }
+
+            Section("全库扫描状态") {
                 if let progress {
                     LabeledContent("状态", value: progress.running ? "扫描中" : "空闲")
                     ProgressView(value: progress.percent, total: 100)
@@ -27,15 +96,15 @@ struct ScanCenterView: View {
                 }
             }
 
-            Section("操作") {
-                Button(busy ? "处理中…" : "立即扫描资料库") {
+            Section("全库操作") {
+                Button(busy ? "处理中…" : "全库扫描资料库") {
                     Task { await startScan() }
                 }
-                .disabled(busy)
+                .disabled(busy || syncingModuleId != nil)
                 Button("重扫失败的目录") {
                     Task { await rescanFailed() }
                 }
-                .disabled(busy)
+                .disabled(busy || syncingModuleId != nil)
             }
 
             Section("索引统计") {
@@ -57,7 +126,7 @@ struct ScanCenterView: View {
 
             if !message.isEmpty {
                 Section {
-                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                    Text(message).font(.footnote).foregroundStyle(.green)
                 }
             }
             if !errorText.isEmpty {
@@ -68,16 +137,52 @@ struct ScanCenterView: View {
         }
         .navigationTitle("扫描中心")
         .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await load() }
         .task { await load() }
         .onDisappear { pollTask?.cancel() }
     }
 
     private func load() async {
         guard let client = model.apiClient else { return }
-        progress = try? await client.scanProgress()
-        cache = try? await client.cacheStats()
+        async let modReq = client.listLibraryModules()
+        async let progReq = client.scanProgress()
+        async let cacheReq = client.cacheStats()
+        modules = (try? await modReq) ?? []
+        progress = try? await progReq
+        cache = try? await cacheReq
         if progress?.running == true {
             startPolling()
+        }
+    }
+
+    private func scanSingleModule(_ mod: LibraryModuleInfo) async {
+        guard let client = model.apiClient else { return }
+        syncingModuleId = mod.id
+        message = ""
+        errorText = ""
+        defer { syncingModuleId = nil }
+        do {
+            let res = try await client.scanLibraryModule(moduleId: mod.id, full: false)
+            message = "「\(mod.name)」同步完成：扫描 \(res.scan.scanned) 项，新增 \(res.scan.added)，索引 \(res.rebuild.entityCount) \(mod.entityUnitLabel)"
+            await load()
+        } catch {
+            errorText = "同步「\(mod.name)」失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func rebuildAllIndexes() async {
+        guard let client = model.apiClient else { return }
+        rebuilding = true
+        message = ""
+        errorText = ""
+        defer { rebuilding = false }
+        do {
+            let summaries = try await client.rebuildModuleIndexes()
+            let totalTagged = summaries.reduce(0) { $0 + $1.taggedAssets }
+            message = "已重建 \(summaries.count) 个模块索引（共标记 \(totalTagged) 个资产）"
+            await load()
+        } catch {
+            errorText = "重建索引失败：\(error.localizedDescription)"
         }
     }
 
@@ -108,8 +213,9 @@ struct ScanCenterView: View {
                     }
                 }
             }
-            cache = try? await client.cacheStats()
-            message = "扫描完成"
+            _ = try? await client.rebuildModuleIndexes()
+            await load()
+            message = "全库扫描与模块索引重建完成"
         } catch {
             errorText = error.localizedDescription
         }

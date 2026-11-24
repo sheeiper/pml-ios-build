@@ -427,6 +427,7 @@ pub(crate) fn ensure_v2(app: &AppHandle) -> Result<(), String> {
 
     crate::v2_state::ensure_state_schema(&mut connection).map_err(|error| error.to_string())?;
     ensure_domain_roots(&connection, app)?;
+    crate::library_modules::ensure_module_schema(&connection)?;
     if !migration_done(&connection)? {
         migrate_vault(&connection, app)?;
     }
@@ -993,7 +994,7 @@ async fn scan_path_v2(
 
 // Fetch everything before opening a write transaction. A failed or malformed listing
 // must never make a partial tree authoritative.
-async fn scan_provider_tree(
+pub(crate) async fn scan_provider_tree(
     app: AppHandle,
     state: State<'_, media_library::MediaLibraryState>,
     domain: &str,

@@ -48,6 +48,8 @@ struct PendingCurationView: View {
     @State private var categoryTree: [VaultCategoryNode] = []
     @State private var filterWords: [String] = []
     @State private var savedAssignments: [String: CuratorItemAssignment?] = [:]
+    @State private var v2Context = PendingV2Context.empty
+    @State private var deckSelectedModule: PendingModuleKind = .creators
     @State private var metaLoaded = false
 
     // Level 1: 项目大厅
@@ -1063,6 +1065,81 @@ struct PendingCurationView: View {
                 .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
             }
 
+            // V2 五大模块 2 级快捷选区（不点进高级即可一键选定模块 + 二级分类/工作室/频道/模特）
+            if v2Context.isLoaded {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack {
+                        Label("模块直达", systemImage: "square.stack.3d.up.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                        Spacer()
+                        Text(deckSelectedModule == .creators ? "创作者自动套【】" : "直入二级目录")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    // 第一级：5 大模块胶囊
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(PendingModuleKind.allCases) { kind in
+                                let active = deckSelectedModule == kind
+                                Button {
+                                    deckSelectedModule = kind
+                                    if kind != .creators {
+                                        deckAuthorInput = ""
+                                    }
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: kind.symbol)
+                                            .font(.system(size: 10, weight: .semibold))
+                                        Text(kind.label)
+                                            .font(.caption2.weight(active ? .bold : .medium))
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(active ? Color.accentColor : Color.accentColor.opacity(0.12), in: Capsule())
+                                    .foregroundStyle(active ? .white : Color.accentColor)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+
+                    // 第二级：当前模块的二级选项（工作室 / 频道 / 模特 / 影片分类 / 漫画分类）
+                    let subs = v2Context.subOptions(for: deckSelectedModule, fallbackVaultRoot: vaultRoot)
+                    if !subs.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                ForEach(subs) { sub in
+                                    let selected = deckCategoryPath == sub.path
+                                    Button {
+                                        deckCategoryPath = sub.path
+                                        deckCategoryName = "\(deckSelectedModule.label) / \(sub.label)"
+                                        stickyCategoryPath = sub.path
+                                        stickyCategoryName = deckCategoryName
+                                        if deckSelectedModule != .creators {
+                                            deckAuthorInput = ""
+                                        }
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    } label: {
+                                        Text(sub.label)
+                                            .font(.caption2.weight(selected ? .bold : .medium))
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(selected ? Color.green : Color(.tertiarySystemFill), in: Capsule())
+                                            .foregroundStyle(selected ? .white : .primary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(10)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+            }
+
             // 绿色分类槽位：最近分类推荐 + 库内叶子分类 + 优先最后一级
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
@@ -1582,20 +1659,11 @@ struct PendingCurationView: View {
         // 确保元数据最新
         await ensureMetaLoaded()
         let activeAuthors = federatedAuthors
-        let customSet = filterWords
-
         var autoAssignedCount = 0
         var newAssignments: [String: CuratorItemAssignment?] = [:]
 
         for i in allItems.indices where !allItems[i].isAssigned {
-            let analyzed = MediaOrganizer.analyzePendingEntry(
-                allItems[i].entry,
-                authors: activeAuthors,
-                categoryTree: categoryTree,
-                vaultRoot: vaultRoot,
-                customFilterWords: customSet,
-                savedAssignments: savedAssignments
-            )
+            let analyzed = analyzeEntryWithV2(allItems[i].entry, authors: activeAuthors)
             allItems[i] = analyzed
             if analyzed.isAssigned, let dest = analyzed.targetVaultPath {
                 autoAssignedCount += 1
@@ -1639,17 +1707,43 @@ struct PendingCurationView: View {
         }
     }
 
-    /// 按需即时识别单个条目（秒开后当前展示项即时匹配）
-    private func analyzeItemIfNeeded(_ item: PendingCurationItem, force: Bool = false) async {
-        guard !item.isAnalyzed || force else { return }
-        let analyzed = MediaOrganizer.analyzePendingEntry(
-            item.entry,
-            authors: federatedAuthors,
+    /// 结合 V2 五大模块智能匹配 + 既有候选词与草稿恢复引擎。
+    private func analyzeEntryWithV2(_ entry: RemoteBrowserEntry, authors: [VaultAuthorEntry]) -> PendingCurationItem {
+        var analyzed = MediaOrganizer.analyzePendingEntry(
+            entry,
+            authors: authors,
             categoryTree: categoryTree,
             vaultRoot: vaultRoot,
             customFilterWords: filterWords,
             savedAssignments: savedAssignments
         )
+        // 已从服务端草稿恢复的保持不变
+        if analyzed.assignmentSource == .restoredDraft {
+            return analyzed
+        }
+        if v2Context.isLoaded,
+           let hit = PendingMatcherV2.match(
+               fileName: entry.name,
+               isDirectory: entry.isDirectory,
+               context: v2Context,
+               fallbackVaultRoot: vaultRoot
+           ) {
+            analyzed.assignmentSource = hit.source
+            analyzed.matchedAuthorId = hit.authorId
+            analyzed.matchedAuthor = hit.authorName
+            analyzed.matchedAlias = hit.matchedAlias
+            analyzed.matchedCategoryPath = hit.categoryPath
+            analyzed.matchedCategoryName = hit.categoryName
+            analyzed.targetVaultPath = hit.targetPath
+            analyzed.isAnalyzed = true
+        }
+        return analyzed
+    }
+
+    /// 按需即时识别单个条目（秒开后当前展示项即时匹配）
+    private func analyzeItemIfNeeded(_ item: PendingCurationItem, force: Bool = false) async {
+        guard !item.isAnalyzed || force else { return }
+        let analyzed = analyzeEntryWithV2(item.entry, authors: federatedAuthors)
         await MainActor.run {
             if let idx = allItems.firstIndex(where: { $0.id == item.id }) {
                 allItems[idx] = analyzed
@@ -1844,9 +1938,11 @@ struct PendingCurationView: View {
             let stillRunningPaths = Set(latest.filter(\.isRunning).map(\.projectPath))
             let justFinished = runningProjectPaths.subtracting(stillRunningPaths)
             if hadRunning && !justFinished.isEmpty {
+                // 后台移动结束后自动触发 V2 五大模块索引重建，确保创作者/合集/图集立即更新
+                Task { _ = try? await client.rebuildModuleIndexes() }
                 if let selected = selectedProject, justFinished.contains(selected.path) {
                     await loadProjectItems(selected, forceRefresh: true)
-                    showHUD("【\(selected.name)】后台移动任务已结束")
+                    showHUD("【\(selected.name)】后台移动任务已结束，正在更新模块索引")
                 } else {
                     await discoverProjects(forceRefresh: true)
                 }
@@ -1893,10 +1989,35 @@ struct PendingCurationView: View {
 
     private func ensureMetaLoaded() async {
         guard !metaLoaded, let client = model.apiClient else { return }
-        let customSet = Set(filterWords.map { $0.lowercased() })
-        if let meta = try? await client.domainMeta() {
-            categoryTree = MediaOrganizer.buildCategoryTree(from: meta.categories)
-            vaultAuthors = MediaOrganizer.buildAuthorEntries(from: meta.authors, customWords: customSet)
+        async let modulesReq = client.listLibraryModules()
+        async let studiosReq = client.listCreatorStudios()
+        async let creatorsReq = client.listCreatorsV2(sort: "count")
+        async let channelsReq = client.listCollectionChannels()
+        async let modelsReq = client.listGalleryModels()
+
+        let loadedModules = (try? await modulesReq) ?? []
+        let loadedStudios = (try? await studiosReq) ?? []
+        let loadedCreators = (try? await creatorsReq) ?? []
+        let loadedChannels = (try? await channelsReq) ?? []
+        let loadedModels = (try? await modelsReq) ?? []
+
+        if !loadedModules.isEmpty {
+            let ctx = PendingV2Context(
+                modules: loadedModules,
+                studios: loadedStudios,
+                creators: loadedCreators,
+                channels: loadedChannels,
+                galleryModels: loadedModels
+            )
+            v2Context = ctx
+            categoryTree = PendingMatcherV2.buildCategoryTree(from: ctx, fallbackVaultRoot: vaultRoot)
+            vaultAuthors = PendingMatcherV2.buildAuthorEntries(from: ctx, fallbackVaultRoot: vaultRoot)
+        } else {
+            let customSet = Set(filterWords.map { $0.lowercased() })
+            if let meta = try? await client.domainMeta() {
+                categoryTree = MediaOrganizer.buildCategoryTree(from: meta.categories)
+                vaultAuthors = MediaOrganizer.buildAuthorEntries(from: meta.authors, customWords: customSet)
+            }
         }
         metaLoaded = true
     }

@@ -115,8 +115,9 @@ struct PMLAPIClient {
 
         let timeout: TimeInterval = {
             switch name {
-            case "scan_domain": return 7200
+            case "scan_domain", "scan_library_module": return 7200
             case "create_pending_project": return 600
+            case "rebuild_module_indexes": return 300
             default: return 30
             }
         }()

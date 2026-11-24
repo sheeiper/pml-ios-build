@@ -1025,6 +1025,13 @@ struct ShortVideosView: View {
             showToast("该视频未关联创作者")
             return
         }
+        if let authorId, !authorId.isEmpty {
+            if let authors = try? await client.libraryAuthors(filter: "all", authorId: authorId),
+               let matched = authors.first(where: { $0.id == authorId }) ?? authors.first {
+                authorSheet = matched
+                return
+            }
+        }
         if let authors = try? await client.libraryAuthors(filter: "all") {
             let matched = authors.first(where: { a in
                 if let authorId, a.id == authorId { return true }

@@ -1,90 +1,63 @@
-import PhotosUI
 import SwiftUI
 import UIKit
 
-private enum AuthorSortMode: String, CaseIterable, Identifiable {
-    case mediaCount = "作品数"
-    case name = "名称"
+private enum CreatorSortV2: String, CaseIterable, Identifiable {
+    case count = "作品最多"
+    case size = "体积最大"
+    case name = "名称 A-Z"
+    case recent = "最近更新"
+
     var id: String { rawValue }
+    var apiValue: String {
+        switch self {
+        case .count: return "count"
+        case .size: return "size"
+        case .name: return "name"
+        case .recent: return "recent"
+        }
+    }
 }
 
-/// 创作者分类大厅：一级分类卡片 → 子分类/作者列表，可切换全库索引。
+// MARK: - 创作者大厅 V2
+
+/// 创作者 V2 大厅：21 个工作室横向胶囊筛选 + 搜索姓名/别名 + 单模块独立同步 + 建议合并管理。
 struct AuthorsView: View {
     @EnvironmentObject private var model: AppModel
 
-    @State private var categories: [LibraryCategory] = []
-    @State private var authors: [LibraryAuthor] = []
-    @State private var selectedCategory: LibraryCategory?
-    @State private var viewAll = false
-    @State private var loading = false
-    @State private var checking = false
-    @State private var refreshNotice = ""
-    @State private var errorText = ""
+    @State private var studios: [CreatorStudioStat] = []
+    @State private var selectedStudio: String? = nil
+    @State private var creators: [CreatorSummaryV2] = []
+    @State private var mergeSuggestions: [CreatorMergeSuggestion] = []
     @State private var searchText = ""
-    @State private var sortMode: AuthorSortMode = .mediaCount
-    @AppStorage("pml.authors.cardLayout") private var cardLayout = "grid"
-    @StateObject private var thumbs = ThumbnailLoader()
+    @State private var sortMode: CreatorSortV2 = .count
+    @State private var loading = false
+    @State private var syncing = false
+    @State private var noticeText = ""
+    @State private var errorText = ""
+    @State private var showMergeSheet = false
 
-    private var isHall: Bool {
-        selectedCategory == nil && !viewAll && searchText.isEmpty
-    }
-
-    private var topCategories: [LibraryCategory] {
-        let ids = Set(categories.map(\.id))
-        return categories
-            .filter { category in
-                guard let parent = category.parentId, !parent.isEmpty else { return true }
-                return !ids.contains(parent)
-            }
-            .sorted { $0.authorCount > $1.authorCount }
-    }
-
-    private var childCategories: [LibraryCategory] {
-        guard let selectedCategory else { return [] }
-        return categories
-            .filter { $0.parentId == selectedCategory.id }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-    }
-
-    private var displayedAuthors: [LibraryAuthor] {
-        let filtered: [LibraryAuthor]
-        if searchText.isEmpty {
-            filtered = authors
-        } else {
-            filtered = authors.filter { author in
-                author.name.localizedCaseInsensitiveContains(searchText)
-                    || author.aliases.contains(where: { $0.localizedCaseInsensitiveContains(searchText) })
-            }
-        }
-        switch sortMode {
-        case .mediaCount:
-            return filtered.sorted { $0.mediaCount > $1.mediaCount }
-        case .name:
-            return filtered.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        }
-    }
+    private let columns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12),
+    ]
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
-                    if loading && categories.isEmpty && authors.isEmpty {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text("加载创作者…").foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.top, 40)
-                    } else if isHall {
-                        hall
-                    } else {
-                        detail
-                    }
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    studioPillBar
 
-                    if !refreshNotice.isEmpty {
-                        Text(refreshNotice)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
+                    if !noticeText.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            Text(noticeText)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .pmlGlassCard(cornerRadius: 12)
                     }
 
                     if !errorText.isEmpty {
@@ -92,816 +65,1186 @@ struct AuthorsView: View {
                             .font(.footnote)
                             .foregroundStyle(.red)
                     }
+
+                    if loading && creators.isEmpty {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("加载创作者…").foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 44)
+                    } else if creators.isEmpty {
+                        ContentUnavailableView(
+                            "暂无创作者",
+                            systemImage: "person.2.slash",
+                            description: Text("请切换工作室筛选或点击右上角同步创作者模块。")
+                        )
+                        .padding(.top, 30)
+                    } else {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(selectedStudio ?? "全部创作者")
+                                .font(.headline)
+                            Spacer()
+                            Text("\(creators.count) 位")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+
+                        LazyVGrid(columns: columns, spacing: 12) {
+                            ForEach(creators) { creator in
+                                NavigationLink {
+                                    AuthorProfileView(creator: creator)
+                                } label: {
+                                    CreatorCardV2View(creator: creator, client: model.apiClient)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
-            .navigationTitle(navigationTitle)
+            .navigationTitle("创作者")
             .navigationBarTitleDisplayMode(.inline)
-            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索创作者/别名")
-            .refreshable { await refreshAndCheckProvider() }
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索创作者姓名或别名")
+            .refreshable { await loadAll(refreshSuggestions: true) }
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 12) {
-                        Button {
-                            Task { await refreshAndCheckProvider() }
-                        } label: {
-                            if checking {
-                                ProgressView()
-                            } else {
-                                Image(systemName: "arrow.clockwise")
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        showMergeSheet = true
+                    } label: {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: "arrow.triangle.merge")
+                            if !mergeSuggestions.isEmpty {
+                                Text("\(mergeSuggestions.count)")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(Color.orange, in: Capsule())
+                                    .offset(x: 7, y: -6)
                             }
                         }
-                        .disabled(checking)
-                        .accessibilityLabel("检查 CD2 更新")
+                    }
+                    .accessibilityLabel("建议合并")
 
-                        if isHall {
-                            NavigationLink("全库索引") {
-                                CreatorCategoryView(category: nil)
+                    Menu {
+                        Picker("排序", selection: $sortMode) {
+                            ForEach(CreatorSortV2.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
                             }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                    }
+
+                    Button {
+                        Task { await syncCreatorsModule() }
+                    } label: {
+                        if syncing {
+                            ProgressView()
                         } else {
-                            Button {
-                                cardLayout = cardLayout == "grid" ? "list" : "grid"
-                            } label: {
-                                Image(systemName: cardLayout == "grid" ? "list.bullet" : "square.grid.2x2")
-                            }
-                            .accessibilityLabel(cardLayout == "grid" ? "切换为单列" : "切换为双列")
-                            Menu {
-                                Picker("排序", selection: $sortMode) {
-                                    ForEach(AuthorSortMode.allCases) { mode in
-                                        Text(mode.rawValue).tag(mode)
-                                    }
-                                }
-                            } label: {
-                                Image(systemName: "arrow.up.arrow.down")
-                            }
-                            Button("分类总览") {
-                                selectedCategory = nil
-                                viewAll = false
-                                searchText = ""
-                                authors = []
-                                Task { await load() }
-                            }
+                            Image(systemName: "arrow.clockwise")
                         }
                     }
+                    .disabled(syncing)
+                    .accessibilityLabel("同步创作者模块")
                 }
             }
-            .task { await load() }
-            .onChange(of: searchText) { _, value in
-                if !value.isEmpty && !viewAll && selectedCategory == nil {
-                    viewAll = true
-                    Task { await load() }
-                }
+            .sheet(isPresented: $showMergeSheet) {
+                CreatorMergeSuggestionsSheet(
+                    suggestions: $mergeSuggestions,
+                    onVerified: {
+                        Task { await loadAll(refreshSuggestions: true) }
+                    }
+                )
+            }
+            .task { await loadAll(refreshSuggestions: true) }
+            .onChange(of: selectedStudio) { _, _ in
+                Task { await loadCreatorsOnly() }
+            }
+            .onChange(of: sortMode) { _, _ in
+                Task { await loadCreatorsOnly() }
+            }
+            .onChange(of: searchText) { _, _ in
+                Task { await loadCreatorsOnly() }
             }
         }
     }
 
-    private var navigationTitle: String {
-        if isHall { return "创作者" }
-        if viewAll { return "全部创作者" }
-        return selectedCategory?.name ?? "创作者"
-    }
-
-    private var hall: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("创作者分类大厅")
-                    .font(.title3.weight(.semibold))
-                Spacer()
-                Text("\(topCategories.count) 个分类 · \(topCategories.reduce(0) { $0 + Int($1.authorCount) }) 位创作者")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if topCategories.isEmpty {
-                Text("还没有分类。扫描资料库并整理后，这里会显示分类大厅。")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 30)
-            } else {
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
-                    ForEach(topCategories) { category in
-                        categoryCard(category)
-                    }
-                }
-            }
-        }
-    }
-
-    private var detail: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(viewAll ? "全部创作者" : (selectedCategory?.name ?? "创作者"))
-                    .font(.title3.weight(.semibold))
-                Spacer()
-                Text("\(displayedAuthors.count) 位")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if !childCategories.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(childCategories) { child in
-                            Button {
-                                selectedCategory = child
-                                Task {
-                                    await loadChildren(of: child)
-                                    await load()
-                                }
-                            } label: {
-                                Text(child.name)
-                                    .font(.caption)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 7)
-                                    .background(Color(.secondarySystemBackground), in: Capsule())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-            }
-
-            if loading && authors.isEmpty {
-                HStack(spacing: 10) {
-                    ProgressView()
-                    Text("加载作者…").foregroundStyle(.secondary)
-                }
-                .padding(.top, 20)
-            } else if displayedAuthors.isEmpty {
-                Text("这个分类下还没有创作者。")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 30)
-            } else if cardLayout == "list" {
-                LazyVStack(spacing: 14) {
-                    ForEach(displayedAuthors) { author in
-                        authorCardLink(author, bannerHeight: 190)
-                    }
-                }
-            } else {
-                LazyVGrid(
-                    columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
-                    spacing: 14
+    private var studioPillBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                V2FilterPill(
+                    title: "全部",
+                    count: studios.isEmpty ? nil : Int64(creators.count),
+                    isSelected: selectedStudio == nil
                 ) {
-                    ForEach(displayedAuthors) { author in
-                        authorCardLink(author, bannerHeight: 108)
+                    selectedStudio = nil
+                }
+
+                ForEach(studios) { studio in
+                    V2FilterPill(
+                        title: studio.studio,
+                        count: studio.creatorCount,
+                        isSelected: selectedStudio == studio.studio
+                    ) {
+                        selectedStudio = studio.studio
                     }
                 }
             }
+            .padding(.vertical, 2)
         }
     }
 
-    private func authorCardLink(_ author: LibraryAuthor, bannerHeight: CGFloat) -> some View {
-        NavigationLink {
-            AuthorProfileView(author: author)
-        } label: {
-            AuthorShowcaseCard(
-                author: author,
-                bannerHeight: bannerHeight,
-                isTopCreator: topCreatorIds.contains(author.id)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var topCreatorIds: Set<String> {
-        let pool = authors.filter { $0.mediaCount > 0 }.sorted { $0.mediaCount > $1.mediaCount }
-        let cutoff = max(1, Int(ceil(Double(pool.count) * 0.1)))
-        return Set(pool.prefix(cutoff).map(\.id))
-    }
-
-    private func categoryCard(_ category: LibraryCategory) -> some View {
-        NavigationLink {
-            CreatorCategoryView(category: category)
-        } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                Image(systemName: "folder.fill")
-                    .font(.title3)
-                    .foregroundStyle(.tint)
-                Text(pmlDisplayName(category.name))
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                Text("\(category.authorCount) 位 · \(category.mediaCount) 项")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, minHeight: 110, alignment: .topLeading)
-            .padding(12)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func authorRow(_ author: LibraryAuthor) -> some View {
-        HStack(spacing: 12) {
-            avatar(author)
-                .frame(width: 46, height: 46)
-                .clipShape(Circle())
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(author.name).lineLimit(1)
-                HStack(spacing: 8) {
-                    Text("\(author.mediaCount) 项")
-                    if author.collectionCount > 0 {
-                        Text("\(author.collectionCount) 个合集")
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Image(systemName: "chevron.right")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.vertical, 9)
-        .contentShape(Rectangle())
-    }
-
-    @ViewBuilder
-    private func avatar(_ author: LibraryAuthor) -> some View {
-        if let id = author.avatarAssetId, let image = thumbs.images[id] {
-            Image(uiImage: image).resizable().scaledToFill()
-        } else if let id = author.coverAssetId, let image = thumbs.images[id] {
-            Image(uiImage: image).resizable().scaledToFill()
-        } else {
-            ZStack {
-                LinearGradient(colors: [.accentColor.opacity(0.85), .accentColor.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                Text(String(author.name.prefix(1)))
-                    .font(.title2.weight(.bold))
-                    .foregroundStyle(.white)
-            }
-        }
-    }
-
-    private func loadChildren(of category: LibraryCategory) async {
-        guard let client = model.apiClient else { return }
-        guard !categories.contains(where: { $0.parentId == category.id }) else { return }
-        if let children = try? await client.libraryCategories(parentId: category.id, filter: "all") {
-            categories.append(contentsOf: children)
-        }
-    }
-
-    /// Pull-to-refresh and the toolbar button use the same real provider check.
-    private func refreshAndCheckProvider() async {
-        guard let client = model.apiClient, !checking else { return }
-        checking = true
-        errorText = ""
-        do {
-            let outcomes = try await client.checkDomainRootsForUpdates()
-            await load()
-            refreshNotice = outcomes.refreshNotice
-        } catch {
-            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
-        }
-        checking = false
-    }
-
-    private func load() async {
+    private func loadAll(refreshSuggestions: Bool) async {
         guard let client = model.apiClient else { return }
         loading = true
         errorText = ""
+        defer { loading = false }
         do {
-            if categories.isEmpty {
-                categories = try await client.libraryCategories(filter: "all")
-            }
-            if isHall {
-                authors = []
-            } else {
-                if let catId = selectedCategory?.id {
-                    let cached = CreatorDataCache.shared.getCached(categoryId: catId)
-                    if let cachedAuths = cached.authors, !cachedAuths.isEmpty {
-                        authors = cachedAuths
-                    }
-                }
-                let fetched = try await client.libraryAuthors(categoryId: selectedCategory?.id, filter: "all")
-                authors = fetched
-                if let catId = selectedCategory?.id {
-                    let cached = CreatorDataCache.shared.getCached(categoryId: catId)
-                    CreatorDataCache.shared.setCached(categoryId: catId, children: cached.children ?? [], authors: fetched)
-                }
-            }
-            if categories.isEmpty && authors.isEmpty {
-                viewAll = true
-                authors = try await client.libraryAuthors(filter: "all")
+            async let studioReq = client.listCreatorStudios()
+            async let creatorReq = client.listCreatorsV2(
+                studio: selectedStudio,
+                query: searchText.trimmingCharacters(in: .whitespacesAndNewlines),
+                sort: sortMode.apiValue
+            )
+            let (loadedStudios, loadedCreators) = try await (studioReq, creatorReq)
+            studios = loadedStudios
+            creators = loadedCreators
+            if refreshSuggestions {
+                mergeSuggestions = (try? await client.listCreatorMergeSuggestions()) ?? []
             }
         } catch {
             errorText = error.localizedDescription
         }
-        loading = false
+    }
+
+    private func loadCreatorsOnly() async {
+        guard let client = model.apiClient else { return }
+        loading = true
+        errorText = ""
+        defer { loading = false }
+        do {
+            creators = try await client.listCreatorsV2(
+                studio: selectedStudio,
+                query: searchText.trimmingCharacters(in: .whitespacesAndNewlines),
+                sort: sortMode.apiValue
+            )
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func syncCreatorsModule() async {
+        guard let client = model.apiClient, !syncing else { return }
+        syncing = true
+        noticeText = ""
+        errorText = ""
+        defer { syncing = false }
+        do {
+            let result = try await client.scanLibraryModule(moduleId: "creators", full: false)
+            noticeText = "创作者同步完成：扫描 \(result.scan.scanned) 项，新增 \(result.scan.added)，共索引 \(result.rebuild.entityCount) 位创作者"
+            await loadAll(refreshSuggestions: true)
+        } catch {
+            errorText = "同步失败：\(error.localizedDescription)"
+        }
     }
 }
+
+// MARK: - 创作者卡片 V2
+
+private struct CreatorCardV2View: View {
+    let creator: CreatorSummaryV2
+    let client: PMLAPIClient?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .bottomLeading) {
+                CachedImageView(
+                    url: client?.v2CoverURL(assetId: creator.bannerAssetId ?? creator.coverAssetId ?? creator.avatarAssetId),
+                    contentMode: .fill,
+                    minHeight: 112,
+                    maxPixel: 480
+                )
+                .frame(height: 112)
+                .frame(maxWidth: .infinity)
+                .clipped()
+
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.68)],
+                    startPoint: .center,
+                    endPoint: .bottom
+                )
+
+                HStack(spacing: 8) {
+                    avatarCircle
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(creator.name)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        if let firstAlias = creator.aliases.first, !firstAlias.isEmpty {
+                            Text(firstAlias)
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.82))
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(8)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Label("\(creator.videoCount)", systemImage: "film")
+                    if creator.imageCount > 0 {
+                        Label("\(creator.imageCount)", systemImage: "photo")
+                    }
+                    Spacer(minLength: 2)
+                    Text(PMLFormatters.bytes(creator.totalBytes))
+                        .monospacedDigit()
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+                if !creator.studios.isEmpty {
+                    Text(creator.studios.prefix(2).joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+        .padding(8)
+        .pmlGlassCard(cornerRadius: 16)
+    }
+
+    private var avatarCircle: some View {
+        Group {
+            if let url = client?.v2CoverURL(assetId: creator.avatarAssetId ?? creator.coverAssetId) {
+                CachedImageView(url: url, contentMode: .fill, minHeight: 34, maxPixel: 160)
+            } else {
+                ZStack {
+                    Color.accentColor.opacity(0.85)
+                    Text(String(creator.name.prefix(1)))
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white)
+                }
+            }
+        }
+        .frame(width: 34, height: 34)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(.white.opacity(0.75), lineWidth: 1.2))
+    }
+}
+
+// MARK: - 创作者详情页 V2（纯文件夹层级浏览 + 单视频直放）
+
 struct AuthorProfileView: View {
-    let author: LibraryAuthor
+    let authorId: String
+    let initialName: String
+    let initialCreator: CreatorSummaryV2?
 
     @EnvironmentObject private var model: AppModel
-    @State private var assets: [LibraryAsset] = []
-    @State private var roots: [LibraryRoot] = []
-    @State private var folderRoot: LibraryRoot?
-    @State private var folderPath = ""
-    @State private var folderEntries: [RemoteBrowserEntry] = []
-    @State private var folderLoading = false
-    @State private var layout: BrowseLayout = .list
-    @State private var sort: BrowseSort = .name
-    @ObservedObject private var covers = ThumbnailService.shared
+    @State private var creator: CreatorSummaryV2?
+    @State private var selectedStudio: String? = nil
+    @State private var page: FolderBrowsePage?
     @State private var loading = false
     @State private var errorText = ""
-    @State private var preview: PreviewItem?
-    @State private var selectedMovieForDetail: RemoteBrowserEntry?
-    @State private var showAliasEditor = false
-    @State private var aliasText = ""
-    @State private var notice = ""
-    @State private var displayAuthor: LibraryAuthor?
-    @State private var avatarItem: PhotosPickerItem?
-    @State private var bannerItem: PhotosPickerItem?
-    @State private var showAvatarPicker = false
-    @State private var showBannerPicker = false
-    @StateObject private var thumbs = ThumbnailLoader()
+    @State private var toastText = ""
+    @State private var playingVideo: V2VideoPlayPayload?
+    @State private var imageViewerContext: ImageViewerContext?
+    @State private var comicTarget: ComicArchiveTarget?
+    @State private var showEditSheet = false
 
-    private let columns = [GridItem(.adaptive(minimum: 100), spacing: 8)]
+    private let columns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12),
+    ]
+
+    init(creator: CreatorSummaryV2) {
+        self.authorId = creator.id
+        self.initialName = creator.name
+        self.initialCreator = creator
+    }
+
+    /// 兼容旧调用方（ShortVideosView 等仍持有 LibraryAuthor）。
+    init(author: LibraryAuthor) {
+        self.authorId = author.id
+        self.initialName = author.name
+        self.initialCreator = nil
+    }
+
+    init(authorId: String, title: String) {
+        self.authorId = authorId
+        self.initialName = title
+        self.initialCreator = nil
+    }
+
+    private var activeCreator: CreatorSummaryV2? {
+        creator ?? initialCreator
+    }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                header
+            LazyVStack(alignment: .leading, spacing: 16) {
+                headerCard
+
+                if let c = activeCreator, c.studios.count > 1 {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            V2FilterPill(
+                                title: "全部工作室",
+                                count: c.mediaCount,
+                                isSelected: selectedStudio == nil
+                            ) {
+                                selectedStudio = nil
+                            }
+                            ForEach(c.studios, id: \.self) { studio in
+                                V2FilterPill(
+                                    title: studio,
+                                    count: c.studioCounts[studio],
+                                    isSelected: selectedStudio == studio
+                                ) {
+                                    selectedStudio = studio
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !toastText.isEmpty {
+                    Text(toastText)
+                        .font(.footnote)
+                        .foregroundStyle(.green)
+                }
 
                 if !errorText.isEmpty {
-                    Text(errorText).font(.footnote).foregroundStyle(.red)
+                    Text(errorText)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
                 }
 
-                if assets.isEmpty && !loading {
-                    Text("暂无作品").foregroundStyle(.secondary)
-                }
-
-                if folderLoading {
-                    HStack(spacing: 8) {
+                if loading && page == nil {
+                    HStack(spacing: 10) {
                         ProgressView()
-                        Text("加载目录…").font(.footnote).foregroundStyle(.secondary)
+                        Text("加载作品目录…").foregroundStyle(.secondary)
                     }
-                    .padding(.vertical, 8)
-                } else if let folderRoot {
-                    folderContent(root: folderRoot)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 30)
+                } else if let page {
+                    if !page.folders.isEmpty {
+                        folderSection(page.folders)
+                    }
+                    if !page.files.isEmpty {
+                        fileSection(page.files)
+                    }
+                    if page.folders.isEmpty && page.files.isEmpty {
+                        ContentUnavailableView(
+                            "暂无内容",
+                            systemImage: "folder",
+                            description: Text("当前筛选下没有文件夹或文件。")
+                        )
+                    }
                 }
             }
-            .padding(16)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
         }
-        .navigationTitle(author.name)
+        .navigationTitle(activeCreator?.name ?? initialName)
         .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await loadFolder() }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button {
-                        showAvatarPicker = true
-                    } label: {
-                        Label("更换头像", systemImage: "person.crop.circle")
-                    }
-                    Button {
-                        showBannerPicker = true
-                    } label: {
-                        Label("更换横幅", systemImage: "rectangle.topthird.inset.filled")
-                    }
-                    Button {
-                        aliasText = info.aliases.joined(separator: "，")
-                        showAliasEditor = true
-                    } label: {
-                        Label("编辑别名", systemImage: "tag")
-                    }
+                Button {
+                    showEditSheet = true
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "pencil")
+                }
+                .disabled(activeCreator == nil)
+                .accessibilityLabel("编辑创作者资料")
+            }
+        }
+        .sheet(isPresented: $showEditSheet) {
+            if let current = activeCreator {
+                EditCreatorProfileSheet(creator: current) { updated in
+                    creator = updated
                 }
             }
         }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Picker("视图", selection: $layout) {
-                        ForEach(BrowseLayout.allCases) { item in
-                            Label(item.title, systemImage: item.symbol).tag(item)
-                        }
-                    }
-                    Divider()
-                    Picker("排序", selection: $sort) {
-                        ForEach(BrowseSort.allCases) { item in
-                            Text(item.title).tag(item)
-                        }
-                    }
-                } label: {
-                    Image(systemName: layout.symbol)
-                }
-            }
-        }
-        .onChange(of: sort) { _, _ in
-            Task { await loadAuthorFolder() }
-        }        .photosPicker(isPresented: $showAvatarPicker, selection: $avatarItem, matching: .images)
-        .photosPicker(isPresented: $showBannerPicker, selection: $bannerItem, matching: .images)
-        .onChange(of: avatarItem) { _, item in
-            guard let item else { return }
-            Task { await upload(item, isAvatar: true) }
-        }
-        .onChange(of: bannerItem) { _, item in
-            guard let item else { return }
-            Task { await upload(item, isAvatar: false) }
-        }
-        .task { await load() }
-        .sheet(isPresented: $showAliasEditor) {
-            aliasEditor
-        }
-        .sheet(item: $selectedMovieForDetail) { item in
-            MovieDetailSheet(
-                assetId: item.assetId,
-                fileName: item.name,
-                remotePath: item.path,
-                onPlay: { targetId in
-                    selectedMovieForDetail = nil
-                    Task {
-                        try? await Task.sleep(nanoseconds: 400_000_000)
-                        guard let source = await model.playbackSource(assetId: targetId, remotePath: item.path) else { return }
-                        preview = PreviewItem(url: source.url, isVideo: true, assetId: targetId, title: item.name, fallbackURL: source.fallbackURL, sourceLabel: source.label, remotePath: item.path)
-                    }
-                }
+        .fullScreenCover(item: $playingVideo) { payload in
+            GestureVideoPlayerSheet(
+                url: payload.url,
+                title: payload.title,
+                assetId: payload.assetId,
+                playlist: payload.playlist,
+                playlistIndex: payload.playlistIndex,
+                remotePath: payload.remotePath
             )
-            .environmentObject(model)
         }
-        .fullScreenCover(item: $preview) { item in
-            if item.isVideo {
-                GestureVideoPlayerSheet(
-                    url: item.url,
-                    title: item.title,
-                    assetId: item.assetId,
-                    startAt: item.startAt,
-                    fallbackURL: item.fallbackURL,
-                    sourceLabel: item.sourceLabel,
-                    remotePath: item.remotePath
+        .fullScreenCover(item: $imageViewerContext) { ctx in
+            ImageViewer(context: ctx)
+        }
+        .fullScreenCover(item: $comicTarget) { target in
+            ComicReaderView(target: target)
+        }
+        .task(id: authorId) { await loadFolder() }
+        .onChange(of: selectedStudio) { _, _ in
+            Task { await loadFolder() }
+        }
+    }
+
+    private var headerCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ZStack(alignment: .bottomLeading) {
+                CachedImageView(
+                    url: model.apiClient?.v2CoverURL(assetId: activeCreator?.bannerAssetId ?? activeCreator?.coverAssetId),
+                    contentMode: .fill,
+                    minHeight: 150,
+                    maxPixel: 960
                 )
-                .id(item.id)
-                .environmentObject(model)
-            } else {
-                ImageViewerSheet(url: item.url)
+                .frame(height: 150)
+                .frame(maxWidth: .infinity)
+                .clipped()
+
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.74)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+
+                HStack(alignment: .bottom, spacing: 12) {
+                    Group {
+                        if let url = model.apiClient?.v2CoverURL(assetId: activeCreator?.avatarAssetId ?? activeCreator?.coverAssetId) {
+                            CachedImageView(url: url, contentMode: .fill, minHeight: 58, maxPixel: 240)
+                        } else {
+                            ZStack {
+                                Color.accentColor
+                                Text(String((activeCreator?.name ?? initialName).prefix(1)))
+                                    .font(.title2.weight(.bold))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                    }
+                    .frame(width: 58, height: 58)
+                    .clipShape(Circle())
+                    .overlay(Circle().strokeBorder(.white.opacity(0.85), lineWidth: 2))
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(activeCreator?.name ?? initialName)
+                            .font(.title3.weight(.bold))
+                            .foregroundStyle(.white)
+                        if let aliases = activeCreator?.aliases, !aliases.isEmpty {
+                            Text("别名：" + aliases.joined(separator: " / "))
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .lineLimit(2)
+                        }
+                        if let c = activeCreator {
+                            Text("\(c.videoCount) 视频 · \(c.imageCount) 图片 · \(PMLFormatters.bytes(c.totalBytes))")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.white.opacity(0.8))
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(12)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            if let bio = activeCreator?.bio, !bio.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(bio)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+            }
+
+            if let links = activeCreator?.socialLinks, !links.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(links.keys.sorted(), id: \.self) { key in
+                            if let raw = links[key], !raw.isEmpty,
+                               let url = URL(string: raw.hasPrefix("http") ? raw : "https://\(raw)") {
+                                Link(destination: url) {
+                                    Label(key, systemImage: "link")
+                                        .font(.caption.weight(.medium))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(Color.accentColor.opacity(0.14), in: Capsule())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .pmlGlassCard(cornerRadius: 20)
+    }
+
+    private func folderSection(_ folders: [FolderCardV2]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("文件夹（\(folders.count)）")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            LazyVGrid(columns: columns, spacing: 12) {
+                ForEach(folders) { folder in
+                    if folder.isSingleVideoWrapper, let singleId = folder.singleVideoAssetId {
+                        Button {
+                            Task { await playSingleVideo(assetId: singleId, title: folder.name) }
+                        } label: {
+                            V2FolderCardView(
+                                title: folder.name,
+                                subtitle: folder.studioName.isEmpty ? nil : folder.studioName,
+                                previewAssetIds: folder.previewAssetIds,
+                                coverAssetId: folder.coverAssetId,
+                                itemCount: folder.itemCount,
+                                videoCount: folder.videoCount,
+                                imageCount: folder.imageCount,
+                                totalBytes: folder.totalBytes,
+                                isSingleVideoWrapper: true,
+                                client: model.apiClient
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        NavigationLink {
+                            CreatorFolderView(
+                                authorId: authorId,
+                                creatorName: activeCreator?.name ?? initialName,
+                                studio: selectedStudio ?? (folder.studioName.isEmpty ? nil : folder.studioName),
+                                subPath: folder.subPath,
+                                folderTitle: folder.name
+                            )
+                        } label: {
+                            V2FolderCardView(
+                                title: folder.name,
+                                subtitle: folder.studioName.isEmpty ? nil : folder.studioName,
+                                previewAssetIds: folder.previewAssetIds,
+                                coverAssetId: folder.coverAssetId,
+                                itemCount: folder.itemCount,
+                                videoCount: folder.videoCount,
+                                imageCount: folder.imageCount,
+                                totalBytes: folder.totalBytes,
+                                isSingleVideoWrapper: false,
+                                client: model.apiClient
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
             }
         }
     }
 
-    private var info: LibraryAuthor {
-        displayAuthor ?? author
+    private func fileSection(_ files: [CreatorAssetV2]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("文件（\(files.count)）")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            LazyVGrid(columns: columns, spacing: 12) {
+                ForEach(files) { asset in
+                    Button {
+                        Task { await openAsset(asset, siblings: files) }
+                    } label: {
+                        V2AssetCardView(asset: asset, client: model.apiClient)
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button {
+                            Task { await setAuthorImage(assetId: asset.id, isBanner: false) }
+                        } label: {
+                            Label("设为创作者头像", systemImage: "person.crop.circle")
+                        }
+                        Button {
+                            Task { await setAuthorImage(assetId: asset.id, isBanner: true) }
+                        } label: {
+                            Label("设为创作者横幅", systemImage: "photo.artframe")
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let bannerId = info.bannerAssetId, let image = thumbs.images[bannerId] {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(height: 140)
-                    .frame(maxWidth: .infinity)
-                    .clipped()
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    private func loadFolder() async {
+        guard let client = model.apiClient else { return }
+        loading = true
+        errorText = ""
+        defer { loading = false }
+        do {
+            let resp = try await client.browseCreatorFolder(
+                authorId: authorId,
+                studio: selectedStudio,
+                subPath: nil,
+                limit: 200
+            )
+            creator = resp.creator
+            page = resp.page
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func playSingleVideo(assetId: String, title: String) async {
+        guard let client = model.apiClient else { return }
+        do {
+            let url = try await client.mediaSourceURL(assetId: assetId)
+            playingVideo = V2VideoPlayPayload(
+                url: url,
+                title: title,
+                assetId: assetId,
+                playlist: [VideoPlaylistItem(id: assetId, title: title, assetId: assetId)],
+                playlistIndex: 0,
+                remotePath: nil
+            )
+        } catch {
+            errorText = "打开视频失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func openAsset(_ asset: CreatorAssetV2, siblings: [CreatorAssetV2]) async {
+        guard let client = model.apiClient else { return }
+        if asset.isVideo {
+            let videos = siblings.filter(\.isVideo)
+            let playlist = videos.map {
+                VideoPlaylistItem(id: $0.id, title: $0.fileName, assetId: $0.id, remotePath: $0.remotePath)
             }
+            let idx = videos.firstIndex(where: { $0.id == asset.id })
+            do {
+                let url = try await client.mediaSourceURL(assetId: asset.id)
+                playingVideo = V2VideoPlayPayload(
+                    url: url,
+                    title: asset.fileName,
+                    assetId: asset.id,
+                    playlist: playlist,
+                    playlistIndex: idx,
+                    remotePath: asset.remotePath
+                )
+            } catch {
+                errorText = "打开视频失败：\(error.localizedDescription)"
+            }
+        } else if asset.isComicArchive {
+            comicTarget = ComicArchiveTarget(id: asset.id, title: asset.fileName)
+        } else if asset.isImage {
+            let images = siblings.filter(\.isImage)
+            let entries = images.map { $0.toRemoteBrowserEntry() }
+            let startIdx = images.firstIndex(where: { $0.id == asset.id }) ?? 0
+            imageViewerContext = ImageViewerContext(entries: entries, startIndex: startIdx)
+        }
+    }
 
-            HStack(spacing: 12) {
-                avatarView(info)
-                    .frame(width: 54, height: 54)
-                    .clipShape(Circle())
+    private func setAuthorImage(assetId: String, isBanner: Bool) async {
+        guard let client = model.apiClient else { return }
+        do {
+            if isBanner {
+                try await client.setAuthorBanner(authorId: authorId, assetId: assetId)
+                toastText = "已设为创作者横幅"
+            } else {
+                try await client.setAuthorAvatar(authorId: authorId, assetId: assetId)
+                toastText = "已设为创作者头像"
+            }
+            await loadFolder()
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+}
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(info.name).font(.title2.weight(.bold))
-                    if !info.aliases.isEmpty {
-                        Text(info.aliases.joined(separator: " / "))
-                            .font(.footnote)
+// MARK: - 创作者子目录递归视图
+
+struct CreatorFolderView: View {
+    let authorId: String
+    let creatorName: String
+    let studio: String?
+    let subPath: String
+    let folderTitle: String
+
+    @EnvironmentObject private var model: AppModel
+    @State private var page: FolderBrowsePage?
+    @State private var loading = false
+    @State private var errorText = ""
+    @State private var playingVideo: V2VideoPlayPayload?
+    @State private var imageViewerContext: ImageViewerContext?
+    @State private var comicTarget: ComicArchiveTarget?
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12),
+    ]
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 16) {
+                if !errorText.isEmpty {
+                    Text(errorText)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+
+                if loading && page == nil {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("加载目录…").foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 40)
+                } else if let page {
+                    if !page.breadcrumbs.isEmpty {
+                        Text(page.breadcrumbs.joined(separator: " / "))
+                            .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    Text("\(info.mediaCount) 项作品 · \(info.collectionCount) 个合集")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+
+                    if !page.folders.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("子文件夹（\(page.folders.count)）")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            LazyVGrid(columns: columns, spacing: 12) {
+                                ForEach(page.folders) { folder in
+                                    if folder.isSingleVideoWrapper, let singleId = folder.singleVideoAssetId {
+                                        Button {
+                                            Task { await playSingleVideo(assetId: singleId, title: folder.name) }
+                                        } label: {
+                                            V2FolderCardView(
+                                                title: folder.name,
+                                                subtitle: nil,
+                                                previewAssetIds: folder.previewAssetIds,
+                                                coverAssetId: folder.coverAssetId,
+                                                itemCount: folder.itemCount,
+                                                videoCount: folder.videoCount,
+                                                imageCount: folder.imageCount,
+                                                totalBytes: folder.totalBytes,
+                                                isSingleVideoWrapper: true,
+                                                client: model.apiClient
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
+                                    } else {
+                                        NavigationLink {
+                                            CreatorFolderView(
+                                                authorId: authorId,
+                                                creatorName: creatorName,
+                                                studio: studio,
+                                                subPath: folder.subPath,
+                                                folderTitle: folder.name
+                                            )
+                                        } label: {
+                                            V2FolderCardView(
+                                                title: folder.name,
+                                                subtitle: nil,
+                                                previewAssetIds: folder.previewAssetIds,
+                                                coverAssetId: folder.coverAssetId,
+                                                itemCount: folder.itemCount,
+                                                videoCount: folder.videoCount,
+                                                imageCount: folder.imageCount,
+                                                totalBytes: folder.totalBytes,
+                                                isSingleVideoWrapper: false,
+                                                client: model.apiClient
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !page.files.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("文件（\(page.files.count)）")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            LazyVGrid(columns: columns, spacing: 12) {
+                                ForEach(page.files) { asset in
+                                    Button {
+                                        Task { await openAsset(asset, siblings: page.files) }
+                                    } label: {
+                                        V2AssetCardView(asset: asset, client: model.apiClient)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
                 }
             }
-
-            if !notice.isEmpty {
-                Text(notice).font(.caption).foregroundStyle(.secondary)
-            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
         }
-        .task {
-            if let bannerId = info.bannerAssetId {
-                await thumbs.image(assetId: bannerId, client: model.apiClient)
-            }
-            if let avatarId = info.avatarAssetId {
-                await thumbs.image(assetId: avatarId, client: model.apiClient)
-            }
+        .navigationTitle(folderTitle)
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await load() }
+        .fullScreenCover(item: $playingVideo) { payload in
+            GestureVideoPlayerSheet(
+                url: payload.url,
+                title: payload.title,
+                assetId: payload.assetId,
+                playlist: payload.playlist,
+                playlistIndex: payload.playlistIndex,
+                remotePath: payload.remotePath
+            )
         }
+        .fullScreenCover(item: $imageViewerContext) { ctx in
+            ImageViewer(context: ctx)
+        }
+        .fullScreenCover(item: $comicTarget) { target in
+            ComicReaderView(target: target)
+        }
+        .task { await load() }
     }
-
-    private var aliasEditor: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    TextField("别名，用逗号分隔", text: $aliasText, axis: .vertical)
-                        .lineLimit(2...4)
-                } footer: {
-                    Text("别名会参与待收纳整理时的作者匹配。")
-                }
-                Section {
-                    Button("保存别名") { Task { await saveAliases() } }
-                }
-            }
-            .navigationTitle("编辑别名")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("取消") { showAliasEditor = false }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func avatarView(_ author: LibraryAuthor) -> some View {
-        if let id = author.avatarAssetId, let image = thumbs.images[id] {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-        } else {
-            ZStack {
-                Circle().fill(.quaternary.opacity(0.35))
-                Image(systemName: "person.fill").foregroundStyle(.tint)
-            }
-        }
-    }
-
-    private func saveAliases() async {
-        guard let client = model.apiClient else { return }
-        let aliases = aliasText
-            .split(whereSeparator: { "，,;；/".contains($0) })
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        do {
-            try await client.updateAuthorAliases(authorId: info.id, aliases: aliases)
-            notice = "别名已保存（\(aliases.count) 个）"
-            showAliasEditor = false
-            await refreshAuthor()
-        } catch {
-            notice = error.localizedDescription
-        }
-    }
-
-    private func upload(_ item: PhotosPickerItem, isAvatar: Bool) async {
-        guard let client = model.apiClient else { return }
-        guard let data = try? await item.loadTransferable(type: Data.self),
-              let base64 = pmlJPEGBase64(data, maxDimension: isAvatar ? 800 : 1600) else {
-            notice = "读取图片失败"
-            return
-        }
-        do {
-            if isAvatar {
-                try await client.uploadAuthorAvatar(authorId: info.id, dataBase64: base64)
-            } else {
-                try await client.uploadAuthorBanner(authorId: info.id, dataBase64: base64)
-            }
-            notice = isAvatar ? "头像已更新" : "横幅已更新"
-            await refreshAuthor()
-        } catch {
-            notice = error.localizedDescription
-        }
-    }
-
-    private func refreshAuthor() async {
-        guard let client = model.apiClient else { return }
-        if let authors = try? await client.libraryAuthors(filter: "all"),
-           let latest = authors.first(where: { $0.id == info.id }) {
-            displayAuthor = latest
-            if let avatarId = latest.avatarAssetId {
-                await thumbs.image(assetId: avatarId, client: client)
-            }
-            if let bannerId = latest.bannerAssetId {
-                await thumbs.image(assetId: bannerId, client: client)
-            }
-        }
-    }
-
-    private func cell(_ asset: LibraryAsset) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(.quaternary.opacity(0.35))
-                if let image = thumbs.images[asset.thumbnailAssetId ?? asset.id] {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                } else {
-                    Image(systemName: asset.mediaType == "video" ? "play.rectangle.fill" : "photo.fill")
-                        .foregroundStyle(.tint)
-                }
-            }
-            .aspectRatio(1, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            Text(asset.fileName)
-                .font(.caption2)
-                .lineLimit(1)
-        }
-    }
-
 
     private func load() async {
         guard let client = model.apiClient else { return }
         loading = true
         errorText = ""
+        defer { loading = false }
         do {
-            async let assetsTask = client.libraryAssets(filter: "all", authorId: author.id, limit: 1000)
-            async let rootsTask = client.libraryRoots()
-            assets = try await assetsTask
-            roots = (try? await rootsTask) ?? []
-            if let resolved = pmlResolveAuthorFolder(assets: assets, roots: roots, authorName: info.name) {
-                folderRoot = resolved.root
-                folderPath = resolved.path
-                await loadAuthorFolder()
+            let resp = try await client.browseCreatorFolder(
+                authorId: authorId,
+                studio: studio,
+                subPath: subPath,
+                limit: 300
+            )
+            page = resp.page
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func playSingleVideo(assetId: String, title: String) async {
+        guard let client = model.apiClient else { return }
+        do {
+            let url = try await client.mediaSourceURL(assetId: assetId)
+            playingVideo = V2VideoPlayPayload(
+                url: url,
+                title: title,
+                assetId: assetId,
+                playlist: [VideoPlaylistItem(id: assetId, title: title, assetId: assetId)],
+                playlistIndex: 0,
+                remotePath: nil
+            )
+        } catch {
+            errorText = "打开视频失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func openAsset(_ asset: CreatorAssetV2, siblings: [CreatorAssetV2]) async {
+        guard let client = model.apiClient else { return }
+        if asset.isVideo {
+            let videos = siblings.filter(\.isVideo)
+            let playlist = videos.map {
+                VideoPlaylistItem(id: $0.id, title: $0.fileName, assetId: $0.id, remotePath: $0.remotePath)
             }
-            if let authors = try? await client.libraryAuthors(filter: "all"),
-               let latest = authors.first(where: { $0.id == author.id }) {
-                displayAuthor = latest
+            let idx = videos.firstIndex(where: { $0.id == asset.id })
+            do {
+                let url = try await client.mediaSourceURL(assetId: asset.id)
+                playingVideo = V2VideoPlayPayload(
+                    url: url,
+                    title: asset.fileName,
+                    assetId: asset.id,
+                    playlist: playlist,
+                    playlistIndex: idx,
+                    remotePath: asset.remotePath
+                )
+            } catch {
+                errorText = "打开视频失败：\(error.localizedDescription)"
+            }
+        } else if asset.isComicArchive {
+            comicTarget = ComicArchiveTarget(id: asset.id, title: asset.fileName)
+        } else if asset.isImage {
+            let images = siblings.filter(\.isImage)
+            let entries = images.map { $0.toRemoteBrowserEntry() }
+            let startIdx = images.firstIndex(where: { $0.id == asset.id }) ?? 0
+            imageViewerContext = ImageViewerContext(entries: entries, startIndex: startIdx)
+        }
+    }
+}
+
+// MARK: - 编辑创作者资料 Sheet
+
+private struct EditCreatorProfileSheet: View {
+    let creator: CreatorSummaryV2
+    let onSaved: (CreatorSummaryV2) -> Void
+
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var aliasesText: String
+    @State private var bioText: String
+    @State private var twitter: String
+    @State private var onlyfans: String
+    @State private var website: String
+    @State private var saving = false
+    @State private var errorText = ""
+
+    init(creator: CreatorSummaryV2, onSaved: @escaping (CreatorSummaryV2) -> Void) {
+        self.creator = creator
+        self.onSaved = onSaved
+        _aliasesText = State(initialValue: creator.aliases.joined(separator: ", "))
+        _bioText = State(initialValue: creator.bio ?? "")
+        _twitter = State(initialValue: creator.socialLinks["twitter"] ?? creator.socialLinks["X"] ?? "")
+        _onlyfans = State(initialValue: creator.socialLinks["onlyfans"] ?? "")
+        _website = State(initialValue: creator.socialLinks["website"] ?? "")
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("基本信息") {
+                    TextField("别名（逗号分隔）", text: $aliasesText)
+                    TextField("个人简介", text: $bioText, axis: .vertical)
+                        .lineLimit(3...6)
+                }
+                Section("社交链接") {
+                    TextField("Twitter / X 链接", text: $twitter)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                    TextField("OnlyFans 链接", text: $onlyfans)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                    TextField("主页 / 其他链接", text: $website)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                }
+                if !errorText.isEmpty {
+                    Section {
+                        Text(errorText).foregroundStyle(.red).font(.footnote)
+                    }
+                }
+            }
+            .navigationTitle("编辑资料")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saving ? "保存中…" : "保存") {
+                        Task { await save() }
+                    }
+                    .disabled(saving)
+                }
+            }
+        }
+    }
+
+    private func save() async {
+        guard let client = model.apiClient else { return }
+        saving = true
+        errorText = ""
+        defer { saving = false }
+        let aliases = aliasesText
+            .split(whereSeparator: { $0 == "," || $0 == "，" || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var links = creator.socialLinks
+        let pairs: [(String, String)] = [("twitter", twitter), ("onlyfans", onlyfans), ("website", website)]
+        for (key, value) in pairs {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                links.removeValue(forKey: key)
+            } else {
+                links[key] = trimmed
+            }
+        }
+        do {
+            let updated = try await client.updateCreatorProfile(
+                authorId: creator.id,
+                aliases: aliases,
+                bio: bioText.trimmingCharacters(in: .whitespacesAndNewlines),
+                socialLinks: links
+            )
+            onSaved(updated)
+            dismiss()
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+}
+
+// MARK: - 创作者建议合并 Sheet（手动去 115 合并 + 已合并复查 + 忽略）
+
+private struct CreatorMergeSuggestionsSheet: View {
+    @Binding var suggestions: [CreatorMergeSuggestion]
+    let onVerified: () -> Void
+
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var busyPairId: String?
+    @State private var keepAlias = true
+    @State private var statusMessage = ""
+    @State private var errorText = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Toggle("不同名合并时保留旧名为别名", isOn: $keepAlias)
+                    Text("在 115 网盘手动将重复创作者的文件夹合并后，点击「已合并，复查」即可自动重扫并保留别名。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if !statusMessage.isEmpty {
+                    Section {
+                        Text(statusMessage)
+                            .font(.footnote)
+                            .foregroundStyle(.green)
+                    }
+                }
+
+                if !errorText.isEmpty {
+                    Section {
+                        Text(errorText)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                if suggestions.isEmpty {
+                    ContentUnavailableView(
+                        "没有疑似重复创作者",
+                        systemImage: "checkmark.seal.fill",
+                        description: Text("所有创作者名称都很干净。")
+                    )
+                } else {
+                    ForEach(suggestions) { item in
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text(item.reason)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.orange)
+                                Spacer()
+                                Text("相似度 \(item.score)")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            candidateRow(item.authorA, tag: "A")
+                            candidateRow(item.authorB, tag: "B")
+
+                            HStack(spacing: 8) {
+                                Button {
+                                    Task { await verify(keep: item.authorA, merged: item.authorB, pairId: item.id) }
+                                } label: {
+                                    Text("保留 A 复查")
+                                        .font(.caption.weight(.semibold))
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(busyPairId != nil)
+
+                                Button {
+                                    Task { await verify(keep: item.authorB, merged: item.authorA, pairId: item.id) }
+                                } label: {
+                                    Text("保留 B 复查")
+                                        .font(.caption.weight(.semibold))
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(busyPairId != nil)
+
+                                Spacer()
+
+                                Button("忽略", role: .destructive) {
+                                    Task { await ignore(item) }
+                                }
+                                .font(.caption)
+                                .disabled(busyPairId != nil)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
+                }
+            }
+            .navigationTitle("建议合并（\(suggestions.count)）")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func candidateRow(_ author: MergeCandidateAuthor, tag: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(tag)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(tag == "A" ? Color.accentColor : Color.purple, in: Capsule())
+                Text(author.name)
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("\(author.mediaCount) 项 · \(PMLFormatters.bytes(author.totalBytes))")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if let path = author.paths.first {
+                Button {
+                    UIPasteboard.general.string = path
+                    statusMessage = "已复制路径：\(path)"
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.on.doc")
+                            .font(.caption2)
+                        Text(path)
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func verify(keep: MergeCandidateAuthor, merged: MergeCandidateAuthor, pairId: String) async {
+        guard let client = model.apiClient else { return }
+        busyPairId = pairId
+        errorText = ""
+        statusMessage = ""
+        defer { busyPairId = nil }
+        do {
+            let result = try await client.verifyCreatorMerge(
+                keepAuthorId: keep.id,
+                mergedAuthorId: merged.id,
+                keepAlias: keepAlias
+            )
+            if result.fullyMerged {
+                statusMessage = "已确认合并到「\(result.keepAuthorName)」，共 \(result.keepTotalAssets) 项。"
+                suggestions.removeAll { $0.id == pairId }
+                onVerified()
+            } else {
+                statusMessage = "「\(result.mergedAuthorName)」下仍有 \(result.remainingOldAssets) 项未移完，请先在 115 移完再同步复查。"
             }
         } catch {
             errorText = error.localizedDescription
         }
-        loading = false
     }
 
-    private func loadAuthorFolder() async {
-        guard let client = model.apiClient, let folderRoot, !folderPath.isEmpty else { return }
-        folderLoading = true
+    private func ignore(_ item: CreatorMergeSuggestion) async {
+        guard let client = model.apiClient else { return }
+        busyPairId = item.id
+        errorText = ""
+        defer { busyPairId = nil }
         do {
-            let page = try await client.remoteChildren(rootId: folderRoot.id, path: folderPath, sort: sort.rawValue)
-            folderEntries = page.items
+            try await client.ignoreCreatorMergePair(authorIdA: item.authorA.id, authorIdB: item.authorB.id)
+            suggestions.removeAll { $0.id == item.id }
         } catch {
-            if !pmlIsCancellation(error) {
-                errorText = error.localizedDescription
-            }
+            errorText = error.localizedDescription
         }
-        folderLoading = false
-    }
-
-    private func open(_ entry: RemoteBrowserEntry) async {
-        guard let source = await model.playbackSource(assetId: entry.assetId, remotePath: entry.path) else {
-            if let err = model.playbackError, !err.isEmpty {
-                errorText = err
-            }
-            return
-        }
-        preview = PreviewItem(
-            url: source.url,
-            isVideo: entry.isVideo,
-            assetId: entry.assetId ?? entry.path,
-            title: entry.name,
-            fallbackURL: source.fallbackURL,
-            sourceLabel: source.label,
-            remotePath: entry.path
-        )
-    }
-
-    private var authorColumns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 6), count: layout == .grid ? 3 : 2)
-    }
-
-    @ViewBuilder
-    private func folderContent(root: LibraryRoot) -> some View {
-        if folderEntries.isEmpty {
-            Text("无文件").foregroundStyle(.secondary)
-        } else if layout == .list {
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(folderEntries) { entry in
-                    if entry.isDirectory {
-                        NavigationLink {
-                            DirectoryView(root: root, path: entry.path)
-                        } label: {
-                            authorEntryRow(entry)
-                        }
-                        .id("dir-\(entry.path)")
-                        .buttonStyle(.plain)
-                    } else {
-                        Button {
-                            Task { await open(entry) }
-                        } label: {
-                            authorEntryRow(entry)
-                        }
-                        .id("file-\(entry.path)")
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        } else {
-            LazyVGrid(columns: authorColumns, spacing: 6) {
-                ForEach(folderEntries) { entry in
-                    if entry.isDirectory {
-                        NavigationLink {
-                            DirectoryView(root: root, path: entry.path)
-                        } label: {
-                            authorEntryCell(entry)
-                        }
-                        .id("dir-\(entry.path)")
-                        .buttonStyle(.plain)
-                    } else {
-                        Button {
-                            Task { await open(entry) }
-                        } label: {
-                            authorEntryCell(entry)
-                        }
-                        .id("file-\(entry.path)")
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-    }
-
-    private func authorEntryCell(_ entry: RemoteBrowserEntry) -> some View {
-        let thumbId = entry.assetId ?? entry.coverAssetId
-        return VStack(alignment: .leading, spacing: 4) {
-            Color.clear
-                .aspectRatio(layout == .wall ? 1 : 0.8, contentMode: .fit)
-                .overlay {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(.quaternary.opacity(0.3))
-                        AssetThumbnailView(assetId: thumbId, contentMode: .fill) {
-                            Image(systemName: entry.isDirectory ? "folder.fill" : (entry.isVideo ? "play.rectangle.fill" : "photo.fill"))
-                                .font(.title3)
-                                .foregroundStyle(entry.isDirectory ? Color.accentColor : Color.secondary)
-                        }
-                    }
-                    .allowsHitTesting(false)
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .clipped()
-            Text(pmlDisplayName(entry.name))
-                .font(.caption2)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .clipped()
-        .contentShape(Rectangle())
-        .contextMenu {
-            if !entry.isDirectory {
-                Button {
-                    Task { await open(entry) }
-                } label: {
-                    Label("立即播放", systemImage: "play.fill")
-                }
-                if entry.isVideo {
-                    Button {
-                        selectedMovieForDetail = entry
-                    } label: {
-                        Label("查看影视百科详情", systemImage: "info.circle")
-                    }
-                }
-            }
-        }
-    }
-
-    private func authorEntryRow(_ entry: RemoteBrowserEntry) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: entry.isDirectory ? "folder.fill" : (entry.isVideo ? "play.rectangle.fill" : "photo.fill"))
-                .foregroundStyle(entry.isDirectory ? Color.accentColor : Color.secondary)
-            Text(pmlDisplayName(entry.name)).lineLimit(1)
-            Spacer()
-            if entry.isDirectory {
-                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
-            }
-        }
-        .padding(.vertical, 8)
-        .contentShape(Rectangle())
-        .contextMenu {
-            if !entry.isDirectory {
-                Button {
-                    Task { await open(entry) }
-                } label: {
-                    Label("立即播放", systemImage: "play.fill")
-                }
-                if entry.isVideo {
-                    Button {
-                        selectedMovieForDetail = entry
-                    } label: {
-                        Label("查看影视百科详情", systemImage: "info.circle")
-                    }
-                }
-            }
-        }
-    }
-    private func open(_ asset: LibraryAsset) async {
-        guard let source = await model.playbackSource(assetId: asset.id, remotePath: asset.remotePath) else {
-            if let err = model.playbackError, !err.isEmpty {
-                errorText = err
-            }
-            return
-        }
-        preview = PreviewItem(
-            url: source.url,
-            isVideo: asset.mediaType == "video",
-            assetId: asset.id,
-            title: asset.fileName,
-            fallbackURL: source.fallbackURL,
-            sourceLabel: source.label,
-            remotePath: asset.remotePath
-        )
     }
 }

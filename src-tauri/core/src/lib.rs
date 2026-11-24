@@ -1,4 +1,5 @@
 pub mod four_domains;
+pub mod library_modules;
 pub mod media_library;
 pub mod telegram_public;
 pub mod v2_catalog;
