@@ -52,6 +52,7 @@ targets:
         CURRENT_PROJECT_VERSION: "2026112201"
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_OBJC_BRIDGING_HEADER: PMLNative/PMLNative-Bridging-Header.h
         OTHER_LDFLAGS:
           - "-ObjC"
           - "-lz"
