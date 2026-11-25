@@ -51,189 +51,218 @@ struct MoviePerformerDetailSheet: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    if loading && detail == nil {
-                        ProgressView("加载演员档案…")
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 40)
-                    }
-                    if let errorMessage {
-                        Label(errorMessage, systemImage: "exclamationmark.triangle")
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
-                    if let person = detail?.person ?? Optional(performer) {
-                        profileHeader(person)
-
-                        HStack(spacing: 8) {
-                            Button {
-                                Task { await enrich(force: !(person.avatarUrl ?? "").isEmpty) }
-                            } label: {
-                                Label(
-                                    enriching ? "获取中…" : ((person.avatarUrl ?? "").isEmpty ? "自动获取资料" : "刷新网络资料"),
-                                    systemImage: "sparkles"
-                                )
-                                .font(.caption.weight(.semibold))
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.purple)
-                            .disabled(enriching)
-
-                            if let onFilterMovies {
-                                Button {
-                                    dismiss()
-                                    onFilterMovies(person.name)
-                                } label: {
-                                    Label("筛选影片", systemImage: "line.3.horizontal.decrease.circle")
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .buttonStyle(.bordered)
-                            }
-
-                            Spacer()
-
-                            Button {
-                                showEditor = true
-                            } label: {
-                                Image(systemName: "pencil")
-                                    .font(.caption.weight(.semibold))
-                            }
-                            .buttonStyle(.bordered)
-                        }
-
-                        let facts = buildFacts(person)
-                        if !facts.isEmpty {
-                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                                ForEach(facts, id: \.label) { fact in
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(fact.label)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                        Text(fact.value)
-                                            .font(.caption.weight(.semibold))
-                                            .lineLimit(2)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(10)
-                                    .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
-                                }
-                            }
-                        }
-
-                        if let bio = person.bio, !bio.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            Text(bio)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
-                        }
-
-                        // 库内作品 / 近期新作 分段切换（默认库内作品，切换后才懒加载近期新作）
-                        Picker("作品分区", selection: $detailTab) {
-                            Text("库内作品 (\(detail?.total ?? person.movieCount))").tag(PerformerWorkTab.library)
-                            Text(recentResult.map { "近期新作 (\($0.unownedCount))" } ?? "近期新作").tag(PerformerWorkTab.recent)
-                        }
-                        .pickerStyle(.segmented)
-                        .onChange(of: detailTab) { _, next in
-                            if next == .recent && recentResult == nil && !recentLoading {
-                                Task { await loadRecentReleases(forceRefresh: false) }
-                            }
-                        }
-
-                        if detailTab == .library {
-                            if let movies = detail?.movies, !movies.isEmpty {
-                                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                                    ForEach(movies) { movie in
-                                        movieCard(movie)
-                                    }
-                                }
-                            } else if !loading {
-                                Text("暂无关联作品").font(.footnote).foregroundStyle(.secondary)
-                            }
-                        } else {
-                            recentReleasesSection
-                        }
-                    }
+            mainScrollView
+                .navigationTitle(detail?.person.name ?? performer.name)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { toolbarContent }
+                .task {
+                    await favs.ensureLoaded(client: model.apiClient)
+                    await load()
                 }
-                .padding(16)
-            }
-            .navigationTitle(detail?.person.name ?? performer.name)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if let onBack {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button {
-                            onBack()
-                        } label: {
-                            HStack(spacing: 3) {
-                                Image(systemName: "chevron.left")
-                                Text("演员列表")
-                            }
-                            .font(.body.weight(.medium))
-                        }
-                    }
+                .sheet(isPresented: $showEditor) {
+                    MoviePerformerEditor(person: detail?.person ?? performer) { await save($0) }
+                        .environmentObject(model)
                 }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    let targetId = detail?.person.id ?? performer.id
-                    let isFav = favs.isPerformerFav(targetId)
-                    Button {
-                        Task { await favs.toggle(client: model.apiClient, type: .performer, id: targetId) }
-                    } label: {
-                        Image(systemName: isFav ? "heart.fill" : "heart")
-                            .foregroundStyle(isFav ? .pink : .secondary)
-                    }
-                    if onBack == nil {
-                        Button("完成") { dismiss() }
-                    }
+                .sheet(item: $selectedReleaseForMagnets) { rel in
+                    MovieMagnetsSheet(release: rel)
+                        .environmentObject(model)
                 }
-            }
-            .task {
-                await favs.ensureLoaded(client: model.apiClient)
-                await load()
-            }
-            .sheet(isPresented: $showEditor) {
-                MoviePerformerEditor(person: detail?.person ?? performer) { await save($0) }
+                .sheet(item: $selectedMovie, onDismiss: handleMovieDismiss) { movie in
+                    MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
+                        pendingPlayback = PendingPlayback(assetId: targetId, title: movie.title)
+                        selectedMovie = nil
+                    }
                     .environmentObject(model)
+                }
+                .fullScreenCover(item: $fullScreenModal) { modal in
+                    fullScreenDestination(modal)
+                }
+        }
+    }
+
+    private var mainScrollView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if loading && detail == nil {
+                    ProgressView("加载演员档案…")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
+                }
+                if let errorMessage {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+                if let person = detail?.person ?? Optional(performer) {
+                    personDetailSection(person)
+                }
             }
-            .sheet(item: $selectedReleaseForMagnets) { rel in
-                MovieMagnetsSheet(release: rel)
-                    .environmentObject(model)
+            .padding(16)
+        }
+    }
+
+    @ViewBuilder
+    private func personDetailSection(_ person: MoviePerformer) -> some View {
+        profileHeader(person)
+        actionsBar(person)
+        factsGrid(person)
+        if let bio = person.bio, !bio.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text(bio)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
+        }
+        worksSection(person)
+    }
+
+    @ViewBuilder
+    private func actionsBar(_ person: MoviePerformer) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                Task { await enrich(force: !(person.avatarUrl ?? "").isEmpty) }
+            } label: {
+                Label(
+                    enriching ? "获取中…" : ((person.avatarUrl ?? "").isEmpty ? "自动获取资料" : "刷新网络资料"),
+                    systemImage: "sparkles"
+                )
+                .font(.caption.weight(.semibold))
             }
-            .sheet(item: $selectedMovie, onDismiss: {
-                if let pending = pendingPlayback {
-                    pendingPlayback = nil
-                    Task {
-                        try? await Task.sleep(nanoseconds: 120_000_000)
-                        await playAsset(pending.assetId, title: pending.title)
+            .buttonStyle(.borderedProminent)
+            .tint(.purple)
+            .disabled(enriching)
+
+            if let onFilterMovies {
+                Button {
+                    dismiss()
+                    onFilterMovies(person.name)
+                } label: {
+                    Label("筛选影片", systemImage: "line.3.horizontal.decrease.circle")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Spacer()
+
+            Button {
+                showEditor = true
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    @ViewBuilder
+    private func factsGrid(_ person: MoviePerformer) -> some View {
+        let facts = buildFacts(person)
+        if !facts.isEmpty {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                ForEach(facts, id: \.label) { fact in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(fact.label)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(fact.value)
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(2)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func worksSection(_ person: MoviePerformer) -> some View {
+        Picker("作品分区", selection: $detailTab) {
+            Text("库内作品 (\(detail?.total ?? person.movieCount))").tag(PerformerWorkTab.library)
+            Text(recentResult.map { "近期新作 (\($0.unownedCount))" } ?? "近期新作").tag(PerformerWorkTab.recent)
+        }
+        .pickerStyle(.segmented)
+        .onChange(of: detailTab) { _, next in
+            if next == .recent && recentResult == nil && !recentLoading {
+                Task { await loadRecentReleases(forceRefresh: false) }
+            }
+        }
+
+        if detailTab == .library {
+            if let movies = detail?.movies, !movies.isEmpty {
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                    ForEach(movies) { movie in
+                        movieCard(movie)
                     }
                 }
-            }) { movie in
-                MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
-                    pendingPlayback = PendingPlayback(assetId: targetId, title: movie.title)
-                    selectedMovie = nil
-                }
-                .environmentObject(model)
+            } else if !loading {
+                Text("暂无关联作品").font(.footnote).foregroundStyle(.secondary)
             }
-            .fullScreenCover(item: $fullScreenModal) { modal in
-                switch modal {
-                case .player(let item):
-                    GestureVideoPlayerSheet(
-                        url: item.url,
-                        title: item.title,
-                        assetId: item.assetId,
-                        startAt: item.startAt,
-                        fallbackURL: item.fallbackURL,
-                        sourceLabel: item.sourceLabel,
-                        remotePath: item.remotePath
-                    )
-                    .id(item.id)
-                    .environmentObject(model)
-                case .avatar(let person, let avatarUrl):
-                    PerformerAvatarViewer(person: person, avatarUrl: avatarUrl)
+        } else {
+            recentReleasesSection
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        if let onBack {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    onBack()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "chevron.left")
+                        Text("演员列表")
+                    }
+                    .font(.body.weight(.medium))
                 }
             }
+        }
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            let targetId = detail?.person.id ?? performer.id
+            let isFav = favs.isPerformerFav(targetId)
+            Button {
+                Task { await favs.toggle(client: model.apiClient, type: .performer, id: targetId) }
+            } label: {
+                Image(systemName: isFav ? "heart.fill" : "heart")
+                    .foregroundStyle(isFav ? .pink : .secondary)
+            }
+            if onBack == nil {
+                Button("完成") { dismiss() }
+            }
+        }
+    }
+
+    private func handleMovieDismiss() {
+        if let pending = pendingPlayback {
+            pendingPlayback = nil
+            Task {
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                await playAsset(pending.assetId, title: pending.title)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func fullScreenDestination(_ modal: FullScreenModal) -> some View {
+        switch modal {
+        case .player(let item):
+            GestureVideoPlayerSheet(
+                url: item.url,
+                title: item.title,
+                assetId: item.assetId,
+                startAt: item.startAt,
+                fallbackURL: item.fallbackURL,
+                sourceLabel: item.sourceLabel,
+                remotePath: item.remotePath
+            )
+            .id(item.id)
+            .environmentObject(model)
+        case .avatar(let person, let avatarUrl):
+            PerformerAvatarViewer(person: person, avatarUrl: avatarUrl)
         }
     }
 

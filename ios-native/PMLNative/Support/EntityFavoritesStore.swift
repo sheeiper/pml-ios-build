@@ -42,6 +42,10 @@ final class EntityFavoritesStore: ObservableObject {
         }
     }
 
+    func isMovieFav(_ id: String) -> Bool { isFavorited(.movie, id: id) }
+    func isPerformerFav(_ id: String) -> Bool { isFavorited(.performer, id: id) }
+    func isCreatorFav(_ id: String) -> Bool { isFavorited(.creator, id: id) }
+
     func toggle(_ type: EntityFavoriteType, id: String, client: PMLAPIClient?) async {
         guard let client, !id.isEmpty else { return }
         let wasFav = isFavorited(type, id: id)
@@ -52,6 +56,10 @@ final class EntityFavoritesStore: ObservableObject {
         } catch {
             apply(type, id: id, favorited: wasFav)
         }
+    }
+
+    func toggle(client: PMLAPIClient?, type: EntityFavoriteType, id: String) async {
+        await toggle(type, id: id, client: client)
     }
 
     private func apply(_ type: EntityFavoriteType, id: String, favorited: Bool) {
