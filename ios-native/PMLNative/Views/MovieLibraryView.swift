@@ -1326,7 +1326,10 @@ public struct MovieLibraryView: View {
     }
 
     private func playAsset(_ assetId: String, title: String) async {
-        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else { return }
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else {
+            errorMessage = model.playbackError ?? "无法解析视频直链"
+            return
+        }
         preview = PreviewItem(url: source.url, isVideo: true, assetId: assetId, title: title, fallbackURL: source.fallbackURL, sourceLabel: source.label, remotePath: nil)
     }
 

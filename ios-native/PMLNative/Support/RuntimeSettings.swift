@@ -21,6 +21,7 @@ struct RuntimeSettings: Codable, Equatable {
     var serverUser: String = "admin"
     var serverPassword: String = ""
     var alistURL: String = "http://103.119.1.41:45112"
+    var lanAlistURL: String? = ""
     var cd2Prefix: String = "/115open"
     var alistPrefix: String = "/115"
     var alistUser: String = ""
@@ -61,6 +62,15 @@ struct RuntimeSettings: Codable, Equatable {
         var text = alistURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while text.hasSuffix("/") { text.removeLast() }
         guard let url = URL(string: text), url.scheme == "http" || url.scheme == "https" else {
+            return nil
+        }
+        return url
+    }
+
+    var normalizedLanAlistURL: URL? {
+        var text = (lanAlistURL ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        while text.hasSuffix("/") { text.removeLast() }
+        guard !text.isEmpty, let url = URL(string: text), url.scheme == "http" || url.scheme == "https" else {
             return nil
         }
         return url

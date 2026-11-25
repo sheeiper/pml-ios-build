@@ -55,6 +55,7 @@ public struct RelatedMoviesGrouped: Codable {
     public let byActors: [MovieMetadata]
     public let makerName: String?
     public let byMaker: [MovieMetadata]
+    public let actorBirthDates: [String: String]?
 }
 
 public struct MoviePerformer: Codable, Identifiable, Hashable {

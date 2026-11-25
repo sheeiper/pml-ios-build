@@ -81,12 +81,33 @@ struct FavoritesView: View {
             Task { await loadCurrentTab() }
         }
         .sheet(item: $selectedMovie) { movie in
-            MovieDetailSheet(number: movie.number)
-                .environmentObject(model)
+            MovieDetailSheet(
+                number: movie.number,
+                assetId: movie.assetId,
+                fileName: movie.title,
+                remotePath: nil,
+                onPlay: { targetId in
+                    selectedMovie = nil
+                    Task {
+                        try? await Task.sleep(nanoseconds: 420_000_000)
+                        await playAsset(assetId: targetId, title: movie.title)
+                    }
+                }
+            )
+            .environmentObject(model)
         }
         .sheet(item: $selectedPerformer) { person in
-            MoviePerformerDetailSheet(performer: person)
-                .environmentObject(model)
+            MoviePerformerDetailSheet(
+                performer: person,
+                onPlay: { assetId, title in
+                    selectedPerformer = nil
+                    Task {
+                        try? await Task.sleep(nanoseconds: 420_000_000)
+                        await playAsset(assetId: assetId, title: title)
+                    }
+                }
+            )
+            .environmentObject(model)
         }
         .fullScreenCover(item: $preview) { item in
             GestureVideoPlayerSheet(
@@ -375,6 +396,22 @@ struct FavoritesView: View {
         }
         let start = images.firstIndex(where: { $0.id == asset.id }) ?? 0
         imageContext = ImageViewerContext(entries: entries, startIndex: start)
+    }
+
+    private func playAsset(assetId: String, title: String) async {
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else {
+            errorText = model.playbackError ?? "无法解析视频直链"
+            return
+        }
+        preview = PreviewItem(
+            url: source.url,
+            isVideo: true,
+            assetId: assetId,
+            title: title,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: nil
+        )
     }
 
     private func unfavoriteAsset(_ asset: LibraryAsset) async {

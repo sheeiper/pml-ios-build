@@ -2551,6 +2551,8 @@ pub struct RelatedMoviesGrouped {
     pub by_actors: Vec<MovieMetadata>,
     pub maker_name: Option<String>,
     pub by_maker: Vec<MovieMetadata>,
+    #[serde(default)]
+    pub actor_birth_dates: std::collections::HashMap<String, String>,
 }
 
 /// Partitioned related recommendations: separates same-actor works from same-maker works.
@@ -2619,11 +2621,33 @@ pub fn get_related_movies_grouped(conn: &Connection, number: &str, limit_per_gro
         }
     }
 
+    let mut actor_birth_dates = std::collections::HashMap::new();
+    if !actor_names.is_empty() {
+        let _ = crate::performers::ensure_performer_schema(conn);
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT birth_date FROM performers
+             WHERE (name = ?1 OR aliases_json LIKE ?2)
+               AND birth_date IS NOT NULL AND trim(birth_date) != ''
+             LIMIT 1"
+        ) {
+            for actor in &actor_names {
+                let alias_pattern = format!("%\"{}\"%", actor.replace('"', ""));
+                if let Ok(Some(bd)) = stmt.query_row(params![actor, alias_pattern], |r| r.get::<_, String>(0)).optional() {
+                    let trimmed = bd.trim().to_string();
+                    if !trimmed.is_empty() {
+                        actor_birth_dates.insert(actor.clone(), trimmed);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(RelatedMoviesGrouped {
         actor_names,
         by_actors,
         maker_name,
         by_maker,
+        actor_birth_dates,
     })
 }
 

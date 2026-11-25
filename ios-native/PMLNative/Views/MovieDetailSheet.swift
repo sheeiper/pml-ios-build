@@ -325,10 +325,11 @@ public struct MovieDetailSheet: View {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 8) {
                                         ForEach(meta.actors, id: \.self) { actress in
+                                            let age = ageAtRelease(for: actress, releaseDate: meta.releaseDate)
                                             Button {
                                                 Task { await openPerformer(named: actress) }
                                             } label: {
-                                                Label(actress, systemImage: "person.circle.fill")
+                                                Label(age.map { "\(actress) · \($0)岁" } ?? actress, systemImage: "person.circle.fill")
                                                     .font(.caption.weight(.semibold))
                                                     .padding(.horizontal, 10)
                                                     .padding(.vertical, 6)
@@ -456,7 +457,14 @@ public struct MovieDetailSheet: View {
             .sheet(item: $selectedPerformer) { person in
                 MoviePerformerDetailSheet(
                     performer: person,
-                    onFilterMovies: onFilterActor.map { handler in { actorName in selectedPerformer = nil; dismiss(); handler(actorName) } }
+                    onFilterMovies: onFilterActor.map { handler in { actorName in selectedPerformer = nil; dismiss(); handler(actorName) } },
+                    onPlay: onPlay.map { handler in
+                        { targetId, _ in
+                            selectedPerformer = nil
+                            dismiss()
+                            handler(targetId)
+                        }
+                    }
                 )
                 .environmentObject(appModel)
             }
@@ -563,6 +571,19 @@ public struct MovieDetailSheet: View {
             let exact = list.items.first(where: { $0.name == name || $0.aliases.contains(name) })
             selectedPerformer = exact ?? list.items.first
         }
+    }
+
+    private func ageAtRelease(for actress: String, releaseDate: String?) -> Int? {
+        guard let birthRaw = relatedGrouped?.actorBirthDates?[actress],
+              let relRaw = releaseDate else { return nil }
+        let bParts = birthRaw.split(whereSeparator: { $0 == "-" || $0 == "/" }).compactMap { Int($0) }
+        let rParts = relRaw.split(whereSeparator: { $0 == "-" || $0 == "/" }).compactMap { Int($0) }
+        guard bParts.count >= 3, rParts.count >= 3 else { return nil }
+        var age = rParts[0] - bParts[0]
+        if rParts[1] < bParts[1] || (rParts[1] == bParts[1] && rParts[2] < bParts[2]) {
+            age -= 1
+        }
+        return (14...85).contains(age) ? age : nil
     }
 
     private func loadAux(for num: String) async {

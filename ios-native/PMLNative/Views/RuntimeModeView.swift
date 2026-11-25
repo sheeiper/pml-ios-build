@@ -35,24 +35,47 @@ struct RuntimeModeView: View {
             }
 
             Section {
-                TextField("AList 地址（http://IP:5244）", text: $draft.alistURL)
+                TextField("公网 AList 地址（http://IP:5244）", text: $draft.alistURL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
+                TextField(
+                    "内网 AList 地址（可选，如 http://192.168.1.x:5244）",
+                    text: Binding(
+                        get: { draft.lanAlistURL ?? "" },
+                        set: { draft.lanAlistURL = $0 }
+                    )
+                )
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
                 TextField("CD2 路径前缀", text: $draft.cd2Prefix)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                 TextField("AList 路径前缀", text: $draft.alistPrefix)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                Button(busy ? "检测中…" : "测试 AList") {
-                    Task { await testAList() }
+                HStack {
+                    Text("当前直连路由")
+                    Spacer()
+                    Text(model.isOnLanAlist ? "局域网 AList 直连" : "公网 AList 直连")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(model.isOnLanAlist ? .green : .secondary)
+                }
+                Button(busy ? "检测中…" : "测试公网 AList") {
+                    Task { await testAList(url: draft.normalizedAlistURL, label: "公网 AList") }
                 }
                 .disabled(busy)
+                if draft.normalizedLanAlistURL != nil {
+                    Button(busy ? "检测中…" : "测试内网 AList") {
+                        Task { await testAList(url: draft.normalizedLanAlistURL, label: "内网 AList") }
+                    }
+                    .disabled(busy)
+                }
             } header: {
-                Text("AList 直连")
+                Text("AList 直连（支持内网自动切换）")
             } footer: {
-                Text("视频、图片和漫画只走 AList /d 直连，不经过服务器中转。前缀对不上时会提示，不会改走 /media。")
+                Text("填写内网 AList 地址后，手机连入同局域网 Wi-Fi 会自动探活并切换局域网直连，切回蜂窝网络自动回退公网。")
             }
 
             Section {
@@ -94,9 +117,9 @@ struct RuntimeModeView: View {
         busy = false
     }
 
-    private func testAList() async {
-        guard let url = draft.normalizedAlistURL else {
-            errorText = "AList 地址无效"
+    private func testAList(url: URL?, label: String) async {
+        guard let url else {
+            errorText = "\(label)地址无效"
             return
         }
         busy = true
@@ -107,13 +130,13 @@ struct RuntimeModeView: View {
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                errorText = "AList 返回异常状态码"
+                errorText = "\(label)返回异常状态码"
                 busy = false
                 return
             }
-            message = "AList 连接成功 · \(url.absoluteString)"
+            message = "\(label)连接成功 · \(url.absoluteString)"
         } catch {
-            errorText = "AList 连接失败：\(error.localizedDescription)"
+            errorText = "\(label)连接失败：\(error.localizedDescription)"
         }
         busy = false
     }

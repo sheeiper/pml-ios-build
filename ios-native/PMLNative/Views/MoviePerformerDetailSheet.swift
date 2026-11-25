@@ -93,10 +93,17 @@ struct MoviePerformerDetailSheet: View {
                 )
                 .environmentObject(model)
             }
-            .sheet(item: $selectedMovie, onDismiss: handleMovieDismiss) { movie in
+            .sheet(item: $selectedMovie) { movie in
                 MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
-                    pendingPlayback = PendingPlayback(assetId: targetId, title: movie.title)
                     selectedMovie = nil
+                    if let onPlay {
+                        onPlay(targetId, movie.title)
+                    } else {
+                        Task {
+                            try? await Task.sleep(nanoseconds: 420_000_000)
+                            await playAsset(targetId, title: movie.title)
+                        }
+                    }
                 }
                 .environmentObject(model)
             }
