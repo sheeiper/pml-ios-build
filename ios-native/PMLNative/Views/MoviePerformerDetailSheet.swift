@@ -567,7 +567,7 @@ struct MoviePerformerDetailSheet: View {
     }
 }
 
-private struct MovieMagnetsSheet: View {
+struct MovieMagnetsSheet: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let release: PerformerRecentRelease

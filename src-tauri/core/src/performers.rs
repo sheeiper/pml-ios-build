@@ -2247,6 +2247,83 @@ pub async fn fetch_movie_magnets(
     Ok(all)
 }
 
+fn online_movie_search_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (i64, Vec<PerformerRecentRelease>)>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (i64, Vec<PerformerRecentRelease>)>>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub async fn search_online_movies(
+    query: &str,
+    force_refresh: bool,
+) -> Result<Vec<PerformerRecentRelease>, String> {
+    let raw = query.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let normalized = crate::jav_scraper::normalize_jav_number(raw);
+    let search_term = normalized.as_deref().unwrap_or(raw).to_string();
+    let cache_key = search_term.to_uppercase();
+    let now = chrono::Utc::now().timestamp();
+    if !force_refresh {
+        if let Ok(guard) = online_movie_search_cache().lock() {
+            if let Some((ts, cached)) = guard.get(&cache_key) {
+                if now - *ts < 1800 {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+    }
+
+    let client = javdb_public_client()?;
+    let encoded = percent_encoding::utf8_percent_encode(&search_term, percent_encoding::NON_ALPHANUMERIC).to_string();
+    let search_url = format!("https://javdb.com/search?q={encoded}&f=all");
+
+    let mut items: Vec<PerformerRecentRelease> = Vec::new();
+    if let Ok(resp) = client.get(&search_url).header("Cookie", "over18=1").send().await {
+        if resp.status().is_success() {
+            if let Ok(html) = resp.text().await {
+                items = parse_javdb_actor_releases(&html);
+            }
+        }
+    }
+
+    // Prioritize exact number match at top if user searched a specific code
+    if let Some(ref norm) = normalized {
+        items.sort_by_key(|item| {
+            if item.number.eq_ignore_ascii_case(norm) {
+                0u8
+            } else if item.number.to_uppercase().contains(&norm.to_uppercase()) {
+                1u8
+            } else {
+                2u8
+            }
+        });
+    }
+
+    // Fallback to direct scraper (JavBus / FC2 / JavDB detail) if JavDB search returned empty
+    if items.is_empty() {
+        if let Ok(meta) = crate::jav_scraper::scrape_movie_metadata(&search_term).await {
+            items.push(PerformerRecentRelease {
+                number: meta.number,
+                title: meta.title,
+                release_date: meta.release_date,
+                cover_url: meta.cover_url,
+                detail_url: String::new(),
+                in_library: false,
+                source: meta.source,
+            });
+        }
+    }
+
+    items.truncate(30);
+    if !items.is_empty() {
+        if let Ok(mut guard) = online_movie_search_cache().lock() {
+            guard.insert(cache_key, (now, items.clone()));
+        }
+    }
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

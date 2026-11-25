@@ -79,6 +79,14 @@ extension PMLAPIClient {
         return try await command("get_movie_magnets", arguments: args, as: [MovieMagnetItem].self)
     }
 
+    func searchOnlineMovies(query: String, forceRefresh: Bool = false) async throws -> [PerformerRecentRelease] {
+        try await command(
+            "search_online_movies",
+            arguments: ["query": query, "forceRefresh": forceRefresh],
+            as: [PerformerRecentRelease].self
+        )
+    }
+
     func getMoviePerformer(id: String) async throws -> MoviePerformerDetail {
         try await command("get_movie_performer", arguments: ["id": id], as: MoviePerformerDetail.self)
     }

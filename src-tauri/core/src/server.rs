@@ -1222,6 +1222,21 @@ async fn dispatch_command(
             let force_refresh = payload.get("forceRefresh").and_then(Value::as_bool).unwrap_or(false);
             result_response(crate::performers::fetch_movie_magnets(&number, detail_url.as_deref(), force_refresh).await)
         }
+        "search_online_movies" => {
+            let query = payload.get("query").and_then(Value::as_str).unwrap_or("").to_owned();
+            let force_refresh = payload.get("forceRefresh").and_then(Value::as_bool).unwrap_or(false);
+            let raw_items = match crate::performers::search_online_movies(&query, force_refresh).await {
+                Ok(v) => v,
+                Err(e) => return error_response(&e),
+            };
+            let app_check = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app_check)?;
+                let (_, _, items) = crate::performers::mark_library_ownership(&conn, raw_items, true)
+                    .map_err(|e| e.to_string())?;
+                Ok(items)
+            }).await
+        }
         "preview_movie_performer_profile" => {
             let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
             let profile_url = payload.get("profileUrl").and_then(Value::as_str).unwrap_or("").to_owned();

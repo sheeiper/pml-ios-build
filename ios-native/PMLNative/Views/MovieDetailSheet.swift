@@ -208,6 +208,18 @@ public struct MovieDetailSheet: View {
                             .buttonStyle(.bordered)
                             .disabled(subtitleSearching)
 
+                            let isMovieFav = favs.isMovieFav(meta.number)
+                            Button {
+                                Task { await favs.toggle(client: appModel.apiClient, type: .movie, id: meta.number) }
+                            } label: {
+                                Image(systemName: isMovieFav ? "heart.fill" : "heart")
+                                    .font(.headline)
+                                    .foregroundStyle(isMovieFav ? .pink : .primary)
+                                    .padding(.vertical, 8)
+                                    .padding(.horizontal, 12)
+                            }
+                            .buttonStyle(.bordered)
+
                             Button {
                                 Task { await loadData(force: true) }
                             } label: {

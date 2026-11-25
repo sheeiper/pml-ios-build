@@ -94,12 +94,27 @@ struct AuthorsView: View {
 
                         LazyVGrid(columns: columns, spacing: 12) {
                             ForEach(creators) { creator in
-                                NavigationLink {
-                                    AuthorProfileView(creator: creator)
-                                } label: {
-                                    CreatorCardV2View(creator: creator, client: model.apiClient)
+                                let isFav = favs.isFavorited(.creator, id: creator.id)
+                                ZStack(alignment: .topTrailing) {
+                                    NavigationLink {
+                                        AuthorProfileView(creator: creator)
+                                    } label: {
+                                        CreatorCardV2View(creator: creator, client: model.apiClient)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Button {
+                                        Task { await favs.toggle(.creator, id: creator.id, client: model.apiClient) }
+                                    } label: {
+                                        Image(systemName: isFav ? "heart.fill" : "heart")
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .foregroundStyle(isFav ? Color.red : Color.white)
+                                            .frame(width: 28, height: 28)
+                                            .background(Color.black.opacity(0.45), in: Circle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .padding(14)
                                 }
-                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -294,24 +309,6 @@ private struct CreatorCardV2View: View {
                     startPoint: .center,
                     endPoint: .bottom
                 )
-
-                VStack {
-                    HStack {
-                        Spacer()
-                        Button {
-                            Task { await favs.toggle(.creator, id: creator.id, client: client) }
-                        } label: {
-                            Image(systemName: isFav ? "heart.fill" : "heart")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(isFav ? Color.red : Color.white)
-                                .frame(width: 28, height: 28)
-                                .background(Color.black.opacity(0.45), in: Circle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    Spacer()
-                }
-                .padding(7)
 
                 HStack(spacing: 8) {
                     avatarCircle

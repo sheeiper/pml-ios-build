@@ -41,6 +41,10 @@ public struct MovieLibraryView: View {
     @State private var preview: PreviewItem?
     @State private var showScrapeSheet = false
     @State private var showFilterDrawer = false
+    @State private var showOnlineSearchSheet = false
+    @State private var pendingFilter: PendingSubFilter = .all
+    @State private var issueOffset = 0
+    @State private var unrecognizedOffset = 0
     @State private var batchStats: BatchScrapeStats?
     @State private var batchProgress: BatchScrapeProgress?
     @State private var enrichStats: PerformerEnrichStats?
@@ -54,7 +58,11 @@ public struct MovieLibraryView: View {
 
     private let pageSize = 40
     private enum LibraryMode: String, CaseIterable, Identifiable {
-        case movies = "影视库", performers = "演员", issues = "失败", unrecognized = "未识别"
+        case movies = "影视库", performers = "演员", pending = "待处理"
+        var id: String { rawValue }
+    }
+    private enum PendingSubFilter: String, CaseIterable, Identifiable {
+        case all = "全部", failed = "刮削失败", unrecognized = "未识别"
         var id: String { rawValue }
     }
 
@@ -93,9 +101,17 @@ public struct MovieLibraryView: View {
                     .padding(.top, 8)
                     .onChange(of: mode) { _, _ in resetAndLoad() }
 
+                    if mode == .movies || mode == .performers {
+                        quickActionBar
+                    }
                     if mode == .movies, activeMovieFilterCount > 0 { activeMovieFilterStrip }
                     else if mode == .performers, activePerformerFilterCount > 0 { activePerformerFilterStrip }
-                    else if mode == .issues { issueFilters }
+                    else if mode == .pending {
+                        pendingSubFilterBar
+                        if pendingFilter != .unrecognized && !issueCounts.isEmpty {
+                            issueFilters
+                        }
+                    }
 
                     if let errorMessage {
                         Label(errorMessage, systemImage: "exclamationmark.triangle")
@@ -106,7 +122,11 @@ public struct MovieLibraryView: View {
 
                     content
                 }
-                .navigationTitle(mode == .movies ? "影视库 (\(total))" : mode.rawValue)
+                .navigationTitle(
+                    mode == .movies ? "影视库 (\(total))"
+                    : mode == .pending ? "待处理 (\(issueTotal + unrecognizedTotal))"
+                    : mode.rawValue
+                )
                 .navigationBarTitleDisplayMode(.inline)
                 .searchable(text: $searchQuery, prompt: mode == .performers ? "搜索演员姓名或别名" : "搜索番号、片名、演员或片厂")
                 .toolbar {
@@ -187,6 +207,10 @@ public struct MovieLibraryView: View {
                 .id(item.id).environmentObject(model)
         }
         .sheet(isPresented: $showScrapeSheet) { manualScrapeSheet }
+        .sheet(isPresented: $showOnlineSearchSheet) {
+            OnlineMovieSearchSheet(initialQuery: searchQuery)
+                .environmentObject(model)
+        }
         .sheet(isPresented: $showFilterDrawer) {
             filterDrawerSheet
                 .presentationDetents([.medium, .large])
@@ -215,7 +239,20 @@ public struct MovieLibraryView: View {
         if loading && currentCount == 0 {
             ProgressView("正在从服务器查询…").frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if currentCount == 0 {
-            ContentUnavailableView(emptyTitle, systemImage: emptySymbol, description: Text(emptyDescription))
+            VStack(spacing: 16) {
+                ContentUnavailableView(emptyTitle, systemImage: emptySymbol, description: Text(emptyDescription))
+                if mode == .movies, !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button {
+                        showOnlineSearchSheet = true
+                    } label: {
+                        Label("全网搜「\(searchQuery.trimmingCharacters(in: .whitespacesAndNewlines))」查磁力", systemImage: "globe")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ScrollView {
                 LazyVStack(spacing: 14) {
@@ -229,15 +266,34 @@ public struct MovieLibraryView: View {
                         }
                         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
                             ForEach(pageItems) { movie in
-                                Button { selectedMovie = movie } label: { movieCell(movie) }
-                                    .buttonStyle(.plain)
+                                movieCell(movie)
                                     .onAppear { loadMoreIfNeeded(movie) }
                             }
                         }
-                    case .issues:
-                        ForEach(issues) { issue in issueCell(issue).onAppear { loadMoreIfNeeded(issue) } }
-                    case .unrecognized:
-                        ForEach(unrecognized) { item in unrecognizedCell(item).onAppear { loadMoreIfNeeded(item) } }
+                    case .pending:
+                        if pendingFilter != .unrecognized && !issues.isEmpty {
+                            HStack {
+                                Label("刮削失败 (\(issueTotal))", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.orange)
+                                Spacer()
+                            }
+                            ForEach(issues) { issue in
+                                issueCell(issue).onAppear { loadMoreIfNeeded(issue) }
+                            }
+                        }
+                        if pendingFilter != .failed && !unrecognized.isEmpty {
+                            HStack {
+                                Label("未识别视频 (\(unrecognizedTotal))", systemImage: "doc.questionmark.fill")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.purple)
+                                Spacer()
+                            }
+                            .padding(.top, (pendingFilter == .all && !issues.isEmpty) ? 6 : 0)
+                            ForEach(unrecognized) { item in
+                                unrecognizedCell(item).onAppear { loadMoreIfNeeded(item) }
+                            }
+                        }
                     case .performers:
                         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
                             ForEach(performers) { person in
@@ -385,36 +441,120 @@ public struct MovieLibraryView: View {
         }
     }
 
+    private var quickActionBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                let isFavOnly = mode == .movies ? onlyFavMovies : onlyFavPerformers
+                let favCount = mode == .movies ? favs.movies.count : favs.performers.count
+                Button {
+                    if mode == .movies { onlyFavMovies.toggle() } else { onlyFavPerformers.toggle() }
+                    resetAndLoad()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isFavOnly ? "heart.fill" : "heart")
+                        Text("仅看收藏")
+                        if favCount > 0 {
+                            Text("(\(favCount))")
+                        }
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(isFavOnly ? Color.pink.opacity(0.22) : Color.secondary.opacity(0.12), in: Capsule())
+                    .foregroundStyle(isFavOnly ? .pink : .primary)
+                }
+                .buttonStyle(.plain)
+
+                if mode == .movies {
+                    Button {
+                        showOnlineSearchSheet = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "globe")
+                            Text("搜番号查磁力")
+                        }
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.purple.opacity(0.16), in: Capsule())
+                        .foregroundStyle(.purple)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal)
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 2)
+    }
+
+    private var pendingSubFilterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(PendingSubFilter.allCases) { sub in
+                    let count: Int = {
+                        switch sub {
+                        case .all: return issueTotal + unrecognizedTotal
+                        case .failed: return issueTotal
+                        case .unrecognized: return unrecognizedTotal
+                        }
+                    }()
+                    let active = pendingFilter == sub
+                    Button {
+                        pendingFilter = sub
+                    } label: {
+                        Text("\(sub.rawValue) (\(count))")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(active ? Color.purple.opacity(0.22) : Color.secondary.opacity(0.12), in: Capsule())
+                            .foregroundStyle(active ? .purple : .primary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal)
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 2)
+    }
+
     private var currentCount: Int {
         switch mode {
         case .movies: return pageItems.count
-        case .issues: return issues.count
-        case .unrecognized: return unrecognized.count
+        case .pending:
+            switch pendingFilter {
+            case .all: return issues.count + unrecognized.count
+            case .failed: return issues.count
+            case .unrecognized: return unrecognized.count
+            }
         case .performers: return performers.count
         }
     }
     private var emptyTitle: String {
         switch mode {
-        case .movies: return "暂无匹配的影视作品"
-        case .issues: return "暂无刮削失败记录"
-        case .unrecognized: return "暂无无法识别视频"
-        case .performers: return "暂无演员档案"
+        case .movies: return onlyFavMovies ? "暂无收藏影片" : "暂无匹配的影视作品"
+        case .pending:
+            switch pendingFilter {
+            case .all: return "暂无待处理项"
+            case .failed: return "暂无刮削失败记录"
+            case .unrecognized: return "暂无无法识别视频"
+            }
+        case .performers: return onlyFavPerformers ? "暂无收藏演员" : "暂无演员档案"
         }
     }
     private var emptySymbol: String {
         switch mode {
-        case .movies: return "film.stack"
-        case .issues: return "checkmark.shield"
-        case .unrecognized: return "doc.questionmark"
-        case .performers: return "person.2"
+        case .movies: return onlyFavMovies ? "heart.slash" : "film.stack"
+        case .pending: return "checkmark.shield"
+        case .performers: return onlyFavPerformers ? "heart.slash" : "person.2"
         }
     }
     private var emptyDescription: String {
         switch mode {
-        case .movies: return "服务端仅返回已验证影视记录；点击右上角数据管理可增量同步与刮削。"
-        case .issues: return "失败记录按原因分类，不与未识别视频混算。"
-        case .unrecognized: return "文件名与父目录均无法提取番号的白名单视频会列在这里。"
-        case .performers: return "完成影片刮削后会自动入库演员档案。"
+        case .movies: return onlyFavMovies ? "点击影片卡片或详情页的红心即可加入收藏。" : "服务端仅返回已验证影视记录；点击右上角数据管理可增量同步与刮削。"
+        case .pending: return "刮削失败与无法识别番号的视频会统一归集在这里处理。"
+        case .performers: return onlyFavPerformers ? "点击演员卡片或详情页的红心即可加入收藏。" : "完成影片刮削后会自动入库演员档案。"
         }
     }
 
@@ -848,48 +988,51 @@ public struct MovieLibraryView: View {
     }
 
     private func movieCell(_ movie: MovieMetadata) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            ZStack(alignment: .topLeading) {
-                Color.black.opacity(0.88)
-                CachedImageView(url: movie.coverUrl.flatMap { model.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fit, minHeight: 108, maxPixel: 720)
-                Text(movie.number)
-                    .font(.system(size: 9, weight: .bold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 4))
-                    .foregroundStyle(.white)
-                    .padding(6)
-            }
-            .overlay(alignment: .topTrailing) {
-                let isFav = favs.isMovieFav(movie.number)
-                Button {
-                    Task { await favs.toggle(client: model.apiClient, type: .movie, id: movie.number) }
-                } label: {
-                    Image(systemName: isFav ? "heart.fill" : "heart")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(isFav ? .pink : .white.opacity(0.9))
-                        .frame(width: 24, height: 24)
-                        .background(.black.opacity(0.5), in: Circle())
+        let isFav = favs.isMovieFav(movie.number)
+        return ZStack(alignment: .topTrailing) {
+            VStack(alignment: .leading, spacing: 5) {
+                ZStack(alignment: .topLeading) {
+                    Color.black.opacity(0.88)
+                    CachedImageView(url: movie.coverUrl.flatMap { model.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fit, minHeight: 108, maxPixel: 720)
+                    Text(movie.number)
+                        .font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 4))
+                        .foregroundStyle(.white)
+                        .padding(6)
                 }
-                .buttonStyle(.plain)
-                .padding(5)
-            }
-            .aspectRatio(3 / 2, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .aspectRatio(3 / 2, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            Text(movie.title)
-                .font(.caption.weight(.semibold))
-                .lineLimit(2)
-            HStack(spacing: 4) {
-                Text(movie.actors.prefix(2).joined(separator: " · ").isEmpty ? (movie.maker ?? "未知") : movie.actors.prefix(2).joined(separator: " · "))
-                    .lineLimit(1)
-                Spacer(minLength: 2)
-                if let date = movie.releaseDate, !date.isEmpty {
-                    Text(date)
+                Text(movie.title)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(2)
+                HStack(spacing: 4) {
+                    Text(movie.actors.prefix(2).joined(separator: " · ").isEmpty ? (movie.maker ?? "未知") : movie.actors.prefix(2).joined(separator: " · "))
+                        .lineLimit(1)
+                    Spacer(minLength: 2)
+                    if let date = movie.releaseDate, !date.isEmpty {
+                        Text(date)
+                    }
                 }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+            .onTapGesture { selectedMovie = movie }
+
+            Button {
+                Task { await favs.toggle(client: model.apiClient, type: .movie, id: movie.number) }
+            } label: {
+                Image(systemName: isFav ? "heart.fill" : "heart")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(isFav ? .pink : .white.opacity(0.92))
+                    .frame(width: 28, height: 28)
+                    .background(.black.opacity(0.55), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(5)
         }
     }
 
@@ -953,7 +1096,8 @@ public struct MovieLibraryView: View {
     }
 
     private func performerCell(_ person: MoviePerformer) -> some View {
-        Button { selectedPerformer = person } label: {
+        let isFav = favs.isPerformerFav(person.id)
+        return ZStack(alignment: .topTrailing) {
             VStack(alignment: .leading, spacing: 6) {
                 ZStack(alignment: .bottomTrailing) {
                     Color.black.opacity(0.85)
@@ -982,20 +1126,6 @@ public struct MovieLibraryView: View {
                         .foregroundStyle(.white)
                         .padding(6)
                 }
-                .overlay(alignment: .topTrailing) {
-                    let isFav = favs.isPerformerFav(person.id)
-                    Button {
-                        Task { await favs.toggle(client: model.apiClient, type: .performer, id: person.id) }
-                    } label: {
-                        Image(systemName: isFav ? "heart.fill" : "heart")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(isFav ? .pink : .white.opacity(0.9))
-                            .frame(width: 24, height: 24)
-                            .background(.black.opacity(0.5), in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .padding(5)
-                }
                 .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -1022,8 +1152,21 @@ public struct MovieLibraryView: View {
                 }
                 .padding(.horizontal, 2)
             }
+            .contentShape(Rectangle())
+            .onTapGesture { selectedPerformer = person }
+
+            Button {
+                Task { await favs.toggle(client: model.apiClient, type: .performer, id: person.id) }
+            } label: {
+                Image(systemName: isFav ? "heart.fill" : "heart")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(isFav ? .pink : .white.opacity(0.92))
+                    .frame(width: 26, height: 26)
+                    .background(.black.opacity(0.55), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(5)
         }
-        .buttonStyle(.plain)
     }
 
     private func cycleHero() {
@@ -1075,7 +1218,8 @@ public struct MovieLibraryView: View {
     private func resetAndLoad() { Task { await reload() } }
     private func reload() async {
         requestVersion += 1
-        offset = 0; pageItems = []; issues = []; unrecognized = []; performers = []; errorMessage = nil
+        offset = 0; issueOffset = 0; unrecognizedOffset = 0
+        pageItems = []; issues = []; unrecognized = []; performers = []; errorMessage = nil
         loading = true; loadingMore = false
         await loadPage(reset: true)
     }
@@ -1090,14 +1234,26 @@ public struct MovieLibraryView: View {
                 let result = try await client.queryMovieLibrary(query: searchQuery, maker: selectedMaker, actor: selectedActor, sort: sort, onlyFavorites: onlyFavMovies, limit: pageSize, offset: offset)
                 guard version == requestVersion else { return }
                 pageItems = reset ? result.items : pageItems + result.items; total = result.total; makers = result.makers; actors = result.actors; offset += result.items.count
-            case .issues:
-                let result = try await client.listScrapeIssues(category: issueCategory, query: searchQuery, limit: pageSize, offset: offset)
-                guard version == requestVersion else { return }
-                issues = reset ? result.items : issues + result.items; issueTotal = result.total; issueCounts = result.counts; offset += result.items.count
-            case .unrecognized:
-                let result = try await client.listUnrecognizedVideos(limit: pageSize, offset: offset)
-                guard version == requestVersion else { return }
-                unrecognized = reset ? result.items : unrecognized + result.items; unrecognizedTotal = result.total; offset += result.items.count
+            case .pending:
+                if reset {
+                    async let issueReq = client.listScrapeIssues(category: issueCategory, query: searchQuery, limit: pageSize, offset: 0)
+                    async let unrecReq = client.listUnrecognizedVideos(limit: pageSize, offset: 0)
+                    let (issueRes, unrecRes) = try await (issueReq, unrecReq)
+                    guard version == requestVersion else { return }
+                    issues = issueRes.items; issueTotal = issueRes.total; issueCounts = issueRes.counts; issueOffset = issueRes.items.count
+                    unrecognized = unrecRes.items; unrecognizedTotal = unrecRes.total; unrecognizedOffset = unrecRes.items.count
+                } else {
+                    if issues.count < issueTotal {
+                        let issueRes = try await client.listScrapeIssues(category: issueCategory, query: searchQuery, limit: pageSize, offset: issueOffset)
+                        guard version == requestVersion else { return }
+                        issues += issueRes.items; issueTotal = issueRes.total; issueOffset += issueRes.items.count
+                    }
+                    if unrecognized.count < unrecognizedTotal {
+                        let unrecRes = try await client.listUnrecognizedVideos(limit: pageSize, offset: unrecognizedOffset)
+                        guard version == requestVersion else { return }
+                        unrecognized += unrecRes.items; unrecognizedTotal = unrecRes.total; unrecognizedOffset += unrecRes.items.count
+                    }
+                }
             case .performers:
                 let result = try await client.listMoviePerformers(
                     query: searchQuery,
@@ -1314,5 +1470,168 @@ public struct MovieLibraryView: View {
                 }
             }
         }
+    }
+}
+
+/// 全网搜番号查资源与磁力链接 Sheet（复用 MovieMagnetsSheet）
+private struct OnlineMovieSearchSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var query: String
+    @State private var results: [PerformerRecentRelease] = []
+    @State private var loading = false
+    @State private var searchedOnce = false
+    @State private var errorMessage: String?
+    @State private var selectedRelease: PerformerRecentRelease?
+
+    init(initialQuery: String = "") {
+        _query = State(initialValue: initialQuery.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    TextField("输入番号，例如 SSIS-123 / FC2-4833053", text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search)
+                        .onSubmit { Task { await runSearch(forceRefresh: false) } }
+
+                    Button {
+                        Task { await runSearch(forceRefresh: false) }
+                    } label: {
+                        Text("搜索")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .disabled(loading || query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+
+                if let errorMessage {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 6)
+                }
+
+                if loading {
+                    ProgressView("正在全网检索番号…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if results.isEmpty {
+                    ContentUnavailableView(
+                        searchedOnce ? "未找到线上作品" : "输入番号查资源与磁力",
+                        systemImage: searchedOnce ? "magnifyingglass" : "globe",
+                        description: Text(searchedOnce ? "请检查番号拼写或尝试点击刷新重试。" : "点击搜索结果卡片即可查看并复制可用磁力链接。")
+                    )
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                            ForEach(results) { item in
+                                Button {
+                                    selectedRelease = item
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        ZStack(alignment: .topLeading) {
+                                            Color.black.opacity(0.88)
+                                            if let raw = item.coverUrl, !raw.isEmpty,
+                                               let url = model.proxyScraperImageURL(rawUrl: raw) {
+                                                CachedImageView(url: url, contentMode: .fit, minHeight: 104, maxPixel: 640)
+                                            } else {
+                                                Image(systemName: "film")
+                                                    .font(.title3)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            HStack {
+                                                Text(item.number)
+                                                    .font(.system(size: 9, weight: .bold))
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 4))
+                                                    .foregroundStyle(.white)
+                                                Spacer()
+                                                Text(item.inLibrary ? "已入库" : "查磁力")
+                                                    .font(.system(size: 9, weight: .bold))
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background((item.inLibrary ? Color.green : Color.purple).opacity(0.88), in: RoundedRectangle(cornerRadius: 4))
+                                                    .foregroundStyle(.white)
+                                            }
+                                            .padding(6)
+                                        }
+                                        .aspectRatio(3 / 2, contentMode: .fit)
+                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                        Text(item.title.isEmpty ? item.number : item.title)
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(2)
+                                            .multilineTextAlignment(.leading)
+
+                                        HStack {
+                                            Text(item.releaseDate ?? "未知日期")
+                                            Spacer()
+                                            Text(item.source)
+                                        }
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(14)
+                    }
+                }
+            }
+            .navigationTitle("搜番号查资源")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if searchedOnce {
+                        Button {
+                            Task { await runSearch(forceRefresh: true) }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .disabled(loading)
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+            .task {
+                if !query.isEmpty {
+                    await runSearch(forceRefresh: false)
+                }
+            }
+            .sheet(item: $selectedRelease) { release in
+                MovieMagnetsSheet(release: release)
+                    .environmentObject(model)
+            }
+        }
+    }
+
+    private func runSearch(forceRefresh: Bool) async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let client = model.apiClient else { return }
+        loading = true
+        searchedOnce = true
+        errorMessage = nil
+        do {
+            results = try await client.searchOnlineMovies(query: trimmed, forceRefresh: forceRefresh)
+        } catch {
+            errorMessage = error.localizedDescription
+            results = []
+        }
+        loading = false
     }
 }
