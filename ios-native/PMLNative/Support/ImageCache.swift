@@ -86,9 +86,10 @@ final class ImageCache {
                     let (data, response) = try await session.data(for: request)
                     if let http = response as? HTTPURLResponse {
                         if (200...299).contains(http.statusCode) {
-                            if let decoded = await Task.detached(priority: .userInitiated) {
+                            let decoded = await Task.detached(priority: .userInitiated) {
                                 Self.decodeOffMain(data, maxPixel: maxPixel)
-                            }.value {
+                            }.value
+                            if let decoded {
                                 return decoded
                             }
                             return nil
