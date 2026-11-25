@@ -2489,6 +2489,11 @@ async fn dispatch_command(
             if let Some(pc) = payload.get("penetrate_comments").and_then(Value::as_bool) {
                 path.push_str(&format!("&penetrate_comments={pc}"));
             }
+            if let Some(mode) = payload.get("mode").and_then(Value::as_str) {
+                if !mode.trim().is_empty() {
+                    path.push_str(&format!("&mode={}", mode.trim()));
+                }
+            }
             forward_to_tg_streamer(reqwest::Method::GET, &path, None).await
         }
         "telegram_user_list_comments" => {

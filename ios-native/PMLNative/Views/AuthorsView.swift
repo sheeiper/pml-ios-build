@@ -484,14 +484,18 @@ struct AuthorProfileView: View {
                 assetId: payload.assetId,
                 playlist: payload.playlist,
                 playlistIndex: payload.playlistIndex,
+                fallbackURL: payload.fallbackURL,
+                sourceLabel: payload.sourceLabel,
                 remotePath: payload.remotePath
             )
+            .id(payload.id)
+            .environmentObject(model)
         }
         .fullScreenCover(item: $imageViewerContext) { ctx in
-            ImageViewer(context: ctx)
+            ImageViewer(context: ctx).environmentObject(model)
         }
         .fullScreenCover(item: $comicTarget) { target in
-            ComicReaderView(target: target)
+            ComicReaderView(target: target).environmentObject(model)
         }
         .task(id: authorId) { await loadFolder() }
         .onChange(of: selectedStudio) { _, _ in
@@ -694,43 +698,45 @@ struct AuthorProfileView: View {
     }
 
     private func playSingleVideo(assetId: String, title: String) async {
-        guard let client = model.apiClient else { return }
-        do {
-            let url = try await client.mediaSourceURL(assetId: assetId)
-            playingVideo = V2VideoPlayPayload(
-                url: url,
-                title: title,
-                assetId: assetId,
-                playlist: [VideoPlaylistItem(id: assetId, title: title, assetId: assetId)],
-                playlistIndex: 0,
-                remotePath: nil
-            )
-        } catch {
-            errorText = "打开视频失败：\(error.localizedDescription)"
+        errorText = ""
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else {
+            errorText = model.playbackError ?? "无法解析视频直链"
+            return
         }
+        playingVideo = V2VideoPlayPayload(
+            url: source.url,
+            title: title,
+            assetId: assetId,
+            playlist: [VideoPlaylistItem(id: assetId, title: title, assetId: assetId)],
+            playlistIndex: 0,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: nil
+        )
     }
 
     private func openAsset(_ asset: CreatorAssetV2, siblings: [CreatorAssetV2]) async {
-        guard let client = model.apiClient else { return }
+        errorText = ""
         if asset.isVideo {
             let videos = siblings.filter(\.isVideo)
             let playlist = videos.map {
                 VideoPlaylistItem(id: $0.id, title: $0.fileName, assetId: $0.id, remotePath: $0.remotePath)
             }
             let idx = videos.firstIndex(where: { $0.id == asset.id })
-            do {
-                let url = try await client.mediaSourceURL(assetId: asset.id)
-                playingVideo = V2VideoPlayPayload(
-                    url: url,
-                    title: asset.fileName,
-                    assetId: asset.id,
-                    playlist: playlist,
-                    playlistIndex: idx,
-                    remotePath: asset.remotePath
-                )
-            } catch {
-                errorText = "打开视频失败：\(error.localizedDescription)"
+            guard let source = await model.playbackSource(assetId: asset.id, remotePath: asset.remotePath) else {
+                errorText = model.playbackError ?? "无法解析视频直链"
+                return
             }
+            playingVideo = V2VideoPlayPayload(
+                url: source.url,
+                title: asset.fileName,
+                assetId: asset.id,
+                playlist: playlist,
+                playlistIndex: idx,
+                fallbackURL: source.fallbackURL,
+                sourceLabel: source.label,
+                remotePath: asset.remotePath
+            )
         } else if asset.isComicArchive {
             comicTarget = ComicArchiveTarget(id: asset.id, title: asset.fileName)
         } else if asset.isImage {
@@ -890,14 +896,18 @@ struct CreatorFolderView: View {
                 assetId: payload.assetId,
                 playlist: payload.playlist,
                 playlistIndex: payload.playlistIndex,
+                fallbackURL: payload.fallbackURL,
+                sourceLabel: payload.sourceLabel,
                 remotePath: payload.remotePath
             )
+            .id(payload.id)
+            .environmentObject(model)
         }
         .fullScreenCover(item: $imageViewerContext) { ctx in
-            ImageViewer(context: ctx)
+            ImageViewer(context: ctx).environmentObject(model)
         }
         .fullScreenCover(item: $comicTarget) { target in
-            ComicReaderView(target: target)
+            ComicReaderView(target: target).environmentObject(model)
         }
         .task { await load() }
     }
@@ -921,43 +931,45 @@ struct CreatorFolderView: View {
     }
 
     private func playSingleVideo(assetId: String, title: String) async {
-        guard let client = model.apiClient else { return }
-        do {
-            let url = try await client.mediaSourceURL(assetId: assetId)
-            playingVideo = V2VideoPlayPayload(
-                url: url,
-                title: title,
-                assetId: assetId,
-                playlist: [VideoPlaylistItem(id: assetId, title: title, assetId: assetId)],
-                playlistIndex: 0,
-                remotePath: nil
-            )
-        } catch {
-            errorText = "打开视频失败：\(error.localizedDescription)"
+        errorText = ""
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else {
+            errorText = model.playbackError ?? "无法解析视频直链"
+            return
         }
+        playingVideo = V2VideoPlayPayload(
+            url: source.url,
+            title: title,
+            assetId: assetId,
+            playlist: [VideoPlaylistItem(id: assetId, title: title, assetId: assetId)],
+            playlistIndex: 0,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: nil
+        )
     }
 
     private func openAsset(_ asset: CreatorAssetV2, siblings: [CreatorAssetV2]) async {
-        guard let client = model.apiClient else { return }
+        errorText = ""
         if asset.isVideo {
             let videos = siblings.filter(\.isVideo)
             let playlist = videos.map {
                 VideoPlaylistItem(id: $0.id, title: $0.fileName, assetId: $0.id, remotePath: $0.remotePath)
             }
             let idx = videos.firstIndex(where: { $0.id == asset.id })
-            do {
-                let url = try await client.mediaSourceURL(assetId: asset.id)
-                playingVideo = V2VideoPlayPayload(
-                    url: url,
-                    title: asset.fileName,
-                    assetId: asset.id,
-                    playlist: playlist,
-                    playlistIndex: idx,
-                    remotePath: asset.remotePath
-                )
-            } catch {
-                errorText = "打开视频失败：\(error.localizedDescription)"
+            guard let source = await model.playbackSource(assetId: asset.id, remotePath: asset.remotePath) else {
+                errorText = model.playbackError ?? "无法解析视频直链"
+                return
             }
+            playingVideo = V2VideoPlayPayload(
+                url: source.url,
+                title: asset.fileName,
+                assetId: asset.id,
+                playlist: playlist,
+                playlistIndex: idx,
+                fallbackURL: source.fallbackURL,
+                sourceLabel: source.label,
+                remotePath: asset.remotePath
+            )
         } else if asset.isComicArchive {
             comicTarget = ComicArchiveTarget(id: asset.id, title: asset.fileName)
         } else if asset.isImage {

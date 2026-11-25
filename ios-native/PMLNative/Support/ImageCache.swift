@@ -14,8 +14,8 @@ final class ImageCache {
     private init() {
         let configuration = URLSessionConfiguration.default
         configuration.requestCachePolicy = .returnCacheDataElseLoad
-        configuration.httpMaximumConnectionsPerHost = 8
-        configuration.timeoutIntervalForRequest = 20
+        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.timeoutIntervalForRequest = 35
         configuration.urlCache = URLCache(memoryCapacity: 64 * 1024 * 1024, diskCapacity: 512 * 1024 * 1024)
         session = URLSession(configuration: configuration)
         cache.countLimit = 400
@@ -69,18 +69,44 @@ final class ImageCache {
 
         let request = makeRequest(url)
         let session = self.session
+        let isServerThumb = isServerURL(url) && (url.path.hasPrefix("/thumbnail/") || url.path.hasPrefix("/api/comic-pages/"))
         let task = Task<UIImage?, Never> {
-            do {
-                let (data, response) = try await session.data(for: request)
-                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                    return nil
+            let maxAttempts = isServerThumb ? 3 : 2
+            for attempt in 0..<maxAttempts {
+                if Task.isCancelled { return nil }
+                do {
+                    if isServerThumb {
+                        await ImageFetchGate.shared.acquire()
+                    }
+                    defer {
+                        if isServerThumb {
+                            Task { await ImageFetchGate.shared.release() }
+                        }
+                    }
+                    let (data, response) = try await session.data(for: request)
+                    if let http = response as? HTTPURLResponse {
+                        if (200...299).contains(http.statusCode) {
+                            if let decoded = await Task.detached(priority: .userInitiated) {
+                                Self.decodeOffMain(data, maxPixel: maxPixel)
+                            }.value {
+                                return decoded
+                            }
+                            return nil
+                        }
+                        let retryable = http.statusCode == 503 || http.statusCode == 504 || http.statusCode == 429 || http.statusCode == 502
+                        if !retryable || attempt == maxAttempts - 1 {
+                            return nil
+                        }
+                    }
+                } catch {
+                    if Task.isCancelled || attempt == maxAttempts - 1 {
+                        return nil
+                    }
                 }
-                return await Task.detached(priority: .userInitiated) {
-                    Self.decodeOffMain(data, maxPixel: maxPixel)
-                }.value
-            } catch {
-                return nil
+                let backoffNs = UInt64((attempt == 0 ? 1_500 : (attempt == 1 ? 3_500 : 6_000)) * 1_000_000)
+                try? await Task.sleep(nanoseconds: backoffNs)
             }
+            return nil
         }
         inFlight[k] = task
         let loaded = await task.value
@@ -134,4 +160,35 @@ nonisolated func pmlDownscaledJPEG(_ image: UIImage, maxPixel: CGFloat = 480, qu
         image.draw(in: CGRect(origin: .zero, size: target))
     }
     return resized.jpegData(compressionQuality: quality)
+}
+
+/// 限制服务器动态缩略图/压缩包封面的并发拉取数量，避免 4 宫格卡片瞬间打爆服务端抽帧队列。
+private actor ImageFetchGate {
+    static let shared = ImageFetchGate(limit: 4)
+    private let limit: Int
+    private var active = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    func acquire() async {
+        if active < limit {
+            active += 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            next.resume()
+        } else {
+            active = max(0, active - 1)
+        }
+    }
 }

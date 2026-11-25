@@ -1,36 +1,57 @@
 import SwiftUI
 import UIKit
 
-/// 首页：资料库概览、最近新增、扫描入口。
+/// 首页 V2：五大模块直达矩阵、新增文件（独立配置 Inbox）、影视库精选、常看创作者、专题合集、写真图集、漫画馆藏与扫描入口。
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
 
-    @State private var overview: LibraryOverview?
-    @State private var recent: [LibraryAsset] = []
+    @State private var modules: [LibraryModuleInfo] = []
+    @State private var inboxPath = ""
+    @State private var inboxRoot: LibraryRoot?
+    @State private var inboxEntries: [RemoteBrowserEntry] = []
+    @State private var syncingInbox = false
+
+    @State private var featuredMovies: [MovieMetadata] = []
+    @State private var shufflingMovies = false
     @State private var creatorsV2: [CreatorSummaryV2] = []
+    @State private var featuredCollections: [CollectionAlbumV2] = []
+    @State private var featuredGalleries: [GallerySetV2] = []
     @State private var comics: [LibraryAsset] = []
     @State private var roots: [LibraryRoot] = []
-    @State private var favorites: Int64 = 0
+
     @State private var loading = false
-    @State private var errorText = ""
-    @State private var scanMessage = ""
-    @State private var scanning = false
     @State private var checking = false
-    @State private var preview: PreviewItem?
+    @State private var noticeText = ""
+    @State private var errorText = ""
+
+    @State private var playingVideo: V2VideoPlayPayload?
+    @State private var imageViewerContext: ImageViewerContext?
     @State private var archiveComic: ComicArchiveTarget?
-    @State private var folderComic: ComicFolderTarget?
     @State private var directoryTarget: HomeDirectoryTarget?
-    @StateObject private var thumbs = ThumbnailLoader()
+    @State private var selectedMovie: MovieMetadata?
+    @State private var openingGalleryId: String?
+
+    private let moduleColumns = [
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+    ]
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    if let overview {
-                        statsGrid(overview)
-                    } else if loading {
-                        ProgressView().frame(maxWidth: .infinity, alignment: .center)
+                LazyVStack(alignment: .leading, spacing: 22) {
+                    if !noticeText.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            Text(noticeText)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .pmlGlassCard(cornerRadius: 12)
                     }
 
                     if !errorText.isEmpty {
@@ -39,12 +60,17 @@ struct HomeView: View {
                             .foregroundStyle(.red)
                     }
 
-                    recentSection
+                    modulesMatrixSection
+                    inboxSection
+                    featuredMoviesSection
                     creatorsSection
+                    collectionsSection
+                    galleriesSection
                     comicsSection
                     scanCard
                 }
-                .padding(20)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
             }
             .navigationTitle("首页")
             .toolbar {
@@ -59,20 +85,23 @@ struct HomeView: View {
                         }
                     }
                     .disabled(checking)
-                    .accessibilityLabel("检查 CD2 更新")
+                    .accessibilityLabel("检查更新")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 16) {
+                    HStack(spacing: 14) {
+                        NavigationLink {
+                            PendingCurationView()
+                        } label: {
+                            Image(systemName: "tray.and.arrow.down")
+                        }
+                        .accessibilityLabel("待收纳整理")
+
                         NavigationLink {
                             FavoritesView()
                         } label: {
                             Image(systemName: "heart")
                         }
-                        NavigationLink {
-                            HistoryView()
-                        } label: {
-                            Image(systemName: "clock.arrow.circlepath")
-                        }
+
                         NavigationLink {
                             SettingsView()
                         } label: {
@@ -84,30 +113,30 @@ struct HomeView: View {
             .task { await refresh() }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active else { return }
-                if errorText.lowercased().contains("cancel") || overview == nil {
+                if errorText.lowercased().contains("cancel") || modules.isEmpty {
                     Task { await refresh() }
                 }
             }
             .refreshable { await refreshAndCheckProvider() }
-            .fullScreenCover(item: $preview) { item in
-                if item.isVideo {
-                    GestureVideoPlayerSheet(
-                        url: item.url,
-                        title: item.title,
-                        assetId: item.assetId,
-                        startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel, remotePath: item.remotePath
-                    )
-                    .id(item.id)
-                    .environmentObject(model)
-                } else {
-                    ImageViewerSheet(url: item.url)
-                }
+            .fullScreenCover(item: $playingVideo) { payload in
+                GestureVideoPlayerSheet(
+                    url: payload.url,
+                    title: payload.title,
+                    assetId: payload.assetId,
+                    playlist: payload.playlist,
+                    playlistIndex: payload.playlistIndex,
+                    fallbackURL: payload.fallbackURL,
+                    sourceLabel: payload.sourceLabel,
+                    remotePath: payload.remotePath
+                )
+                .id(payload.id)
+                .environmentObject(model)
+            }
+            .fullScreenCover(item: $imageViewerContext) { ctx in
+                ImageViewer(context: ctx).environmentObject(model)
             }
             .fullScreenCover(item: $archiveComic) { target in
                 ComicReaderView(target: target).environmentObject(model)
-            }
-            .fullScreenCover(item: $folderComic) { target in
-                ComicFolderReaderView(target: target).environmentObject(model)
             }
             .sheet(item: $directoryTarget) { target in
                 NavigationStack {
@@ -115,60 +144,184 @@ struct HomeView: View {
                         .environmentObject(model)
                 }
             }
-        }
-    }
-
-    private func statsGrid(_ overview: LibraryOverview) -> some View {
-        LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
-            statCard("媒体", "\(overview.assets)", "photo.on.rectangle.angled")
-            statCard("图片", "\(overview.images)", "photo.fill")
-            statCard("视频", "\(overview.videos)", "play.rectangle.fill")
-            statCard("漫画", "\(overview.comics)", "book.closed.fill")
-            statCard("创作者", "\(creatorsV2.isEmpty ? overview.authors : Int64(creatorsV2.count))", "person.2.fill")
-            statCard("收藏", "\(favorites)", "heart.fill")
-            statCard("未播放", "\(overview.unplayed)", "eye.slash")
-            statCard("占用", pmlFormatBytes(overview.totalBytes), "internaldrive")
-        }
-    }
-
-    private func statCard(_ title: String, _ value: String, _ symbol: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: symbol)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.tint)
-                Text(title)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            .sheet(item: $selectedMovie) { movie in
+                MovieDetailSheet(number: movie.number)
+                    .environmentObject(model)
             }
-            Text(value)
-                .font(.title3.weight(.semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .pmlGlassCard(cornerRadius: 18)
+    }
+
+    // MARK: - 顶部五大模块直达矩阵
+
+    @ViewBuilder
+    private var modulesMatrixSection: some View {
+        if !modules.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("五大资料库")
+                        .font(.headline)
+                    Spacer()
+                    NavigationLink("全部应用") {
+                        AppCenterView()
+                    }
+                    .font(.caption)
+                }
+
+                LazyVGrid(columns: moduleColumns, spacing: 10) {
+                    ForEach(modules) { mod in
+                        NavigationLink {
+                            moduleDestination(for: mod.kind)
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: mod.symbol)
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 36, height: 36)
+                                    .background(moduleTint(mod.kind), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(mod.name)
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    Text("\(mod.entityCount) \(mod.entityUnitLabel)")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                    Text(PMLFormatters.bytes(mod.totalBytes))
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(11)
+                            .pmlGlassCard(cornerRadius: 16)
+                        }
+                        .buttonStyle(PressableTileStyle())
+                    }
+
+                    NavigationLink {
+                        PendingCurationView()
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "tray.and.arrow.down.fill")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 36, height: 36)
+                                .background(Color.orange.gradient, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("待收纳整理")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Text("五大模块分拣")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Text("刷卡 / 批量")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(11)
+                        .pmlGlassCard(cornerRadius: 16)
+                    }
+                    .buttonStyle(PressableTileStyle())
+                }
+            }
+        } else if loading {
+            ProgressView()
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 16)
+        }
     }
 
     @ViewBuilder
-    private var recentSection: some View {
-        if !recent.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("最近新增")
-                    .font(.headline)
+    private func moduleDestination(for kind: String) -> some View {
+        switch kind {
+        case "movies": MovieLibraryView()
+        case "creators": AuthorsView()
+        case "collections": CollectionsView()
+        case "galleries": GalleriesView()
+        default: BrowseView()
+        }
+    }
+
+    private func moduleTint(_ kind: String) -> AnyShapeStyle {
+        switch kind {
+        case "movies": return AnyShapeStyle(Color.indigo.gradient)
+        case "creators": return AnyShapeStyle(Color.pink.gradient)
+        case "collections": return AnyShapeStyle(Color.cyan.gradient)
+        case "galleries": return AnyShapeStyle(Color.orange.gradient)
+        case "comics": return AnyShapeStyle(Color.green.gradient)
+        default: return AnyShapeStyle(Color.accentColor.gradient)
+        }
+    }
+
+    // MARK: - 板块 1：新增文件（单独配置的新增文件夹 Inbox）
+
+    private var inboxSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("新增文件")
+                        .font(.headline)
+                    if !inboxPath.isEmpty {
+                        Text(inboxPath)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                Spacer()
+                Button {
+                    Task { await syncInbox() }
+                } label: {
+                    if syncingInbox {
+                        ProgressView()
+                    } else {
+                        Label("同步", systemImage: "bolt.fill")
+                            .font(.caption.weight(.medium))
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(syncingInbox || inboxRoot == nil)
+
+                if let root = inboxRoot, !inboxPath.isEmpty {
+                    Button("全部") {
+                        directoryTarget = HomeDirectoryTarget(root: root, path: inboxPath)
+                    }
+                    .font(.caption)
+                }
+            }
+
+            if inboxEntries.isEmpty {
+                HStack(spacing: 10) {
+                    Image(systemName: "tray")
+                        .foregroundStyle(.secondary)
+                    Text(inboxPath.isEmpty ? "尚未配置新增文件夹路径（请在媒体源中设置）" : "新增文件夹暂无新入库文件")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .pmlGlassCard(cornerRadius: 16)
+            } else {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(recent) { asset in
+                    HStack(spacing: 11) {
+                        ForEach(inboxEntries) { entry in
                             Button {
-                                Task { await open(asset) }
+                                Task { await openInboxEntry(entry) }
                             } label: {
-                                recentCell(asset)
+                                inboxCard(entry)
                             }
                             .buttonStyle(.plain)
-                            .task {
-                                await thumbs.image(assetId: asset.thumbnailAssetId ?? asset.id, client: model.apiClient)
-                            }
                         }
                     }
                 }
@@ -176,75 +329,148 @@ struct HomeView: View {
         }
     }
 
-    private func recentCell(_ asset: LibraryAsset) -> some View {
+    private func inboxCard(_ entry: RemoteBrowserEntry) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(.quaternary.opacity(0.35))
-                if let image = thumbs.images[asset.thumbnailAssetId ?? asset.id] {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 132, height: 96)
-                        .clipped()
+            ZStack(alignment: .topLeading) {
+                if let coverId = entry.coverAssetId ?? entry.assetId {
+                    CachedImageView(
+                        url: model.apiClient?.v2CoverURL(assetId: coverId, isArchive: entry.isComicArchive),
+                        contentMode: .fill,
+                        minHeight: 94,
+                        maxPixel: 420
+                    )
+                    .frame(width: 144, height: 94)
+                    .clipped()
                 } else {
-                    Image(systemName: asset.mediaType == "video" ? "play.rectangle.fill" : "photo.fill")
-                        .font(.system(size: 20))
-                        .foregroundStyle(.tint)
+                    ZStack {
+                        Color.secondary.opacity(0.14)
+                        Image(systemName: entry.symbol)
+                            .font(.title2)
+                            .foregroundStyle(.tint)
+                    }
+                    .frame(width: 144, height: 94)
                 }
-            }
-            .frame(width: 132, height: 96)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .clipped()
-            .allowsHitTesting(false)
 
-            Text(asset.fileName)
-                .font(.caption)
-                .lineLimit(1)
-                .frame(width: 132, alignment: .leading)
+                Text(entry.isDirectory ? "文件夹" : (entry.isVideo ? "视频" : "文件"))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.black.opacity(0.58), in: Capsule())
+                    .padding(6)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Text(entry.name)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .frame(width: 144, alignment: .leading)
         }
-        .contentShape(Rectangle())
+        .padding(7)
+        .pmlGlassCard(cornerRadius: 15)
     }
 
-    private var scanCard: some View {
-        NavigationLink {
-            ScanCenterView()
-        } label: {
+    // MARK: - 板块 2：影视库精选推荐
+
+    @ViewBuilder
+    private var featuredMoviesSection: some View {
+        if !featuredMovies.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Label("资料库扫描", systemImage: "arrow.triangle.2.circlepath")
+                    Text("影视库精选")
                         .font(.headline)
                     Spacer()
-                    Text("去扫描").font(.caption).foregroundStyle(.tint)
+                    Button {
+                        Task { await shuffleMovies() }
+                    } label: {
+                        if shufflingMovies {
+                            ProgressView()
+                        } else {
+                            Label("换一批", systemImage: "shuffle")
+                                .font(.caption.weight(.medium))
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(shufflingMovies)
                 }
-                Text("扫描范围：已整理、漫画（最近添加与待整理不扫描）")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 11) {
+                        ForEach(featuredMovies) { movie in
+                            Button {
+                                selectedMovie = movie
+                            } label: {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ZStack(alignment: .topLeading) {
+                                        CachedImageView(
+                                            url: movie.coverUrl.flatMap { model.proxyScraperImageURL(rawUrl: $0) },
+                                            contentMode: .fill,
+                                            minHeight: 104,
+                                            maxPixel: 480
+                                        )
+                                        .frame(width: 168, height: 104)
+                                        .clipped()
+
+                                        Text(movie.number)
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.black.opacity(0.66), in: Capsule())
+                                            .padding(6)
+                                    }
+                                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+                                    Text(movie.title ?? movie.number)
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                        .frame(width: 168, alignment: .leading)
+                                }
+                                .padding(7)
+                                .pmlGlassCard(cornerRadius: 15)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
             }
-            .padding(16)
-            .pmlGlassCard(cornerRadius: 20)
         }
-        .buttonStyle(.plain)
     }
+
+    // MARK: - 板块 3：常看创作者
 
     @ViewBuilder
     private var creatorsSection: some View {
         if !creatorsV2.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                Text("常看创作者").font(.headline)
+                HStack {
+                    Text("常看创作者")
+                        .font(.headline)
+                    Spacer()
+                    NavigationLink("全部") {
+                        AuthorsView()
+                    }
+                    .font(.caption)
+                }
+
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 14) {
-                        ForEach(creatorsV2.prefix(12)) { creator in
+                        ForEach(creatorsV2.prefix(14)) { creator in
                             NavigationLink {
                                 AuthorProfileView(creator: creator)
                                     .environmentObject(model)
                             } label: {
                                 VStack(spacing: 6) {
                                     creatorAvatarView(creator)
-                                        .frame(width: 60, height: 60)
+                                        .frame(width: 62, height: 62)
                                         .clipShape(Circle())
+                                        .overlay(Circle().strokeBorder(Color.primary.opacity(0.1), lineWidth: 1))
                                     Text(creator.name)
                                         .font(.caption)
+                                        .foregroundStyle(.primary)
                                         .lineLimit(1)
                                         .frame(width: 68)
                                 }
@@ -258,33 +484,9 @@ struct HomeView: View {
     }
 
     @ViewBuilder
-    private var comicsSection: some View {
-        if !comics.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("漫画馆藏").font(.headline)
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(comics) { asset in
-                            Button {
-                                Task { await openComic(asset) }
-                            } label: {
-                                comicCell(asset)
-                            }
-                            .buttonStyle(.plain)
-                            .task {
-                                await thumbs.image(assetId: asset.thumbnailAssetId ?? asset.id, client: model.apiClient)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
     private func creatorAvatarView(_ creator: CreatorSummaryV2) -> some View {
         if let url = model.apiClient?.v2CoverURL(assetId: creator.avatarAssetId ?? creator.coverAssetId) {
-            CachedImageView(url: url, contentMode: .fill, minHeight: 60, maxPixel: 200)
+            CachedImageView(url: url, contentMode: .fill, minHeight: 62, maxPixel: 200)
         } else {
             ZStack {
                 Circle().fill(.quaternary.opacity(0.35))
@@ -295,34 +497,370 @@ struct HomeView: View {
         }
     }
 
-    private func comicCell(_ asset: LibraryAsset) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(.quaternary.opacity(0.35))
-                if let image = thumbs.images[asset.thumbnailAssetId ?? asset.id] {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                } else {
-                    Image(systemName: "book.closed.fill")
-                        .font(.system(size: 22))
-                        .foregroundStyle(.tint)
+    // MARK: - 板块 4：专题合集精选
+
+    @ViewBuilder
+    private var collectionsSection: some View {
+        if !featuredCollections.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("专题合集")
+                        .font(.headline)
+                    Spacer()
+                    NavigationLink("全部") {
+                        CollectionsView()
+                    }
+                    .font(.caption)
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 11) {
+                        ForEach(featuredCollections) { alb in
+                            if alb.isSingleVideoWrapper, let singleId = alb.singleVideoAssetId {
+                                Button {
+                                    Task { await playVideo(assetId: singleId, title: alb.name, remotePath: alb.remotePath) }
+                                } label: {
+                                    collectionMiniCard(alb)
+                                }
+                                .buttonStyle(.plain)
+                            } else {
+                                NavigationLink {
+                                    CollectionFolderView(albumId: alb.id, albumTitle: alb.name, subPath: nil)
+                                } label: {
+                                    collectionMiniCard(alb)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
                 }
             }
-            .frame(width: 116, height: 154)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+    }
 
-            Text(asset.fileName)
-                .font(.caption)
+    private func collectionMiniCard(_ alb: CollectionAlbumV2) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack {
+                CachedImageView(
+                    url: model.apiClient?.v2CoverURL(assetId: alb.coverAssetId ?? alb.previewAssetIds.first),
+                    contentMode: .fill,
+                    minHeight: 98,
+                    maxPixel: 420
+                )
+                .frame(width: 162, height: 98)
+                .clipped()
+
+                VStack {
+                    HStack {
+                        Text(alb.channel)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.black.opacity(0.6), in: Capsule())
+                        Spacer()
+                    }
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Text(alb.isSingleVideoWrapper ? "▶ 单视频" : "\(alb.itemCount) 项")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(alb.isSingleVideoWrapper ? Color.accentColor.opacity(0.88) : Color.black.opacity(0.62), in: Capsule())
+                    }
+                }
+                .padding(6)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+            Text(alb.name)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.primary)
                 .lineLimit(1)
-                .frame(width: 116, alignment: .leading)
+                .frame(width: 162, alignment: .leading)
+        }
+        .padding(7)
+        .pmlGlassCard(cornerRadius: 15)
+    }
+
+    // MARK: - 板块 5：写真图集精选
+
+    @ViewBuilder
+    private var galleriesSection: some View {
+        if !featuredGalleries.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("写真图集")
+                        .font(.headline)
+                    Spacer()
+                    NavigationLink("全部") {
+                        GalleriesView()
+                    }
+                    .font(.caption)
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 11) {
+                        ForEach(featuredGalleries) { set in
+                            Button {
+                                Task { await openGallerySet(set) }
+                            } label: {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ZStack {
+                                        CachedImageView(
+                                            url: model.apiClient?.v2CoverURL(assetId: set.coverAssetId, isArchive: set.isArchive),
+                                            contentMode: .fill,
+                                            minHeight: 164,
+                                            maxPixel: 420
+                                        )
+                                        .frame(width: 122, height: 164)
+                                        .clipped()
+
+                                        if openingGalleryId == set.id {
+                                            Color.black.opacity(0.35)
+                                            ProgressView().tint(.white)
+                                        }
+
+                                        VStack {
+                                            Spacer()
+                                            HStack {
+                                                Spacer()
+                                                Text(set.isArchive ? "ZIP" : "\(set.itemCount) P")
+                                                    .font(.caption2.monospacedDigit().weight(.semibold))
+                                                    .foregroundStyle(.white)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(Color.black.opacity(0.65), in: Capsule())
+                                            }
+                                        }
+                                        .padding(6)
+                                    }
+                                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+                                    Text(set.albumName)
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                        .frame(width: 122, alignment: .leading)
+                                    Text(set.modelName)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .frame(width: 122, alignment: .leading)
+                                }
+                                .padding(7)
+                                .pmlGlassCard(cornerRadius: 15)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(openingGalleryId != nil)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 板块 6：漫画馆藏 + 扫描中心
+
+    @ViewBuilder
+    private var comicsSection: some View {
+        if !comics.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("漫画馆藏").font(.headline)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(comics) { asset in
+                            Button {
+                                Task { await openComic(asset) }
+                            } label: {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    CachedImageView(
+                                        url: model.apiClient?.v2CoverURL(assetId: asset.thumbnailAssetId ?? asset.id, isArchive: isComicArchiveName(asset.fileName)),
+                                        contentMode: .fill,
+                                        minHeight: 150,
+                                        maxPixel: 420
+                                    )
+                                    .frame(width: 112, height: 150)
+                                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+                                    Text(asset.fileName)
+                                        .font(.caption)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                        .frame(width: 112, alignment: .leading)
+                                }
+                                .padding(7)
+                                .pmlGlassCard(cornerRadius: 14)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var scanCard: some View {
+        NavigationLink {
+            ScanCenterView()
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("五大模块同步与扫描中心", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.headline)
+                    Spacer()
+                    Text("进入").font(.caption).foregroundStyle(.tint)
+                }
+                Text("支持影视库、创作者、合集、图集、漫画独立增量同步与索引重建。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(15)
+            .pmlGlassCard(cornerRadius: 18)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 数据加载与交互
+
+    private func refreshAndCheckProvider() async {
+        guard let client = model.apiClient, !checking else { return }
+        checking = true
+        noticeText = ""
+        defer { checking = false }
+        do {
+            let outcomes = try await client.checkDomainRootsForUpdates()
+            noticeText = outcomes.refreshNotice
+            await refresh()
+        } catch {
+            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
+        }
+    }
+
+    private func refresh() async {
+        guard let client = model.apiClient else { return }
+        loading = true
+        errorText = ""
+        defer { loading = false }
+
+        async let modulesReq = client.listLibraryModules()
+        async let configReq = client.directoryConfig()
+        async let rootsReq = client.libraryRoots()
+        async let moviesReq = client.getRandomFeaturedMovies(limit: 12)
+        async let creatorsReq = client.listCreatorsV2(sort: "count")
+        async let collectionsReq = client.listCollectionAlbums(sort: "recent", limit: 12, offset: 0)
+        async let galleriesReq = client.listGallerySets(sort: "recent", limit: 12, offset: 0)
+        async let comicsReq = client.libraryAssets(filter: "comics", limit: 16)
+
+        modules = (try? await modulesReq) ?? []
+        roots = (try? await rootsReq) ?? []
+        featuredMovies = (try? await moviesReq) ?? []
+        creatorsV2 = (try? await creatorsReq) ?? []
+        featuredCollections = (try? await collectionsReq)?.albums ?? []
+        featuredGalleries = (try? await galleriesReq)?.sets ?? []
+        comics = (try? await comicsReq) ?? []
+
+        if let config = try? await configReq {
+            let configuredInbox = config.recentPath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            inboxPath = configuredInbox
+            inboxRoot = roots.first { configuredInbox == $0.remotePath || configuredInbox.hasPrefix($0.remotePath + "/") }
+            if let root = inboxRoot, !configuredInbox.isEmpty {
+                await loadInboxEntries(root: root, path: configuredInbox, forceRefresh: false)
+            } else {
+                inboxEntries = []
+            }
+        }
+    }
+
+    private func syncInbox() async {
+        guard let root = inboxRoot, !inboxPath.isEmpty, !syncingInbox else { return }
+        syncingInbox = true
+        noticeText = ""
+        defer { syncingInbox = false }
+        await loadInboxEntries(root: root, path: inboxPath, forceRefresh: true)
+        noticeText = "新增文件目录已同步（\(inboxEntries.count) 项）"
+    }
+
+    private func loadInboxEntries(root: LibraryRoot, path: String, forceRefresh: Bool) async {
+        guard let client = model.apiClient else { return }
+        if let page = try? await client.remoteChildren(rootId: root.id, path: path, refresh: forceRefresh, sort: "newest") {
+            inboxEntries = page.items
+                .filter { !$0.name.hasPrefix(".") && !$0.name.hasPrefix("@") }
+                .prefix(24)
+                .map { $0 }
+        }
+    }
+
+    private func shuffleMovies() async {
+        guard let client = model.apiClient, !shufflingMovies else { return }
+        shufflingMovies = true
+        defer { shufflingMovies = false }
+        if let fresh = try? await client.getRandomFeaturedMovies(limit: 12) {
+            featuredMovies = fresh
+        }
+    }
+
+    private func openInboxEntry(_ entry: RemoteBrowserEntry) async {
+        if entry.isDirectory, let root = inboxRoot {
+            directoryTarget = HomeDirectoryTarget(root: root, path: entry.path)
+            return
+        }
+        if entry.isVideo {
+            await playVideo(assetId: entry.assetId ?? "", title: entry.name, remotePath: entry.path)
+        } else if entry.isComicArchive, let assetId = entry.assetId {
+            archiveComic = ComicArchiveTarget(id: assetId, title: entry.name)
+        } else if entry.isImage {
+            let images = inboxEntries.filter(\.isImage)
+            let idx = images.firstIndex(where: { $0.id == entry.id }) ?? 0
+            imageViewerContext = ImageViewerContext(entries: images, startIndex: idx)
+        }
+    }
+
+    private func playVideo(assetId: String, title: String, remotePath: String?) async {
+        errorText = ""
+        let resolvedId = assetId.isEmpty ? nil : assetId
+        guard let source = await model.playbackSource(assetId: resolvedId, remotePath: remotePath) else {
+            errorText = model.playbackError ?? "无法解析视频直链"
+            return
+        }
+        playingVideo = V2VideoPlayPayload(
+            url: source.url,
+            title: title,
+            assetId: assetId,
+            playlist: [VideoPlaylistItem(id: assetId.isEmpty ? (remotePath ?? title) : assetId, title: title, assetId: resolvedId, remotePath: remotePath)],
+            playlistIndex: 0,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: remotePath
+        )
+    }
+
+    private func openGallerySet(_ item: GallerySetV2) async {
+        guard let client = model.apiClient else { return }
+        if item.isArchive, let coverId = item.coverAssetId, !coverId.isEmpty {
+            archiveComic = ComicArchiveTarget(id: coverId, title: item.albumName)
+            return
+        }
+        openingGalleryId = item.id
+        errorText = ""
+        defer { openingGalleryId = nil }
+        do {
+            let assets = try await client.getGallerySetItems(setId: item.id)
+            let images = assets.filter(\.isImage)
+            if !images.isEmpty {
+                imageViewerContext = ImageViewerContext(entries: images.map { $0.toRemoteBrowserEntry() }, startIndex: 0)
+            } else if let archive = assets.first(where: \.isComicArchive) {
+                archiveComic = ComicArchiveTarget(id: archive.id, title: item.albumName)
+            }
+        } catch {
+            errorText = "打开图集失败：\(error.localizedDescription)"
         }
     }
 
     private func openComic(_ asset: LibraryAsset) async {
-        let lower = asset.fileName.lowercased()
-        if lower.hasSuffix(".cbz") || lower.hasSuffix(".zip") || lower.hasSuffix(".cbr") || lower.hasSuffix(".rar") {
+        if isComicArchiveName(asset.fileName) {
             archiveComic = ComicArchiveTarget(id: asset.id, title: asset.fileName)
             return
         }
@@ -333,79 +871,9 @@ struct HomeView: View {
         )
     }
 
-    /// Pull-to-refresh and the toolbar button share this single path: it checks
-    /// the provider first, then reloads the cached overview.
-    private func refreshAndCheckProvider() async {
-        guard let client = model.apiClient, !checking else { return }
-        checking = true
-        scanMessage = ""
-        do {
-            let outcomes = try await client.checkDomainRootsForUpdates()
-            scanMessage = outcomes.refreshNotice
-            await refresh()
-        } catch {
-            if !pmlIsCancellation(error) { errorText = error.localizedDescription }
-        }
-        checking = false
-    }
-
-    private func refresh(retryOnCancel: Bool = true) async {
-        guard let client = model.apiClient else { return }
-        loading = true
-        errorText = ""
-        do {
-            async let overviewTask = client.libraryOverview()
-            async let recentTask = client.libraryAssets(filter: "recent", limit: 14)
-            async let favoriteTask = client.favoriteCount()
-            async let authorsTask = client.listCreatorsV2(sort: "count")
-            async let comicsTask = client.libraryAssets(filter: "comics", limit: 16)
-            async let rootsTask = client.libraryRoots()
-            overview = try await overviewTask
-            recent = try await recentTask
-            favorites = try await favoriteTask
-            creatorsV2 = (try? await authorsTask) ?? []
-            comics = try await comicsTask
-            roots = try await rootsTask
-        } catch {
-            errorText = error.localizedDescription
-        }
-        loading = false
-    }
-
-    private func open(_ asset: LibraryAsset) async {
-        guard let source = await model.playbackSource(assetId: asset.id, remotePath: asset.remotePath) else { return }
-        preview = PreviewItem(
-            url: source.url,
-            isVideo: asset.mediaType == "video",
-            assetId: asset.id,
-            title: asset.fileName,
-            fallbackURL: source.fallbackURL,
-            sourceLabel: source.label,
-            remotePath: asset.remotePath
-        )
-    }
-
-    private func startScan() async {
-        guard let client = model.apiClient, !scanning else { return }
-        scanning = true
-        scanMessage = "开始扫描…"
-        defer { scanning = false }
-        do {
-            try await client.startScan()
-            scanMessage = "扫描中…"
-            for _ in 0..<900 {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let progress = try? await client.scanProgress() else { break }
-                scanMessage = "\(progress.message) \(Int(progress.percent))%"
-                if !progress.running {
-                    scanMessage = progress.error ?? "扫描完成：索引 \(progress.filesIndexed) 项"
-                    break
-                }
-            }
-            await refresh()
-        } catch {
-            scanMessage = error.localizedDescription
-        }
+    private func isComicArchiveName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        return lower.hasSuffix(".cbz") || lower.hasSuffix(".zip") || lower.hasSuffix(".cbr") || lower.hasSuffix(".rar") || lower.hasSuffix(".pdf")
     }
 }
 

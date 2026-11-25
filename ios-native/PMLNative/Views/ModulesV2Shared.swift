@@ -9,6 +9,8 @@ struct V2VideoPlayPayload: Identifiable {
     let assetId: String
     let playlist: [VideoPlaylistItem]
     let playlistIndex: Int?
+    let fallbackURL: URL?
+    let sourceLabel: String?
     let remotePath: String?
 }
 

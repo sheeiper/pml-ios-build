@@ -71,20 +71,28 @@ extension PMLAPIClient {
         return resp.subscribedIds ?? []
     }
 
-    /// 切换某个频道的订阅状态
-    func telegramToggleSubscription(chatId: Int64) async throws -> Bool {
-        let resp: TelegramToggleSubResponse = try await command("telegram_user_toggle_subscription", arguments: ["chat_id": chatId])
+    /// 切换某个频道的订阅状态（订阅时可直接指定 mode: chat / videos / downloads）
+    func telegramToggleSubscription(
+        chatId: Int64,
+        mode: String? = nil,
+        subscribe: Bool? = nil
+    ) async throws -> (isSubscribed: Bool, config: TelegramNativeChannelConfig?) {
+        var args: [String: Any] = ["chat_id": chatId]
+        if let mode { args["mode"] = mode }
+        if let subscribe { args["subscribe"] = subscribe }
+        let resp: TelegramToggleSubResponse = try await command("telegram_user_toggle_subscription", arguments: args)
         guard resp.ok else {
             throw APIError.server(resp.error ?? "切换订阅失败")
         }
-        return resp.isSubscribed ?? false
+        return (resp.isSubscribed ?? false, resp.config)
     }
 
-    /// 更新频道订阅过滤配置（视频、图片、离线下载链接、评论区穿透、防广告、防重复）
+    /// 更新频道订阅过滤配置（含绑定模式 mode）
     func telegramUpdateSubscriptionConfig(chatId: Int64, config: TelegramNativeChannelConfig) async throws -> TelegramNativeChannelConfig {
         let resp: TelegramUpdateConfigResponse = try await command("telegram_user_update_subscription", arguments: [
             "chat_id": chatId,
             "config": [
+                "mode": config.mode,
                 "show_videos": config.showVideos,
                 "show_photos": config.showPhotos,
                 "show_links": config.showLinks,
@@ -116,6 +124,7 @@ extension PMLAPIClient {
             "filter_duplicates": filterDuplicates
         ]
         if let config = config {
+            args["mode"] = config.mode
             args["show_videos"] = config.showVideos
             args["show_photos"] = config.showPhotos
             args["show_links"] = config.showLinks

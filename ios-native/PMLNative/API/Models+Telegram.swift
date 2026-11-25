@@ -15,6 +15,7 @@ public struct TelegramNativeFolder: Identifiable, Codable, Hashable {
 }
 
 public struct TelegramNativeChannelConfig: Codable, Hashable {
+    public var mode: String
     public var showVideos: Bool
     public var showPhotos: Bool
     public var showLinks: Bool
@@ -23,6 +24,7 @@ public struct TelegramNativeChannelConfig: Codable, Hashable {
     public var filterDuplicates: Bool
 
     public init(
+        mode: String = "chat",
         showVideos: Bool = true,
         showPhotos: Bool = true,
         showLinks: Bool = true,
@@ -30,6 +32,7 @@ public struct TelegramNativeChannelConfig: Codable, Hashable {
         filterAds: Bool = true,
         filterDuplicates: Bool = true
     ) {
+        self.mode = mode
         self.showVideos = showVideos
         self.showPhotos = showPhotos
         self.showLinks = showLinks
@@ -39,12 +42,24 @@ public struct TelegramNativeChannelConfig: Codable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case mode
         case showVideos = "show_videos"
         case showPhotos = "show_photos"
         case showLinks = "show_links"
         case penetrateComments = "penetrate_comments"
         case filterAds = "filter_ads"
         case filterDuplicates = "filter_duplicates"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mode = (try? c.decodeIfPresent(String.self, forKey: .mode)) ?? "chat"
+        showVideos = (try? c.decodeIfPresent(Bool.self, forKey: .showVideos)) ?? true
+        showPhotos = (try? c.decodeIfPresent(Bool.self, forKey: .showPhotos)) ?? true
+        showLinks = (try? c.decodeIfPresent(Bool.self, forKey: .showLinks)) ?? true
+        penetrateComments = (try? c.decodeIfPresent(Bool.self, forKey: .penetrateComments)) ?? true
+        filterAds = (try? c.decodeIfPresent(Bool.self, forKey: .filterAds)) ?? true
+        filterDuplicates = (try? c.decodeIfPresent(Bool.self, forKey: .filterDuplicates)) ?? true
     }
 }
 

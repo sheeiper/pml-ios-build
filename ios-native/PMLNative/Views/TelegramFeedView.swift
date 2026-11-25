@@ -23,15 +23,34 @@ struct TelegramFeedView: View {
     @State private var showChannelFilterSheet = false
     @State private var currentConfig = TelegramNativeChannelConfig()
     
-    // 浏览模式：对话框 (chat) | 视频流 (videos) | 下载区 (downloads)
+    // 浏览模式：由每个已订阅频道的配置决定，不在顶部频繁切换
     enum TelegramFeedMode: String, CaseIterable, Identifiable {
-        case chat = "对话框"
-        case videos = "视频流"
-        case downloads = "下载区"
+        case chat = "chat"
+        case videos = "videos"
+        case downloads = "downloads"
         var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .chat: return "对话框"
+            case .videos: return "视频流"
+            case .downloads: return "下载区"
+            }
+        }
+        var shortTitle: String {
+            switch self {
+            case .chat: return "对话"
+            case .videos: return "视频"
+            case .downloads: return "下载"
+            }
+        }
     }
 
-    @AppStorage("pml_tg_feed_mode") private var feedMode: TelegramFeedMode = .chat
+    private var activeFeedMode: TelegramFeedMode {
+        TelegramFeedMode(rawValue: selectedDialog?.config?.mode ?? "chat") ?? .chat
+    }
+
+    @State private var initialAnchorVersion = 0
+    @State private var pendingSubModes: [Int64: String] = [:]
     @State private var selectedDownloadMsgIds: Set<Int64> = []
     @State private var copiedLinksStore: Set<String> = {
         if let saved = UserDefaults.standard.stringArray(forKey: "pml_tg_copied_links") {
@@ -54,7 +73,18 @@ struct TelegramFeedView: View {
 
     struct ImageTarget: Identifiable {
         let id = UUID()
-        let url: URL
+        let urls: [URL]
+        let startIndex: Int
+
+        init(url: URL) {
+            self.urls = [url]
+            self.startIndex = 0
+        }
+
+        init(urls: [URL], startIndex: Int = 0) {
+            self.urls = urls
+            self.startIndex = min(max(0, startIndex), max(0, urls.count - 1))
+        }
     }
 
     var body: some View {
@@ -68,43 +98,27 @@ struct TelegramFeedView: View {
                 mainContentView
             }
         }
-        .navigationTitle("Telegram 订阅")
+        .navigationTitle(selectedDialog?.title ?? "Telegram 订阅")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if let dialog = selectedDialog {
-                    Button {
-                        Task {
-                            await markSelectedDialogAsRead()
-                        }
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "checkmark.circle")
-                            if let count = dialog.unreadCount, count > 0 {
-                                Text("\(count)")
-                                    .font(.caption2.bold())
-                            }
-                        }
-                    }
-                    .accessibilityLabel("一键已读")
-
-                    Button {
-                        if let cfg = selectedDialog?.config {
-                            currentConfig = cfg
-                        }
-                        showChannelFilterSheet = true
-                    } label: {
-                        Image(systemName: "slider.horizontal.3")
-                    }
-                    .accessibilityLabel("过滤设置")
-                }
-
+            ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    showAllDialogsSheet = true
+                    if let cfg = selectedDialog?.config {
+                        currentConfig = cfg
+                    }
+                    showChannelFilterSheet = true
                 } label: {
-                    Image(systemName: "list.star")
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "gearshape")
+                        if let count = selectedDialog?.unreadCount, count > 0 {
+                            Circle()
+                                .fill(Color.blue)
+                                .frame(width: 7, height: 7)
+                                .offset(x: 3, y: -2)
+                        }
+                    }
                 }
-                .accessibilityLabel("频道订阅管理")
+                .accessibilityLabel("频道设置")
             }
         }
         .overlay(alignment: .top) {
@@ -127,7 +141,7 @@ struct TelegramFeedView: View {
             )
         }
         .sheet(item: $activeImageTarget) { target in
-            TelegramZoomableImageViewer(url: target.url) {
+            TelegramZoomableImageViewer(urls: target.urls, startIndex: target.startIndex) {
                 activeImageTarget = nil
             }
         }
@@ -206,26 +220,12 @@ struct TelegramFeedView: View {
                 Divider()
             }
 
-            // 模式选择分段选择器 (对话框 / 视频流 / 下载区)
-            Picker("浏览模式", selection: $feedMode) {
-                ForEach(TelegramFeedMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(Color(uiColor: .systemBackground))
-            .overlay(alignment: .bottom) {
-                Divider()
-            }
-
-            // 内容视图区域
+            // 内容视图区域（模式由当前已订阅频道配置决定，需调整可点右上角设置）
             if loadingMessages && messages.isEmpty {
                 ProgressView("加载消息与资源...")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                switch feedMode {
+                switch activeFeedMode {
                 case .chat:
                     chatMessagesView
                 case .videos:
@@ -281,9 +281,6 @@ struct TelegramFeedView: View {
                                         .background(Color(uiColor: .secondarySystemBackground), in: Capsule())
                                     }
                                     .padding(.top, 4)
-                                    .onAppear {
-                                        Task { await loadOlderMessages() }
-                                    }
                                 }
                             }
 
@@ -323,16 +320,11 @@ struct TelegramFeedView: View {
                         .padding(.trailing, 20)
                         .padding(.bottom, 16)
                     }
-                    .onChange(of: selectedDialog?.id) { _ in
-                        scrollProxy.scrollTo("BOTTOM_MSG_ANCHOR", anchor: .bottom)
-                    }
-                    .onChange(of: messages.count) { _ in
-                        if !loadingOlder {
-                            scrollProxy.scrollTo("BOTTOM_MSG_ANCHOR", anchor: .bottom)
-                        }
+                    .onChange(of: initialAnchorVersion) { _, _ in
+                        anchorToFirstUnreadOrBottom(proxy: scrollProxy, hasUnread: firstUnreadMsgId != nil)
                     }
                     .onAppear {
-                        scrollProxy.scrollTo("BOTTOM_MSG_ANCHOR", anchor: .bottom)
+                        anchorToFirstUnreadOrBottom(proxy: scrollProxy, hasUnread: firstUnreadMsgId != nil)
                     }
                 }
             }
@@ -677,33 +669,62 @@ struct TelegramFeedView: View {
         .padding(24)
     }
 
-    // MARK: - 频道订阅管理弹窗
+    // MARK: - 频道订阅管理弹窗（订阅时直接指定模式，未订阅频道不在主列表显示）
 
     private var allDialogsManagementSheet: some View {
         NavigationStack {
             List {
-                Section("点击星标快速订阅至 iOS") {
+                Section("订阅频道并选择内容模式（未订阅频道不在主列表显示）") {
                     ForEach(dialogs) { d in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(d.title)
-                                    .font(.headline)
-                                    .lineLimit(1)
-                                if let user = d.username, !user.isEmpty {
-                                    Text("@\(user)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                        let currentMode = pendingSubModes[d.id] ?? d.config?.mode ?? "chat"
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(d.title)
+                                        .font(.headline)
+                                        .lineLimit(1)
+                                    if let user = d.username, !user.isEmpty {
+                                        Text("@\(user)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Button {
+                                    Task { await toggleSub(d, mode: currentMode) }
+                                } label: {
+                                    Text((d.isSubscribed == true) ? "已订阅" : "订阅")
+                                        .font(.caption.weight(.semibold))
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
+                                        .background((d.isSubscribed == true) ? Color.orange.opacity(0.16) : Color.accentColor, in: Capsule())
+                                        .foregroundStyle((d.isSubscribed == true) ? Color.orange : Color.white)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+
+                            HStack(spacing: 6) {
+                                Text("模式:")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                ForEach(TelegramFeedMode.allCases) { mode in
+                                    let active = currentMode == mode.rawValue
+                                    Button {
+                                        pendingSubModes[d.id] = mode.rawValue
+                                        if d.isSubscribed == true {
+                                            Task { await updateDialogModeQuick(d, mode: mode.rawValue) }
+                                        }
+                                    } label: {
+                                        Text(mode.shortTitle)
+                                            .font(.caption2.weight(active ? .bold : .regular))
+                                            .padding(.horizontal, 9)
+                                            .padding(.vertical, 4)
+                                            .background(active ? Color.accentColor : Color(uiColor: .secondarySystemFill), in: Capsule())
+                                            .foregroundStyle(active ? Color.white : Color.primary)
+                                    }
+                                    .buttonStyle(.borderless)
                                 }
                             }
-                            Spacer()
-                            Button {
-                                Task { await toggleSub(d) }
-                            } label: {
-                                Image(systemName: (d.isSubscribed == true) ? "star.fill" : "star")
-                                    .font(.title2)
-                                    .foregroundStyle((d.isSubscribed == true) ? .orange : .secondary)
-                            }
-                            .buttonStyle(.borderless)
                         }
                         .padding(.vertical, 4)
                     }
@@ -744,6 +765,48 @@ struct TelegramFeedView: View {
                         }
                         .padding(.vertical, 4)
                     }
+                }
+
+                Section("快捷操作") {
+                    if let d = selectedDialog {
+                        Button {
+                            showChannelFilterSheet = false
+                            Task { await markSelectedDialogAsRead() }
+                        } label: {
+                            Label(
+                                (d.unreadCount ?? 0) > 0 ? "一键标为已读 (\(d.unreadCount ?? 0))" : "标为已读",
+                                systemImage: "checkmark.circle"
+                            )
+                        }
+
+                        Button {
+                            showChannelFilterSheet = false
+                            Task { await loadMessages(chatId: d.id) }
+                        } label: {
+                            Label("刷新最新消息", systemImage: "arrow.clockwise")
+                        }
+                    }
+
+                    Button {
+                        showChannelFilterSheet = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            showAllDialogsSheet = true
+                        }
+                    } label: {
+                        Label("管理订阅频道", systemImage: "list.star")
+                    }
+                }
+
+                Section("频道内容模式（低频调整）") {
+                    Picker("浏览模式", selection: $currentConfig.mode) {
+                        ForEach(TelegramFeedMode.allCases) { mode in
+                            Text(mode.title).tag(mode.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("下载区会自动过滤视频封面，仅展示图片、可复制标题与下载链接。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("显示内容类型 (至少勾选一项)") {
@@ -890,10 +953,22 @@ struct TelegramFeedView: View {
             // Telegram API 默认返回从新到旧 [最新, 次新, ..., 较早]
             // 反转为时间正序：[较早, ..., 次新, 最新]，使最新内容呈现在最下方
             messages = msgs.reversed()
+            initialAnchorVersion += 1
         } catch {
             errorText = error.localizedDescription
         }
         loadingMessages = false
+    }
+
+    /// 进入频道后单次精准定位到「第一条未读」或最底部，避免画面上下乱跳。
+    private func anchorToFirstUnreadOrBottom(proxy: ScrollViewProxy, hasUnread: Bool) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            if hasUnread {
+                proxy.scrollTo("UNREAD_DIVIDER_ANCHOR", anchor: .top)
+            } else {
+                proxy.scrollTo("BOTTOM_MSG_ANCHOR", anchor: .bottom)
+            }
+        }
     }
 
     private func loadOlderMessages() async {
@@ -959,25 +1034,63 @@ struct TelegramFeedView: View {
         }
     }
 
-    private func toggleSub(_ dialog: TelegramNativeDialog) async {
+    private func toggleSub(_ dialog: TelegramNativeDialog, mode: String? = nil) async {
         guard let client = model.apiClient else { return }
         do {
-            let isSub = try await client.telegramToggleSubscription(chatId: dialog.id)
+            let result = try await client.telegramToggleSubscription(chatId: dialog.id, mode: mode)
             if let idx = dialogs.firstIndex(where: { $0.id == dialog.id }) {
-                dialogs[idx].isSubscribed = isSub
+                dialogs[idx].isSubscribed = result.isSubscribed
+                if let cfg = result.config {
+                    dialogs[idx].config = cfg
+                }
             }
             subscribedDialogs = dialogs.filter { $0.isSubscribed == true }
-            if isSub {
-                triggerToast("已订阅 \(dialog.title)")
+            if result.isSubscribed {
+                let mTitle = (TelegramFeedMode(rawValue: result.config?.mode ?? mode ?? "chat") ?? .chat).title
+                triggerToast("已订阅 \(dialog.title)（\(mTitle)）")
                 if selectedDialog == nil {
-                    selectedDialog = dialog
-                    await loadMessages(chatId: dialog.id)
+                    if let updated = subscribedDialogs.first(where: { $0.id == dialog.id }) {
+                        selectedDialog = updated
+                        currentConfig = updated.config ?? TelegramNativeChannelConfig()
+                        await loadMessages(chatId: updated.id)
+                    }
                 }
             } else {
                 triggerToast("已取消订阅")
+                if selectedDialog?.id == dialog.id {
+                    selectedDialog = subscribedDialogs.first
+                    if let next = selectedDialog {
+                        currentConfig = next.config ?? TelegramNativeChannelConfig()
+                        await loadMessages(chatId: next.id)
+                    } else {
+                        messages = []
+                    }
+                }
             }
         } catch {
             triggerToast("操作失败: \(error.localizedDescription)")
+        }
+    }
+
+    private func updateDialogModeQuick(_ dialog: TelegramNativeDialog, mode: String) async {
+        guard let client = model.apiClient else { return }
+        var cfg = dialog.config ?? TelegramNativeChannelConfig()
+        cfg.mode = mode
+        do {
+            let updated = try await client.telegramUpdateSubscriptionConfig(chatId: dialog.id, config: cfg)
+            if let idx = dialogs.firstIndex(where: { $0.id == dialog.id }) {
+                dialogs[idx].config = updated
+            }
+            subscribedDialogs = dialogs.filter { $0.isSubscribed == true }
+            if selectedDialog?.id == dialog.id {
+                selectedDialog?.config = updated
+                currentConfig = updated
+                await loadMessages(chatId: dialog.id)
+            }
+            let mTitle = (TelegramFeedMode(rawValue: mode) ?? .chat).title
+            triggerToast("已将「\(dialog.title)」设为\(mTitle)模式")
+        } catch {
+            triggerToast("更新模式失败: \(error.localizedDescription)")
         }
     }
 
@@ -1055,6 +1168,10 @@ struct TelegramFeedView: View {
         messages.filter { $0.isVideo == true || $0.video != nil || ($0.mediaList?.contains(where: { $0.isVideo == true }) ?? false) }
     }
 
+    private var firstUnreadVideoMsgId: Int64? {
+        videoMessages.first(where: { $0.isUnread == true })?.id
+    }
+
     private var videoStreamView: some View {
         VStack(spacing: 0) {
             if videoMessages.isEmpty {
@@ -1068,13 +1185,29 @@ struct TelegramFeedView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 14) {
-                        ForEach(videoMessages) { msg in
-                            videoStreamCard(msg)
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        LazyVStack(spacing: 14) {
+                            ForEach(videoMessages) { msg in
+                                if msg.id == firstUnreadVideoMsgId {
+                                    unreadDividerView
+                                        .id("UNREAD_DIVIDER_ANCHOR")
+                                }
+                                videoStreamCard(msg)
+                                    .id(msg.id)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("BOTTOM_MSG_ANCHOR")
                         }
+                        .padding(16)
                     }
-                    .padding(16)
+                    .onChange(of: initialAnchorVersion) { _, _ in
+                        anchorToFirstUnreadOrBottom(proxy: scrollProxy, hasUnread: firstUnreadVideoMsgId != nil)
+                    }
+                    .onAppear {
+                        anchorToFirstUnreadOrBottom(proxy: scrollProxy, hasUnread: firstUnreadVideoMsgId != nil)
+                    }
                 }
             }
         }
@@ -1082,11 +1215,24 @@ struct TelegramFeedView: View {
 
     private func videoStreamCard(_ msg: TelegramNativeMessage) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            HStack(spacing: 6) {
+                if msg.isUnread == true {
+                    Circle()
+                        .fill(Color.blue)
+                        .frame(width: 8, height: 8)
+                }
                 Text(getMessageFirstLine(msg.text))
                     .font(.subheadline.bold())
                     .lineLimit(1)
                 Spacer()
+                if msg.isUnread == true {
+                    Text("未读")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.blue)
+                }
                 if let d = msg.date {
                     Text(formatDate(d))
                         .font(.caption2)
@@ -1263,6 +1409,29 @@ struct TelegramFeedView: View {
         return result
     }
 
+    private var firstUnreadDownloadMsgId: Int64? {
+        downloadableMessages.first(where: { $0.isUnread == true })?.id
+    }
+
+    /// 下载区只抓图片，自动过滤视频（不抓取、不显示视频封面）。
+    private func downloadPhotoURLs(for msg: TelegramNativeMessage) -> [URL] {
+        guard let chatId = selectedDialog?.id, let client = model.apiClient else { return [] }
+        var result: [URL] = []
+        if let list = msg.mediaList, !list.isEmpty {
+            for item in list where item.hasPhoto == true && item.isVideo != true {
+                if let u = client.telegramUserThumbURL(chatId: chatId, messageId: item.id) {
+                    result.append(u)
+                }
+            }
+        }
+        if result.isEmpty && msg.hasPhoto == true && msg.isVideo != true {
+            if let u = client.telegramUserThumbURL(chatId: chatId, messageId: msg.id) {
+                result.append(u)
+            }
+        }
+        return result
+    }
+
     private var downloadsHubView: some View {
         VStack(spacing: 0) {
             // 顶部批量操作栏
@@ -1321,13 +1490,29 @@ struct TelegramFeedView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 12) {
-                        ForEach(downloadableMessages) { msg in
-                            downloadCard(msg)
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            ForEach(downloadableMessages) { msg in
+                                if msg.id == firstUnreadDownloadMsgId {
+                                    unreadDividerView
+                                        .id("UNREAD_DIVIDER_ANCHOR")
+                                }
+                                downloadCard(msg)
+                                    .id(msg.id)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("BOTTOM_MSG_ANCHOR")
                         }
+                        .padding(16)
                     }
-                    .padding(16)
+                    .onChange(of: initialAnchorVersion) { _, _ in
+                        anchorToFirstUnreadOrBottom(proxy: scrollProxy, hasUnread: firstUnreadDownloadMsgId != nil)
+                    }
+                    .onAppear {
+                        anchorToFirstUnreadOrBottom(proxy: scrollProxy, hasUnread: firstUnreadDownloadMsgId != nil)
+                    }
                 }
             }
         }
@@ -1336,6 +1521,8 @@ struct TelegramFeedView: View {
     private func downloadCard(_ msg: TelegramNativeMessage) -> some View {
         let isSelected = selectedDownloadMsgIds.contains(msg.id)
         let links = extractOfflineLinks(from: msg)
+        let photoURLs = downloadPhotoURLs(for: msg)
+        let firstLineTitle = getMessageFirstLine(msg.text)
         return HStack(alignment: .top, spacing: 12) {
             // 选择复选框
             Button {
@@ -1348,53 +1535,104 @@ struct TelegramFeedView: View {
             .padding(.top, 4)
 
             VStack(alignment: .leading, spacing: 10) {
-                // 1. 文字标题：严格只显示第一行内容
-                HStack {
-                    Text(getMessageFirstLine(msg.text))
+                // 1. 文字标题：支持选中复制 + 一键复制标题按钮 + 未读标记
+                HStack(alignment: .center, spacing: 6) {
+                    if msg.isUnread == true {
+                        Circle()
+                            .fill(Color.blue)
+                            .frame(width: 8, height: 8)
+                    }
+                    Text(firstLineTitle)
                         .font(.subheadline.bold())
                         .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Spacer()
-                    if let d = msg.date {
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 4)
+                    Button {
+                        UIPasteboard.general.string = firstLineTitle
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        triggerToast("已复制标题")
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 10))
+                            Text("复制标题")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(Color(uiColor: .secondarySystemFill), in: Capsule())
+                        .foregroundStyle(.primary)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if let d = msg.date {
+                    HStack(spacing: 6) {
+                        if msg.isUnread == true {
+                            Text("未读")
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(Color.blue.opacity(0.15), in: Capsule())
+                                .foregroundStyle(.blue)
+                        }
                         Text(formatDate(d))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
 
-                HStack(alignment: .top, spacing: 10) {
-                    // 2. 图片参考 (点击可缩放放大预览)
-                    if let chatId = selectedDialog?.id,
-                       let thumbURL = model.apiClient?.telegramUserThumbURL(chatId: chatId, messageId: msg.id) {
-                        Button {
-                            activeImageTarget = ImageTarget(url: thumbURL)
-                        } label: {
-                            ZStack(alignment: .bottomTrailing) {
-                                AsyncImage(url: thumbURL) { phase in
-                                    switch phase {
-                                    case .success(let img):
-                                        img.resizable().scaledToFill()
-                                    case .failure:
-                                        Color(uiColor: .secondarySystemBackground)
-                                            .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
-                                    default:
-                                        ProgressView().controlSize(.small)
+                // 2. 纯图片参考（过滤视频，多图支持点击缩放与左右滑动）
+                if !photoURLs.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(Array(photoURLs.prefix(6).enumerated()), id: \.offset) { idx, thumbURL in
+                                Button {
+                                    activeImageTarget = ImageTarget(urls: photoURLs, startIndex: idx)
+                                } label: {
+                                    ZStack(alignment: .bottomTrailing) {
+                                        AsyncImage(url: thumbURL) { phase in
+                                            switch phase {
+                                            case .success(let img):
+                                                img.resizable().scaledToFill()
+                                            case .failure:
+                                                Color(uiColor: .secondarySystemBackground)
+                                                    .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                                            default:
+                                                Color(uiColor: .secondarySystemBackground)
+                                                    .overlay(ProgressView().controlSize(.small))
+                                            }
+                                        }
+                                        .frame(width: 82, height: 82)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                                        if idx == 5 && photoURLs.count > 6 {
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .fill(Color.black.opacity(0.55))
+                                                .frame(width: 82, height: 82)
+                                                .overlay(
+                                                    Text("+\(photoURLs.count - 6)")
+                                                        .font(.subheadline.bold())
+                                                        .foregroundStyle(.white)
+                                                )
+                                        } else {
+                                            Image(systemName: "plus.magnifyingglass")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .foregroundStyle(.white)
+                                                .padding(3)
+                                                .background(.black.opacity(0.6), in: Circle())
+                                                .padding(3)
+                                        }
                                     }
                                 }
-                                .frame(width: 80, height: 60)
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
-
-                                Image(systemName: "plus.magnifyingglass")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .foregroundStyle(.white)
-                                    .padding(3)
-                                    .background(.black.opacity(0.6), in: Circle())
-                                    .padding(2)
+                                .buttonStyle(.plain)
                             }
                         }
-                        .buttonStyle(.plain)
                     }
+                }
 
+                HStack(alignment: .top, spacing: 10) {
                     // 3. 下载链接展示
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(Array(links.enumerated()), id: \.offset) { _, lk in
@@ -1762,99 +2000,42 @@ struct TelegramCommentsSheet: View {
 }
 
 
-// MARK: - 原生手势缩放图片查看器 (双击放大 / 捏合缩放 / 拖拽平移)
+// MARK: - 原生手势缩放多图查看器 (左右滑动切换 / 双击放大 / 捏合缩放 / 拖拽平移)
 
 struct TelegramZoomableImageViewer: View {
-    let url: URL
+    let urls: [URL]
     let onClose: () -> Void
 
-    @State private var scale: CGFloat = 1.0
-    @State private var lastScale: CGFloat = 1.0
-    @State private var offset: CGSize = .zero
-    @State private var lastOffset: CGSize = .zero
+    @State private var currentIndex: Int
+
+    init(urls: [URL], startIndex: Int = 0, onClose: @escaping () -> Void) {
+        self.urls = urls
+        self.onClose = onClose
+        let clamped = min(max(0, startIndex), max(0, urls.count - 1))
+        _currentIndex = State(initialValue: clamped)
+    }
+
+    init(url: URL, onClose: @escaping () -> Void) {
+        self.init(urls: [url], startIndex: 0, onClose: onClose)
+    }
 
     var body: some View {
         NavigationStack {
-            GeometryReader { geo in
-                ZStack {
-                    Color.black.ignoresSafeArea()
-
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image
-                                .resizable()
-                                .scaledToFit()
-                                .scaleEffect(scale)
-                                .offset(offset)
-                                .gesture(
-                                    MagnificationGesture()
-                                        .onChanged { value in
-                                            let delta = value / lastScale
-                                            lastScale = value
-                                            scale = min(max(scale * delta, 1.0), 5.0)
-                                        }
-                                        .onEnded { _ in
-                                            lastScale = 1.0
-                                            if scale < 1.0 {
-                                                withAnimation(.spring()) {
-                                                    scale = 1.0
-                                                    offset = .zero
-                                                    lastOffset = .zero
-                                                }
-                                            }
-                                        }
-                                        .simultaneously(with:
-                                            DragGesture()
-                                                .onChanged { value in
-                                                    if scale > 1.0 {
-                                                        offset = CGSize(
-                                                            width: lastOffset.width + value.translation.width,
-                                                            height: lastOffset.height + value.translation.height
-                                                        )
-                                                    }
-                                                }
-                                                .onEnded { _ in
-                                                    if scale > 1.0 {
-                                                        lastOffset = offset
-                                                    } else {
-                                                        withAnimation(.spring()) {
-                                                            offset = .zero
-                                                            lastOffset = .zero
-                                                        }
-                                                    }
-                                                }
-                                        )
-                                )
-                                .onTapGesture(count: 2) {
-                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                        if scale > 1.2 {
-                                            scale = 1.0
-                                            offset = .zero
-                                            lastOffset = .zero
-                                        } else {
-                                            scale = 2.5
-                                        }
-                                    }
-                                }
-                        case .failure:
-                            VStack(spacing: 8) {
-                                Image(systemName: "photo")
-                                    .font(.system(size: 40))
-                                    .foregroundStyle(.white.opacity(0.6))
-                                Text("图片加载失败")
-                                    .font(.caption)
-                                    .foregroundStyle(.white.opacity(0.6))
-                            }
-                        default:
-                            ProgressView()
-                                .tint(.white)
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if urls.count > 1 {
+                    TabView(selection: $currentIndex) {
+                        ForEach(Array(urls.enumerated()), id: \.offset) { idx, itemURL in
+                            TelegramZoomableSinglePage(url: itemURL)
+                                .tag(idx)
                         }
                     }
-                    .frame(width: geo.size.width, height: geo.size.height)
+                    .tabViewStyle(.page(indexDisplayMode: .automatic))
+                } else if let first = urls.first {
+                    TelegramZoomableSinglePage(url: first)
                 }
             }
-            .navigationTitle("图片预览")
+            .navigationTitle(urls.count > 1 ? "图片预览 (\(currentIndex + 1)/\(urls.count))" : "图片预览")
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.black, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
@@ -1866,14 +2047,106 @@ struct TelegramZoomableImageViewer: View {
                     .foregroundStyle(.white)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        UIPasteboard.general.string = url.absoluteString
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                            .foregroundStyle(.white)
+                    if urls.indices.contains(currentIndex) {
+                        Button {
+                            UIPasteboard.general.string = urls[currentIndex].absoluteString
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .foregroundStyle(.white)
+                        }
+                        .accessibilityLabel("复制图片链接")
                     }
-                    .accessibilityLabel("复制图片链接")
                 }
+            }
+        }
+    }
+}
+
+private struct TelegramZoomableSinglePage: View {
+    let url: URL
+
+    @State private var scale: CGFloat = 1.0
+    @State private var lastScale: CGFloat = 1.0
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                Color.black
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFit()
+                            .scaleEffect(scale)
+                            .offset(offset)
+                            .gesture(
+                                MagnificationGesture()
+                                    .onChanged { value in
+                                        let delta = value / lastScale
+                                        lastScale = value
+                                        scale = min(max(scale * delta, 1.0), 5.0)
+                                    }
+                                    .onEnded { _ in
+                                        lastScale = 1.0
+                                        if scale <= 1.02 {
+                                            withAnimation(.spring()) {
+                                                scale = 1.0
+                                                offset = .zero
+                                                lastOffset = .zero
+                                            }
+                                        }
+                                    }
+                                    .simultaneously(with:
+                                        DragGesture(minimumDistance: scale > 1.05 ? 4 : 1000)
+                                            .onChanged { value in
+                                                if scale > 1.05 {
+                                                    offset = CGSize(
+                                                        width: lastOffset.width + value.translation.width,
+                                                        height: lastOffset.height + value.translation.height
+                                                    )
+                                                }
+                                            }
+                                            .onEnded { _ in
+                                                if scale > 1.05 {
+                                                    lastOffset = offset
+                                                } else {
+                                                    withAnimation(.spring()) {
+                                                        offset = .zero
+                                                        lastOffset = .zero
+                                                    }
+                                                }
+                                            }
+                                    )
+                            )
+                            .onTapGesture(count: 2) {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    if scale > 1.2 {
+                                        scale = 1.0
+                                        offset = .zero
+                                        lastOffset = .zero
+                                    } else {
+                                        scale = 2.5
+                                    }
+                                }
+                            }
+                    case .failure:
+                        VStack(spacing: 8) {
+                            Image(systemName: "photo")
+                                .font(.system(size: 40))
+                                .foregroundStyle(.white.opacity(0.6))
+                            Text("图片加载失败")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.6))
+                        }
+                    default:
+                        ProgressView()
+                            .tint(.white)
+                    }
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
             }
         }
     }

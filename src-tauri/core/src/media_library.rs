@@ -7157,18 +7157,18 @@ async fn serve_video_thumbnail(
 
     // 3. For remote video / HEIC: extract with a responsive concurrency limiter
     // Generates thumbnails on demand with robust timeouts for remote drives.
-    // If active video streaming is currently occurring, yield immediately to prioritize streaming bandwidth!
+    // If active video streaming is currently occurring, yield briefly to prioritize initial playback burst.
     if let Some(ref tracker) = source.activity_tracker {
         let last_act = tracker.load(std::sync::atomic::Ordering::Relaxed);
-        if last_act > 0 && now().saturating_sub(last_act as i64) < 15 {
+        if last_act > 0 && now().saturating_sub(last_act as i64) < 4 {
             return write_proxy_error(stream, 503, "Yielding to Active Media Stream").await;
         }
     }
 
     static THUMBNAIL_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    let semaphore = THUMBNAIL_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(2));
+    let semaphore = THUMBNAIL_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(4));
 
-    let Ok(_permit) = tokio::time::timeout(std::time::Duration::from_secs(35), semaphore.acquire()).await else {
+    let Ok(_permit) = tokio::time::timeout(std::time::Duration::from_secs(45), semaphore.acquire()).await else {
         return write_proxy_error(stream, 503, "Thumbnail Generation Queue Busy").await;
     };
 
