@@ -205,6 +205,15 @@ pub(crate) fn ensure_module_schema(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_gallery_items_set
             ON gallery_items(set_id, sort_order);
+
+        CREATE TABLE IF NOT EXISTS entity_favorites (
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(entity_type, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_entity_favorites_type_time
+            ON entity_favorites(entity_type, created_at DESC);
         "#,
     )
     .map_err(|e| format!("初始化多模块表结构失败：{e}"))?;
@@ -1382,15 +1391,113 @@ fn load_creators_summary_map(
     Ok(out)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityFavoriteIds {
+    pub movies: Vec<String>,
+    pub performers: Vec<String>,
+    pub creators: Vec<String>,
+}
+
+pub(crate) fn ensure_entity_favorites_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entity_favorites (
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(entity_type, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_entity_favorites_type_time
+            ON entity_favorites(entity_type, created_at DESC);",
+    )
+}
+
+pub fn toggle_entity_favorite(
+    app: &AppHandle,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<bool, String> {
+    let kind = entity_type.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "movie" | "performer" | "creator") {
+        return Err(format!("不支持的收藏类型：{entity_type}"));
+    }
+    let eid = entity_id.trim();
+    if eid.is_empty() {
+        return Err("缺少 entityId".into());
+    }
+    four_domains::ensure_v2(app)?;
+    let conn = four_domains::open_v2(app)?;
+    ensure_entity_favorites_table(&conn).map_err(|e| e.to_string())?;
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM entity_favorites WHERE entity_type=?1 AND entity_id=?2",
+            params![kind, eid],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if existing.is_some() {
+        conn.execute(
+            "DELETE FROM entity_favorites WHERE entity_type=?1 AND entity_id=?2",
+            params![kind, eid],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(false)
+    } else {
+        conn.execute(
+            "INSERT OR REPLACE INTO entity_favorites(entity_type, entity_id, created_at) VALUES(?1, ?2, ?3)",
+            params![kind, eid, now()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+}
+
+pub fn list_entity_favorite_ids(app: &AppHandle) -> Result<EntityFavoriteIds, String> {
+    four_domains::ensure_v2(app)?;
+    let conn = four_domains::open_v2(app)?;
+    ensure_entity_favorites_table(&conn).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT entity_type, entity_id FROM entity_favorites ORDER BY created_at DESC, entity_id ASC")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    let mut result = EntityFavoriteIds::default();
+    for row in rows.flatten() {
+        match row.0.as_str() {
+            "movie" => result.movies.push(row.1),
+            "performer" => result.performers.push(row.1),
+            "creator" => result.creators.push(row.1),
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
 pub fn list_creators_v2(
     app: &AppHandle,
     studio: Option<&str>,
     query: Option<&str>,
     sort: Option<&str>,
+    only_favorites: bool,
 ) -> Result<Vec<CreatorSummaryV2>, String> {
     four_domains::ensure_v2(app)?;
     let conn = four_domains::open_v2(app)?;
     let mut creators = load_creators_summary_map(&conn, None)?;
+
+    if only_favorites {
+        ensure_entity_favorites_table(&conn).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT entity_id FROM entity_favorites WHERE entity_type='creator'")
+            .map_err(|e| e.to_string())?;
+        let fav_ids: HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        creators.retain(|c| fav_ids.contains(&c.id));
+    }
 
     if let Some(st) = studio.map(str::trim).filter(|s| !s.is_empty() && *s != "all") {
         creators.retain(|c| c.studio_counts.contains_key(st));

@@ -4,6 +4,7 @@ import UIKit
 
 struct MoviePerformerDetailSheet: View {
     @EnvironmentObject private var model: AppModel
+    @ObservedObject private var favs = EntityFavoritesStore.shared
     @Environment(\.dismiss) private var dismiss
     let performer: MoviePerformer
     var onBack: (() -> Void)? = nil
@@ -173,13 +174,23 @@ struct MoviePerformerDetailSheet: View {
                             .font(.body.weight(.medium))
                         }
                     }
-                } else {
-                    ToolbarItem(placement: .topBarTrailing) {
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    let targetId = detail?.person.id ?? performer.id
+                    let isFav = favs.isPerformerFav(targetId)
+                    Button {
+                        Task { await favs.toggle(client: model.apiClient, type: .performer, id: targetId) }
+                    } label: {
+                        Image(systemName: isFav ? "heart.fill" : "heart")
+                            .foregroundStyle(isFav ? .pink : .secondary)
+                    }
+                    if onBack == nil {
                         Button("完成") { dismiss() }
                     }
                 }
             }
             .task {
+                await favs.ensureLoaded(client: model.apiClient)
                 await load()
             }
             .sheet(isPresented: $showEditor) {

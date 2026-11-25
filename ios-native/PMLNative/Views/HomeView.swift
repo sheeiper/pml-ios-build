@@ -757,7 +757,14 @@ struct HomeView: View {
         modules = (try? await modulesReq) ?? []
         roots = (try? await rootsReq) ?? []
         featuredMovies = (try? await moviesReq) ?? []
-        creatorsV2 = (try? await creatorsReq) ?? []
+        await EntityFavoritesStore.shared.ensureLoaded(client: client)
+        let loadedCreators = (try? await creatorsReq) ?? []
+        creatorsV2 = loadedCreators.sorted {
+            let aFav = EntityFavoritesStore.shared.isFavorited(.creator, id: $0.id)
+            let bFav = EntityFavoritesStore.shared.isFavorited(.creator, id: $1.id)
+            if aFav != bFav { return aFav }
+            return false
+        }
         featuredCollections = (try? await collectionsReq)?.albums ?? []
         featuredGalleries = (try? await galleriesReq)?.sets ?? []
         comics = (try? await comicsReq) ?? []

@@ -23,9 +23,11 @@ private enum CreatorSortV2: String, CaseIterable, Identifiable {
 /// 创作者 V2 大厅：21 个工作室横向胶囊筛选 + 搜索姓名/别名 + 单模块独立同步 + 建议合并管理。
 struct AuthorsView: View {
     @EnvironmentObject private var model: AppModel
+    @ObservedObject private var favs = EntityFavoritesStore.shared
 
     @State private var studios: [CreatorStudioStat] = []
     @State private var selectedStudio: String? = nil
+    @State private var onlyFavorites = false
     @State private var creators: [CreatorSummaryV2] = []
     @State private var mergeSuggestions: [CreatorMergeSuggestion] = []
     @State private var searchText = ""
@@ -177,10 +179,20 @@ struct AuthorsView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 V2FilterPill(
+                    title: "❤️ 已收藏",
+                    count: Int64(favs.creators.count),
+                    isSelected: onlyFavorites
+                ) {
+                    onlyFavorites.toggle()
+                    Task { await loadCreatorsOnly() }
+                }
+
+                V2FilterPill(
                     title: "全部",
                     count: studios.isEmpty ? nil : Int64(creators.count),
-                    isSelected: selectedStudio == nil
+                    isSelected: !onlyFavorites && selectedStudio == nil
                 ) {
+                    onlyFavorites = false
                     selectedStudio = nil
                 }
 
@@ -204,11 +216,13 @@ struct AuthorsView: View {
         errorText = ""
         defer { loading = false }
         do {
+            await favs.ensureLoaded(client: client)
             async let studioReq = client.listCreatorStudios()
             async let creatorReq = client.listCreatorsV2(
                 studio: selectedStudio,
                 query: searchText.trimmingCharacters(in: .whitespacesAndNewlines),
-                sort: sortMode.apiValue
+                sort: sortMode.apiValue,
+                onlyFavorites: onlyFavorites
             )
             let (loadedStudios, loadedCreators) = try await (studioReq, creatorReq)
             studios = loadedStudios
@@ -230,7 +244,8 @@ struct AuthorsView: View {
             creators = try await client.listCreatorsV2(
                 studio: selectedStudio,
                 query: searchText.trimmingCharacters(in: .whitespacesAndNewlines),
-                sort: sortMode.apiValue
+                sort: sortMode.apiValue,
+                onlyFavorites: onlyFavorites
             )
         } catch {
             errorText = error.localizedDescription
@@ -258,8 +273,10 @@ struct AuthorsView: View {
 private struct CreatorCardV2View: View {
     let creator: CreatorSummaryV2
     let client: PMLAPIClient?
+    @ObservedObject private var favs = EntityFavoritesStore.shared
 
     var body: some View {
+        let isFav = favs.isFavorited(.creator, id: creator.id)
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .bottomLeading) {
                 CachedImageView(
@@ -277,6 +294,24 @@ private struct CreatorCardV2View: View {
                     startPoint: .center,
                     endPoint: .bottom
                 )
+
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button {
+                            Task { await favs.toggle(.creator, id: creator.id, client: client) }
+                        } label: {
+                            Image(systemName: isFav ? "heart.fill" : "heart")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(isFav ? Color.red : Color.white)
+                                .frame(width: 28, height: 28)
+                                .background(Color.black.opacity(0.45), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Spacer()
+                }
+                .padding(7)
 
                 HStack(spacing: 8) {
                     avatarCircle
@@ -351,6 +386,7 @@ struct AuthorProfileView: View {
     let initialCreator: CreatorSummaryV2?
 
     @EnvironmentObject private var model: AppModel
+    @ObservedObject private var favs = EntityFavoritesStore.shared
     @State private var creator: CreatorSummaryV2?
     @State private var selectedStudio: String? = nil
     @State private var page: FolderBrowsePage?
@@ -460,7 +496,16 @@ struct AuthorProfileView: View {
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await loadFolder() }
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                let isFav = favs.isFavorited(.creator, id: authorId)
+                Button {
+                    Task { await favs.toggle(.creator, id: authorId, client: model.apiClient) }
+                } label: {
+                    Image(systemName: isFav ? "heart.fill" : "heart")
+                        .foregroundStyle(isFav ? .red : .primary)
+                }
+                .accessibilityLabel(isFav ? "取消收藏创作者" : "收藏创作者")
+
                 Button {
                     showEditSheet = true
                 } label: {

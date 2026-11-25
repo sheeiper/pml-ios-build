@@ -2024,12 +2024,22 @@ fn escape_like_pattern(value: &str) -> String {
 }
 
 pub fn query_movie_library(conn: &Connection, query: &str, maker: &str, actor: &str, sort: &str, limit: u32, offset: u32) -> Result<MovieLibraryPage, rusqlite::Error> {
+    query_movie_library_filtered(conn, query, maker, actor, sort, limit, offset, false)
+}
+
+pub fn query_movie_library_filtered(conn: &Connection, query: &str, maker: &str, actor: &str, sort: &str, limit: u32, offset: u32, only_favorites: bool) -> Result<MovieLibraryPage, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
+    if only_favorites {
+        crate::library_modules::ensure_entity_favorites_table(conn)?;
+    }
     // Keep performer candidates synchronized before any read. Errors are wrapped
     // as rusqlite conversion failures so the public API remains DB-compatible.
     crate::performers::sync_performers(conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))))?;
     let verified_where = " WHERE verification_version = 1 AND source NOT IN ('javdb_not_found','not_found','') AND cover_url IS NOT NULL AND cover_url != ''";
     let mut where_sql = verified_where.to_string();
+    if only_favorites {
+        where_sql.push_str(" AND EXISTS (SELECT 1 FROM entity_favorites ef WHERE ef.entity_type = 'movie' AND ef.entity_id = movie_metadata.number)");
+    }
     let q = query.trim();
     let m = maker.trim();
     let a = actor.trim();

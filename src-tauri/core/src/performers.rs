@@ -307,6 +307,7 @@ pub struct PerformerFilterQuery {
     pub height_range: String,
     pub cup: String,
     pub profile_filter: String,
+    pub only_favorites: bool,
     pub limit: u32,
     pub offset: u32,
 }
@@ -345,6 +346,14 @@ pub fn list_performers_filtered(conn: &Connection, fq: &PerformerFilterQuery) ->
     let mut clauses: Vec<String> = vec![
         "(?1='' OR instr(lower(p.name),lower(?1))>0 OR EXISTS(SELECT 1 FROM json_each(p.aliases_json) a WHERE instr(lower(a.value),lower(?1))>0))".to_string()
     ];
+
+    if fq.only_favorites {
+        crate::library_modules::ensure_entity_favorites_table(conn)?;
+        clauses.push(
+            "EXISTS (SELECT 1 FROM entity_favorites ef WHERE ef.entity_type = 'performer' AND ef.entity_id = p.id)"
+                .to_string(),
+        );
+    }
 
     if let Some(min_m) = fq.min_movies {
         if min_m > 0 {

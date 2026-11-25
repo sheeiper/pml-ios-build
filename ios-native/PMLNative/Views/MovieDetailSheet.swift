@@ -3,6 +3,7 @@ import SwiftUI
 public struct MovieDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var appModel: AppModel
+    @ObservedObject private var favs = EntityFavoritesStore.shared
 
     public let number: String?
     public let assetId: String?
@@ -423,9 +424,22 @@ public struct MovieDetailSheet: View {
         .navigationTitle(metadata?.number ?? "影视百科详情")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if let favNumber = metadata?.number ?? currentNumber ?? number, !favNumber.isEmpty {
+                        let isFav = favs.isFavorited(.movie, id: favNumber)
+                        Button {
+                            Task { await favs.toggle(.movie, id: favNumber, client: appModel.apiClient) }
+                        } label: {
+                            Image(systemName: isFav ? "heart.fill" : "heart")
+                                .foregroundStyle(isFav ? .red : .primary)
+                        }
+                        .accessibilityLabel(isFav ? "取消收藏影片" : "收藏影片")
+                    }
                     Button("完成") { dismiss() }
                 }
+            }
+            .task {
+                await favs.ensureLoaded(client: appModel.apiClient)
             }
             .sheet(item: $selectedPerformer) { person in
                 MoviePerformerDetailSheet(

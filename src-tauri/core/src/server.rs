@@ -700,10 +700,27 @@ async fn dispatch_command(
             let app = app.clone();
             blocking_result_response(move || crate::library_modules::list_creator_studios(&app)).await
         }
+        "toggle_entity_favorite" => {
+            let entity_type = payload.get("entityType").and_then(Value::as_str).unwrap_or("").to_owned();
+            let entity_id = payload.get("entityId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::toggle_entity_favorite(&app, &entity_type, &entity_id)
+            })
+            .await
+        }
+        "list_entity_favorite_ids" => {
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::list_entity_favorite_ids(&app)
+            })
+            .await
+        }
         "list_creators_v2" => {
             let studio = payload.get("studio").and_then(Value::as_str).map(str::to_owned);
             let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
             let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let only_favorites = payload.get("onlyFavorites").and_then(Value::as_bool).unwrap_or(false);
             let app = app.clone();
             blocking_result_response(move || {
                 crate::library_modules::list_creators_v2(
@@ -711,6 +728,7 @@ async fn dispatch_command(
                     studio.as_deref(),
                     query.as_deref(),
                     sort.as_deref(),
+                    only_favorites,
                 )
             })
             .await
@@ -1122,13 +1140,14 @@ async fn dispatch_command(
             let actor = payload.get("actor").and_then(Value::as_str).unwrap_or("").to_owned();
             let sort = payload.get("sort").and_then(Value::as_str).unwrap_or("date").to_owned();
             let category = payload.get("category").and_then(Value::as_str).unwrap_or("").to_owned();
+            let only_favorites = payload.get("onlyFavorites").and_then(Value::as_bool).unwrap_or(false);
             let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 100) as u32;
             let offset = payload.get("offset").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32;
             let app = app.clone();
             blocking_result_response(move || {
                 let conn = four_domains::open_v2(&app)?;
                 match operation.as_str() {
-                    "query_movie_library" => serde_json::to_value(crate::jav_scraper::query_movie_library(&conn, &query, &maker, &actor, &sort, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
+                    "query_movie_library" => serde_json::to_value(crate::jav_scraper::query_movie_library_filtered(&conn, &query, &maker, &actor, &sort, limit, offset, only_favorites).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
                     "list_scrape_issues" => serde_json::to_value(crate::jav_scraper::list_scrape_issues(&conn, &category, &query, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
                     _ => serde_json::to_value(crate::jav_scraper::list_unrecognized_videos(&conn, limit, offset).map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
                 }
@@ -1143,6 +1162,7 @@ async fn dispatch_command(
                 height_range: payload.get("heightRange").and_then(Value::as_str).unwrap_or("").to_owned(),
                 cup: payload.get("cup").and_then(Value::as_str).unwrap_or("").to_owned(),
                 profile_filter: payload.get("profileFilter").and_then(Value::as_str).unwrap_or("").to_owned(),
+                only_favorites: payload.get("onlyFavorites").and_then(Value::as_bool).unwrap_or(false),
                 limit: payload.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 100) as u32,
                 offset: payload.get("offset").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
             };

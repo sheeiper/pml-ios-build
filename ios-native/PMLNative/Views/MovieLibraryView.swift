@@ -3,6 +3,7 @@ import SwiftUI
 /// Server-backed movie library. Search, facets, sorting and pagination are never performed locally.
 public struct MovieLibraryView: View {
     @EnvironmentObject private var model: AppModel
+    @ObservedObject private var favs = EntityFavoritesStore.shared
     @State private var pageItems: [MovieMetadata] = []
     @State private var total = 0
     @State private var makers: [String] = []
@@ -21,6 +22,8 @@ public struct MovieLibraryView: View {
     @State private var issueCategory = ""
     @State private var selectedMaker = ""
     @State private var selectedActor = ""
+    @State private var onlyFavMovies = false
+    @State private var onlyFavPerformers = false
     @State private var sort = "release_date_desc"
     @State private var performerSort = "latest_release"
     @State private var performerAgeRange = ""
@@ -58,7 +61,7 @@ public struct MovieLibraryView: View {
     public init() {}
 
     private var hasActiveFilters: Bool {
-        !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !selectedMaker.isEmpty || !selectedActor.isEmpty
+        !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !selectedMaker.isEmpty || !selectedActor.isEmpty || onlyFavMovies
     }
 
     private var heroMovie: MovieMetadata? {
@@ -109,6 +112,14 @@ public struct MovieLibraryView: View {
                 .toolbar {
                     ToolbarItemGroup(placement: .topBarTrailing) {
                         if mode == .movies || mode == .performers {
+                            let isFavOnly = mode == .movies ? onlyFavMovies : onlyFavPerformers
+                            Button {
+                                if mode == .movies { onlyFavMovies.toggle() } else { onlyFavPerformers.toggle() }
+                                resetAndLoad()
+                            } label: {
+                                Image(systemName: isFavOnly ? "heart.fill" : "heart")
+                                    .foregroundStyle(isFavOnly ? .pink : .primary)
+                            }
                             let count = mode == .movies ? activeMovieFilterCount : activePerformerFilterCount
                             Button { showFilterDrawer = true } label: {
                                 HStack(spacing: 4) {
@@ -127,6 +138,7 @@ public struct MovieLibraryView: View {
                     }
                 }
                 .task {
+                    await favs.ensureLoaded(client: model.apiClient)
                     await reload()
                     await loadDiscoveryData()
                 }
@@ -848,6 +860,20 @@ public struct MovieLibraryView: View {
                     .foregroundStyle(.white)
                     .padding(6)
             }
+            .overlay(alignment: .topTrailing) {
+                let isFav = favs.isMovieFav(movie.number)
+                Button {
+                    Task { await favs.toggle(client: model.apiClient, type: .movie, id: movie.number) }
+                } label: {
+                    Image(systemName: isFav ? "heart.fill" : "heart")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(isFav ? .pink : .white.opacity(0.9))
+                        .frame(width: 24, height: 24)
+                        .background(.black.opacity(0.5), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .padding(5)
+            }
             .aspectRatio(3 / 2, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
@@ -956,6 +982,20 @@ public struct MovieLibraryView: View {
                         .foregroundStyle(.white)
                         .padding(6)
                 }
+                .overlay(alignment: .topTrailing) {
+                    let isFav = favs.isPerformerFav(person.id)
+                    Button {
+                        Task { await favs.toggle(client: model.apiClient, type: .performer, id: person.id) }
+                    } label: {
+                        Image(systemName: isFav ? "heart.fill" : "heart")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(isFav ? .pink : .white.opacity(0.9))
+                            .frame(width: 24, height: 24)
+                            .background(.black.opacity(0.5), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(5)
+                }
                 .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -1047,7 +1087,7 @@ public struct MovieLibraryView: View {
         do {
             switch mode {
             case .movies:
-                let result = try await client.queryMovieLibrary(query: searchQuery, maker: selectedMaker, actor: selectedActor, sort: sort, limit: pageSize, offset: offset)
+                let result = try await client.queryMovieLibrary(query: searchQuery, maker: selectedMaker, actor: selectedActor, sort: sort, onlyFavorites: onlyFavMovies, limit: pageSize, offset: offset)
                 guard version == requestVersion else { return }
                 pageItems = reset ? result.items : pageItems + result.items; total = result.total; makers = result.makers; actors = result.actors; offset += result.items.count
             case .issues:
@@ -1067,6 +1107,7 @@ public struct MovieLibraryView: View {
                     heightRange: performerHeightRange,
                     cup: performerCup,
                     profileFilter: performerProfileFilter,
+                    onlyFavorites: onlyFavPerformers,
                     limit: pageSize,
                     offset: offset
                 )

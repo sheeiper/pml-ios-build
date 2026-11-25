@@ -1,8 +1,10 @@
 import Foundation
 
 extension PMLAPIClient {
-    func queryMovieLibrary(query: String = "", maker: String = "", actor: String = "", sort: String = "release_date_desc", limit: Int = 50, offset: Int = 0) async throws -> MovieLibraryPage {
-        try await command("query_movie_library", arguments: ["query": query, "maker": maker, "actor": actor, "sort": sort, "limit": limit, "offset": offset], as: MovieLibraryPage.self)
+    func queryMovieLibrary(query: String = "", maker: String = "", actor: String = "", sort: String = "release_date_desc", onlyFavorites: Bool = false, limit: Int = 50, offset: Int = 0) async throws -> MovieLibraryPage {
+        var args: [String: Any] = ["query": query, "maker": maker, "actor": actor, "sort": sort, "limit": limit, "offset": offset]
+        if onlyFavorites { args["onlyFavorites"] = true }
+        return try await command("query_movie_library", arguments: args, as: MovieLibraryPage.self)
     }
 
     func getRandomFeaturedMovies(limit: Int = 20) async throws -> [MovieMetadata] {
@@ -49,10 +51,12 @@ extension PMLAPIClient {
         heightRange: String = "",
         cup: String = "",
         profileFilter: String = "",
+        onlyFavorites: Bool = false,
         limit: Int = 50,
         offset: Int = 0
     ) async throws -> MoviePerformerList {
         var args: [String: Any] = ["query": query, "sort": sort, "limit": limit, "offset": offset]
+        if onlyFavorites { args["onlyFavorites"] = true }
         if let minMovies, minMovies > 0 { args["minMovies"] = minMovies }
         if !ageRange.isEmpty { args["ageRange"] = ageRange }
         if !heightRange.isEmpty { args["heightRange"] = heightRange }

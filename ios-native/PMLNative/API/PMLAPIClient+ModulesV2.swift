@@ -62,6 +62,19 @@ extension PMLAPIClient {
         return try await command("rebuild_module_indexes", arguments: args)
     }
 
+    // MARK: 实体级收藏（影片 / 演员 / 创作者）
+
+    func toggleEntityFavorite(type: EntityFavoriteType, entityId: String) async throws -> Bool {
+        try await command("toggle_entity_favorite", arguments: [
+            "entityType": type.rawValue,
+            "entityId": entityId,
+        ])
+    }
+
+    func listEntityFavoriteIds() async throws -> EntityFavoriteIds {
+        try await command("list_entity_favorite_ids")
+    }
+
     // MARK: 创作者 V2
 
     func listCreatorStudios() async throws -> [CreatorStudioStat] {
@@ -71,11 +84,13 @@ extension PMLAPIClient {
     func listCreatorsV2(
         studio: String? = nil,
         query: String? = nil,
-        sort: String = "count"
+        sort: String = "count",
+        onlyFavorites: Bool = false
     ) async throws -> [CreatorSummaryV2] {
         var args: [String: Any] = ["sort": sort]
         if let studio, !studio.isEmpty { args["studio"] = studio }
         if let query, !query.isEmpty { args["query"] = query }
+        if onlyFavorites { args["onlyFavorites"] = true }
         return try await command("list_creators_v2", arguments: args)
     }
 
