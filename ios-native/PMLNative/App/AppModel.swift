@@ -1,11 +1,9 @@
 import Combine
 import Foundation
 
-/// 全局状态：内嵌 Rust 内核 + 本地/服务器运行模式。
+/// 全局状态（纯服务器模式 + AList/115 严格直链播放加速）。
 @MainActor
 final class AppModel: ObservableObject {
-    @Published private(set) var corePort: Int?
-    @Published private(set) var coreError: String?
     @Published private(set) var settings: RuntimeSettings
     @Published private(set) var settingsRevision = 0
     @Published var playbackError: String?
@@ -14,49 +12,36 @@ final class AppModel: ObservableObject {
     private var directURLCache: [String: (url: URL, fetchedAt: Date)] = [:]
     private static let directURLCacheTTL: TimeInterval = 45
 
-    init(corePort: Int32, coreError: String?, settings: RuntimeSettings = .load()) {
-        self.corePort = corePort > 0 ? Int(corePort) : nil
-        self.coreError = corePort > 0 ? nil : coreError
+    init(settings: RuntimeSettings = .load()) {
         self.settings = settings
         configureImageAuth()
     }
 
-    var coreBaseURL: URL? {
-        guard let corePort else { return nil }
-        return URL(string: "http://127.0.0.1:\(corePort)")
-    }
-
-    /// 本地内嵌内核客户端（媒体代理与本地模式数据都可用）。
-    var localClient: PMLAPIClient? {
-        guard let coreBaseURL else { return nil }
-        return PMLAPIClient(configuration: .init(baseURL: coreBaseURL, username: "", password: ""))
-    }
-
-    /// 当前数据源：服务器模式走远程，其余走本地内核。
+    /// 唯一数据源：远程私人媒体库服务器。
     var apiClient: PMLAPIClient? {
-        if settings.mode == .server, let url = settings.normalizedServerURL {
-            return PMLAPIClient(
-                configuration: .init(
-                    baseURL: url,
-                    username: settings.serverUser,
-                    password: settings.serverPassword
-                )
+        guard let url = settings.normalizedServerURL else { return nil }
+        return PMLAPIClient(
+            configuration: .init(
+                baseURL: url,
+                username: settings.serverUser,
+                password: settings.serverPassword
             )
-        }
-        return localClient
+        )
+    }
+
+    var isConfigured: Bool {
+        settings.isConfigured
     }
 
     var isServerMode: Bool {
-        settings.mode == .server && settings.normalizedServerURL != nil
+        settings.normalizedServerURL != nil
     }
 
     var coreStatusText: String {
-        if settings.mode == .server {
-            return "服务器模式 · \(settings.serverURL)"
+        if let url = settings.normalizedServerURL {
+            return "服务器 · \(url.absoluteString)"
         }
-        if let corePort { return "运行中 · 127.0.0.1:\(corePort)" }
-        if let coreError { return "未启动：\(coreError)" }
-        return "未启动"
+        return "未配置服务器"
     }
 
     func updateSettings(_ newValue: RuntimeSettings) {
@@ -68,56 +53,28 @@ final class AppModel: ObservableObject {
     }
 
     private func configureImageAuth() {
-        let base = settings.mode == .server ? settings.normalizedServerURL : nil
         ImageCache.shared.setServerAuth(
-            baseURL: base,
+            baseURL: settings.normalizedServerURL,
             username: settings.serverUser,
             password: settings.serverPassword
         )
     }
 
-    /// 回前台恢复：服务器模式只重建连接；本地模式额外允许重启内核实监听。
+    /// 回前台恢复：重建网络会话并轻量探活。
     func reconnectIfNeeded() async {
         APISession.shared.reset()
         guard let client = apiClient else { return }
-        if settings.mode == .server {
-            _ = try? await client.health()
-            return
-        }
-        guard corePort != nil else { return }
-        if (try? await client.health()) != nil {
-            if let status = try? await client.libraryStatus(),
-               status.configured, !status.connected {
-                _ = try? await client.restoreConnection()
-            }
-            return
-        }
-        let newPort = pml_core_restart()
-        if newPort > 0 {
-            corePort = Int(newPort)
-            coreError = nil
-            APISession.shared.reset()
-            for _ in 0..<10 {
-                if let refreshed = localClient, (try? await refreshed.health()) != nil {
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
-            coreError = "内核已重启，但本地 API 仍无法连接"
-        } else if let raw = pml_core_last_error() {
-            coreError = String(cString: raw)
-        }
+        _ = try? await client.health()
     }
 
     // MARK: - 播放地址解析
 
-    /// 视频一律严格直链（包括旧 relay 设置、本地模式及只有 assetId 的影视入口）；绝不回退服务器中转。
-    /// 经 DirectPlaybackPolicy 校验通过后，交给手机本机 LocalMediaProxy 缓存 AList `/d` 302 后的真实 115 CDN 直链并复用连接池，
-    /// 解决 AVPlayer 每次 Range/拖动都重复走 AList 302 与重建 TLS 握手导致的加载慢。
+    /// 视频一律严格直链；经 DirectPlaybackPolicy 校验通过后，交给手机本机 LocalMediaProxy
+    /// 缓存 AList `/d` 302 后的真实 115 CDN 直链并复用连接池，提升拖动与切集速度。
     func playbackSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         playbackError = nil
         guard let client = apiClient else {
-            playbackError = "无法连接直链解析服务；不会使用服务器中转"
+            playbackError = "尚未配置服务器连接，请先在设置中填写服务器地址与密码"
             return nil
         }
         let cacheKey = Self.directCacheKey(assetId: assetId, remotePath: remotePath)
@@ -136,7 +93,7 @@ final class AppModel: ObservableObject {
                 guard DirectPlaybackPolicy.allows(
                     resolved,
                     serverURL: settings.normalizedServerURL,
-                    coreURL: coreBaseURL,
+                    coreURL: nil,
                     alistURL: settings.normalizedAlistURL
                 ) else {
                     playbackError = "解析结果不是安全的媒体直链，已拒绝服务器中转"
@@ -157,8 +114,6 @@ final class AppModel: ObservableObject {
             return PlaybackSource(url: directURL, fallbackURL: nil, label: "严格直连")
         } catch {
             if !Task.isCancelled {
-                // Keep the server's actionable configuration/login diagnostic;
-                // resolver errors never contain credentials or signed URLs.
                 let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
                 playbackError = detail.isEmpty
                     ? "直链解析失败，请检查服务端 AList 配置及存储登录状态；不会回退中转。"
@@ -188,7 +143,7 @@ final class AppModel: ObservableObject {
             || DirectPlaybackPolicy.allows(
                 url,
                 serverURL: settings.normalizedServerURL,
-                coreURL: coreBaseURL,
+                coreURL: nil,
                 alistURL: settings.normalizedAlistURL
             )
     }
@@ -197,7 +152,6 @@ final class AppModel: ObservableObject {
     func playbackHeaders(for url: URL) -> [String: String] { [:] }
 
     /// 图片/漫画走已鉴权的服务器图片通道；只有视频严格走 AList 直链。
-    /// 这样画册不会受手机到 AList 公网端口、游客权限或签名策略影响。
     func imageSource(assetId: String?, remotePath: String?) async -> PlaybackSource? {
         guard let client = apiClient, let assetId,
               let url = try? await client.mediaSourceURL(assetId: assetId) else { return nil }
@@ -219,8 +173,6 @@ final class AppModel: ObservableObject {
               remotePath == cd2Prefix || remotePath.hasPrefix(cd2Prefix + "/") else { return nil }
 
         let mapped = alistPrefix + String(remotePath.dropFirst(cd2Prefix.count))
-        // Encode each path segment; leave '/' separators intact while escaping '?'/'#'
-        // so filenames cannot accidentally become query/fragment delimiters.
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "?#")
         let encoded = mapped
@@ -229,5 +181,4 @@ final class AppModel: ObservableObject {
             .joined(separator: "/")
         return URL(string: base.absoluteString + "/d" + encoded)
     }
-
 }

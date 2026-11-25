@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 本地 / 服务器运行模式，以及服务器模式下的 AList 直连配置。
+/// 服务器连接与 AList 直连配置（纯服务器模式）。
 struct RuntimeModeView: View {
     @EnvironmentObject private var model: AppModel
 
@@ -15,19 +15,6 @@ struct RuntimeModeView: View {
 
     var body: some View {
         Form {
-            Section {
-                Picker("运行模式", selection: $draft.mode) {
-                    ForEach(AppRunMode.allCases, id: \.self) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-            } header: {
-                Text("运行模式")
-            } footer: {
-                Text("服务器模式下，浏览/索引/进度/字幕来自服务器；本地模式使用 App 内置数据库。切换后全局生效。")
-            }
-
             Section {
                 TextField("服务器地址", text: $draft.serverURL)
                     .textInputAutocapitalization(.never)
@@ -44,7 +31,7 @@ struct RuntimeModeView: View {
             } header: {
                 Text("服务器")
             } footer: {
-                Text("服务器只保存索引、进度和后台扫描。视频、图片、漫画字节不经过服务器。")
+                Text("浏览、索引、进度与五大资料库均由服务器统一维护；视频严格走直连，不经服务器中转。")
             }
 
             Section {
@@ -83,7 +70,7 @@ struct RuntimeModeView: View {
                 Section { Text(errorText).font(.footnote).foregroundStyle(.red) }
             }
         }
-        .navigationTitle("运行模式与服务器")
+        .navigationTitle("服务器与直连设置")
         .navigationBarTitleDisplayMode(.inline)
     }
 

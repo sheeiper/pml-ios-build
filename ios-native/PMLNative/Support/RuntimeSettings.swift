@@ -1,17 +1,5 @@
 import Foundation
 
-enum AppRunMode: String, Codable, CaseIterable {
-    case local
-    case server
-
-    var title: String {
-        switch self {
-        case .local: return "本地"
-        case .server: return "服务器"
-        }
-    }
-}
-
 enum PlaybackRouteMode: String, Codable, CaseIterable, Identifiable {
     case auto
     case direct
@@ -26,8 +14,9 @@ enum PlaybackRouteMode: String, Codable, CaseIterable, Identifiable {
         }
     }
 }
+
+/// 纯服务器模式配置（无缝兼容旧版 UserDefaults 中的 serverURL / serverUser / serverPassword / alistURL）。
 struct RuntimeSettings: Codable, Equatable {
-    var mode: AppRunMode = .local
     var serverURL: String = "http://103.119.1.41:18080"
     var serverUser: String = "admin"
     var serverPassword: String = ""
@@ -39,6 +28,10 @@ struct RuntimeSettings: Codable, Equatable {
     var playbackMode: PlaybackRouteMode? = .auto
 
     var routeMode: PlaybackRouteMode { playbackMode ?? .auto }
+
+    var isConfigured: Bool {
+        normalizedServerURL != nil && !serverPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     static let storageKey = "pml.runtime.settings.v1"
 
