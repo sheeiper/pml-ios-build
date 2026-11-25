@@ -88,6 +88,12 @@ public struct MovieLibraryView: View {
                         mode = .movies
                         selectedActor = actorName
                         resetAndLoad()
+                    },
+                    onPlay: { assetId, title in
+                        Task {
+                            try? await Task.sleep(nanoseconds: 420_000_000)
+                            await playAsset(assetId, title: title)
+                        }
                     }
                 )
                 .environmentObject(model)
@@ -115,9 +121,6 @@ public struct MovieLibraryView: View {
                         )
                         .environmentObject(model)
                     } else {
-                        if mode == .movies || mode == .performers {
-                            quickActionBar
-                        }
                         if mode == .movies, activeMovieFilterCount > 0 { activeMovieFilterStrip }
                         else if mode == .performers, activePerformerFilterCount > 0 { activePerformerFilterStrip }
                         else if mode == .pending {
@@ -147,14 +150,6 @@ public struct MovieLibraryView: View {
                 .toolbar {
                     ToolbarItemGroup(placement: .topBarTrailing) {
                         if mode == .movies || mode == .performers {
-                            let isFavOnly = mode == .movies ? onlyFavMovies : onlyFavPerformers
-                            Button {
-                                if mode == .movies { onlyFavMovies.toggle() } else { onlyFavPerformers.toggle() }
-                                resetAndLoad()
-                            } label: {
-                                Image(systemName: isFavOnly ? "heart.fill" : "heart")
-                                    .foregroundStyle(isFavOnly ? .pink : .primary)
-                            }
                             let count = mode == .movies ? activeMovieFilterCount : activePerformerFilterCount
                             Button { showFilterDrawer = true } label: {
                                 HStack(spacing: 4) {
@@ -616,11 +611,12 @@ public struct MovieLibraryView: View {
     }
 
     private var activeMovieFilterCount: Int {
-        (sort != "release_date_desc" ? 1 : 0) + (!selectedMaker.isEmpty ? 1 : 0) + (!selectedActor.isEmpty ? 1 : 0)
+        (onlyFavMovies ? 1 : 0) + (sort != "release_date_desc" ? 1 : 0) + (!selectedMaker.isEmpty ? 1 : 0) + (!selectedActor.isEmpty ? 1 : 0)
     }
 
     private var activePerformerFilterCount: Int {
-        (performerSort != "latest_release" ? 1 : 0)
+        (onlyFavPerformers ? 1 : 0)
+            + (performerSort != "latest_release" ? 1 : 0)
             + (!performerAgeRange.isEmpty ? 1 : 0)
             + (!performerHeightRange.isEmpty ? 1 : 0)
             + (!performerCup.isEmpty ? 1 : 0)
@@ -631,6 +627,9 @@ public struct MovieLibraryView: View {
     private var activeMovieFilterStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                if onlyFavMovies {
+                    activeTagChip("❤️ 仅看收藏") { onlyFavMovies = false; resetAndLoad() }
+                }
                 if sort != "release_date_desc" {
                     activeTagChip(sortLabel) { sort = "release_date_desc"; resetAndLoad() }
                 }
@@ -641,6 +640,7 @@ public struct MovieLibraryView: View {
                     activeTagChip("演员: \(selectedActor)") { selectedActor = ""; resetAndLoad() }
                 }
                 Button("清空") {
+                    onlyFavMovies = false
                     sort = "release_date_desc"
                     selectedMaker = ""
                     selectedActor = ""
@@ -657,6 +657,9 @@ public struct MovieLibraryView: View {
     private var activePerformerFilterStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                if onlyFavPerformers {
+                    activeTagChip("❤️ 仅看收藏") { onlyFavPerformers = false; resetAndLoad() }
+                }
                 if performerSort != "latest_release" {
                     activeTagChip(performerSortLabel) { performerSort = "latest_release"; resetAndLoad() }
                 }
@@ -676,6 +679,7 @@ public struct MovieLibraryView: View {
                     activeTagChip(performerProfileFilter == "has_avatar" ? "已有头像" : "待补全") { performerProfileFilter = ""; resetAndLoad() }
                 }
                 Button("清空") {
+                    onlyFavPerformers = false
                     performerSort = "latest_release"
                     performerAgeRange = ""
                     performerHeightRange = ""
@@ -727,6 +731,18 @@ public struct MovieLibraryView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     if mode == .movies {
                         VStack(alignment: .leading, spacing: 8) {
+                            Text("收藏筛选").font(.footnote.bold()).foregroundStyle(.secondary)
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                drawerChoiceChip("全部影片", active: !onlyFavMovies) {
+                                    if onlyFavMovies { onlyFavMovies = false; resetAndLoad() }
+                                }
+                                drawerChoiceChip("❤️ 仅看收藏\(favs.movies.isEmpty ? "" : " (\(favs.movies.count))")", active: onlyFavMovies) {
+                                    if !onlyFavMovies { onlyFavMovies = true; resetAndLoad() }
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
                             Text("排序方式").font(.footnote.bold()).foregroundStyle(.secondary)
                             let opts: [(String, String)] = [
                                 ("release_date_desc", "发行日期：最新"),
@@ -776,6 +792,18 @@ public struct MovieLibraryView: View {
                             .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
                         }
                     } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("收藏筛选").font(.footnote.bold()).foregroundStyle(.secondary)
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                drawerChoiceChip("全部演员", active: !onlyFavPerformers) {
+                                    if onlyFavPerformers { onlyFavPerformers = false; resetAndLoad() }
+                                }
+                                drawerChoiceChip("❤️ 仅看收藏\(favs.performers.isEmpty ? "" : " (\(favs.performers.count))")", active: onlyFavPerformers) {
+                                    if !onlyFavPerformers { onlyFavPerformers = true; resetAndLoad() }
+                                }
+                            }
+                        }
+
                         VStack(alignment: .leading, spacing: 8) {
                             Text("排序方式").font(.footnote.bold()).foregroundStyle(.secondary)
                             let opts: [(String, String)] = [
@@ -870,10 +898,12 @@ public struct MovieLibraryView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("重置") {
                         if mode == .movies {
+                            onlyFavMovies = false
                             sort = "release_date_desc"
                             selectedMaker = ""
                             selectedActor = ""
                         } else {
+                            onlyFavPerformers = false
                             performerSort = "latest_release"
                             performerAgeRange = ""
                             performerHeightRange = ""
@@ -1025,17 +1055,15 @@ public struct MovieLibraryView: View {
             .contentShape(Rectangle())
             .onTapGesture { selectedMovie = movie }
 
-            Button {
-                Task { await favs.toggle(client: model.apiClient, type: .movie, id: movie.number) }
-            } label: {
-                Image(systemName: isFav ? "heart.fill" : "heart")
+            if isFav {
+                Image(systemName: "heart.fill")
                     .font(.caption2.weight(.bold))
-                    .foregroundStyle(isFav ? .pink : .white.opacity(0.92))
-                    .frame(width: 28, height: 28)
-                    .background(.black.opacity(0.55), in: Circle())
+                    .foregroundStyle(.pink)
+                    .frame(width: 24, height: 24)
+                    .background(.black.opacity(0.6), in: Circle())
+                    .padding(6)
+                    .allowsHitTesting(false)
             }
-            .buttonStyle(.plain)
-            .padding(5)
         }
     }
 
@@ -1158,17 +1186,15 @@ public struct MovieLibraryView: View {
             .contentShape(Rectangle())
             .onTapGesture { selectedPerformer = person }
 
-            Button {
-                Task { await favs.toggle(client: model.apiClient, type: .performer, id: person.id) }
-            } label: {
-                Image(systemName: isFav ? "heart.fill" : "heart")
+            if isFav {
+                Image(systemName: "heart.fill")
                     .font(.caption2.weight(.bold))
-                    .foregroundStyle(isFav ? .pink : .white.opacity(0.92))
-                    .frame(width: 26, height: 26)
-                    .background(.black.opacity(0.55), in: Circle())
+                    .foregroundStyle(.pink)
+                    .frame(width: 24, height: 24)
+                    .background(.black.opacity(0.6), in: Circle())
+                    .padding(6)
+                    .allowsHitTesting(false)
             }
-            .buttonStyle(.plain)
-            .padding(5)
         }
     }
 

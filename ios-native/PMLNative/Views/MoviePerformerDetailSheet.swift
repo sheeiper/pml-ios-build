@@ -50,47 +50,59 @@ struct MoviePerformerDetailSheet: View {
     @State private var selectedReleaseForMagnets: PerformerRecentRelease?
 
     var body: some View {
-        NavigationStack {
-            mainScrollView
-                .navigationTitle(detail?.person.name ?? performer.name)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar { toolbarContent }
-                .task {
-                    await favs.ensureLoaded(client: model.apiClient)
-                    await load()
-                }
-                .sheet(isPresented: $showEditor) {
-                    MoviePerformerEditor(person: detail?.person ?? performer) { await save($0) }
-                        .environmentObject(model)
-                }
-                .sheet(item: $selectedReleaseForMagnets) { rel in
-                    OnlineMovieDetailSheet(
-                        release: rel,
-                        onPlayAsset: { assetId, title in
-                            selectedReleaseForMagnets = nil
+        if onBack != nil {
+            contentBody
+        } else {
+            NavigationStack {
+                contentBody
+            }
+        }
+    }
+
+    private var contentBody: some View {
+        mainScrollView
+            .navigationTitle(detail?.person.name ?? performer.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { toolbarContent }
+            .task {
+                await favs.ensureLoaded(client: model.apiClient)
+                await load()
+            }
+            .sheet(isPresented: $showEditor) {
+                MoviePerformerEditor(person: detail?.person ?? performer) { await save($0) }
+                    .environmentObject(model)
+            }
+            .sheet(item: $selectedReleaseForMagnets) { rel in
+                OnlineMovieDetailSheet(
+                    release: rel,
+                    onPlayAsset: { assetId, title in
+                        selectedReleaseForMagnets = nil
+                        if let onPlay {
+                            onPlay(assetId, title)
+                        } else {
                             Task {
-                                try? await Task.sleep(nanoseconds: 120_000_000)
+                                try? await Task.sleep(nanoseconds: 420_000_000)
                                 await playAsset(assetId, title: title)
                             }
-                        },
-                        onFilterActor: { actorName in
-                            selectedReleaseForMagnets = nil
-                            onFilterMovies?(actorName)
                         }
-                    )
-                    .environmentObject(model)
-                }
-                .sheet(item: $selectedMovie, onDismiss: handleMovieDismiss) { movie in
-                    MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
-                        pendingPlayback = PendingPlayback(assetId: targetId, title: movie.title)
-                        selectedMovie = nil
+                    },
+                    onFilterActor: { actorName in
+                        selectedReleaseForMagnets = nil
+                        onFilterMovies?(actorName)
                     }
-                    .environmentObject(model)
+                )
+                .environmentObject(model)
+            }
+            .sheet(item: $selectedMovie, onDismiss: handleMovieDismiss) { movie in
+                MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
+                    pendingPlayback = PendingPlayback(assetId: targetId, title: movie.title)
+                    selectedMovie = nil
                 }
-                .fullScreenCover(item: $fullScreenModal) { modal in
-                    fullScreenDestination(modal)
-                }
-        }
+                .environmentObject(model)
+            }
+            .fullScreenCover(item: $fullScreenModal) { modal in
+                fullScreenDestination(modal)
+            }
     }
 
     private var mainScrollView: some View {
@@ -252,9 +264,13 @@ struct MoviePerformerDetailSheet: View {
     private func handleMovieDismiss() {
         if let pending = pendingPlayback {
             pendingPlayback = nil
-            Task {
-                try? await Task.sleep(nanoseconds: 120_000_000)
-                await playAsset(pending.assetId, title: pending.title)
+            if let onPlay {
+                onPlay(pending.assetId, pending.title)
+            } else {
+                Task {
+                    try? await Task.sleep(nanoseconds: 420_000_000)
+                    await playAsset(pending.assetId, title: pending.title)
+                }
             }
         }
     }
