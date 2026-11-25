@@ -64,8 +64,21 @@ struct MoviePerformerDetailSheet: View {
                         .environmentObject(model)
                 }
                 .sheet(item: $selectedReleaseForMagnets) { rel in
-                    MovieMagnetsSheet(release: rel)
-                        .environmentObject(model)
+                    OnlineMovieDetailSheet(
+                        release: rel,
+                        onPlayAsset: { assetId, title in
+                            selectedReleaseForMagnets = nil
+                            Task {
+                                try? await Task.sleep(nanoseconds: 120_000_000)
+                                await playAsset(assetId, title: title)
+                            }
+                        },
+                        onFilterActor: { actorName in
+                            selectedReleaseForMagnets = nil
+                            onFilterMovies?(actorName)
+                        }
+                    )
+                    .environmentObject(model)
                 }
                 .sheet(item: $selectedMovie, onDismiss: handleMovieDismiss) { movie in
                     MovieDetailSheet(number: movie.number, assetId: movie.assetId, fileName: movie.title, remotePath: nil) { targetId in
@@ -317,7 +330,7 @@ struct MoviePerformerDetailSheet: View {
                             selectedReleaseForMagnets = rel
                         } label: {
                             VStack(alignment: .leading, spacing: 5) {
-                                ZStack(alignment: .topLeading) {
+                                ZStack {
                                     Color.black.opacity(0.85)
                                     CachedImageView(
                                         url: rel.coverUrl.flatMap { model.proxyScraperImageURL(rawUrl: $0) },
@@ -325,6 +338,8 @@ struct MoviePerformerDetailSheet: View {
                                         minHeight: 96,
                                         maxPixel: 540
                                     )
+                                }
+                                .overlay(alignment: .topLeading) {
                                     HStack {
                                         Text(rel.number)
                                             .font(.system(size: 9, weight: .bold))
@@ -333,7 +348,7 @@ struct MoviePerformerDetailSheet: View {
                                             .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 4))
                                             .foregroundStyle(.white)
                                         Spacer()
-                                        Text(rel.inLibrary ? "已入库" : "磁力")
+                                        Text(rel.inLibrary ? "已入库" : "详情")
                                             .font(.system(size: 9, weight: .bold))
                                             .padding(.horizontal, 5)
                                             .padding(.vertical, 2)
@@ -444,9 +459,11 @@ struct MoviePerformerDetailSheet: View {
     private func movieCard(_ movie: MovieMetadata) -> some View {
         Button { selectedMovie = movie } label: {
             VStack(alignment: .leading, spacing: 5) {
-                ZStack(alignment: .topLeading) {
+                ZStack {
                     Color.black.opacity(0.85)
                     CachedImageView(url: movie.coverUrl.flatMap { model.proxyScraperImageURL(rawUrl: $0) }, contentMode: .fit, minHeight: 96, maxPixel: 600)
+                }
+                .overlay(alignment: .topLeading) {
                     Text(movie.number)
                         .font(.system(size: 9, weight: .bold))
                         .padding(.horizontal, 6)

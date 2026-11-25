@@ -1237,6 +1237,39 @@ async fn dispatch_command(
                 Ok(items)
             }).await
         }
+        "get_online_movie_detail" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+            if number.is_empty() {
+                return error_response("缺少番号参数");
+            }
+            let app_check = app.clone();
+            let num_for_db = number.clone();
+            let local_meta = tokio::task::spawn_blocking(move || -> Option<crate::jav_scraper::MovieMetadata> {
+                let conn = four_domains::open_v2(&app_check).ok()?;
+                let normalized = crate::jav_scraper::normalize_jav_number(&num_for_db)
+                    .unwrap_or_else(|| num_for_db.to_uppercase());
+                crate::jav_scraper::get_movie_metadata(&conn, &normalized).ok().flatten()
+            }).await.ok().flatten();
+
+            if let Some(mut meta) = local_meta {
+                if !meta.sample_images.is_empty() && !meta.actors.is_empty() {
+                    return result_response(Ok(meta));
+                }
+                if let Ok(online) = crate::jav_scraper::scrape_movie_metadata(&number).await {
+                    if meta.sample_images.is_empty() { meta.sample_images = online.sample_images; }
+                    if meta.actors.is_empty() { meta.actors = online.actors; }
+                    if meta.tags.is_empty() { meta.tags = online.tags; }
+                    if meta.director.is_none() { meta.director = online.director; }
+                    if meta.maker.is_none() { meta.maker = online.maker; }
+                    if meta.label.is_none() { meta.label = online.label; }
+                    if meta.series.is_none() { meta.series = online.series; }
+                    if meta.duration_minutes.is_none() { meta.duration_minutes = online.duration_minutes; }
+                }
+                result_response(Ok(meta))
+            } else {
+                result_response(crate::jav_scraper::scrape_movie_metadata(&number).await)
+            }
+        }
         "preview_movie_performer_profile" => {
             let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
             let profile_url = payload.get("profileUrl").and_then(Value::as_str).unwrap_or("").to_owned();

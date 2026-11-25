@@ -87,6 +87,14 @@ extension PMLAPIClient {
         )
     }
 
+    func getOnlineMovieDetail(number: String) async throws -> MovieMetadata {
+        try await command(
+            "get_online_movie_detail",
+            arguments: ["number": number],
+            as: MovieMetadata.self
+        )
+    }
+
     func getMoviePerformer(id: String) async throws -> MoviePerformerDetail {
         try await command("get_movie_performer", arguments: ["id": id], as: MoviePerformerDetail.self)
     }
