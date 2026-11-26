@@ -246,7 +246,7 @@ struct HomeView: View {
         case "movies": MovieLibraryView()
         case "creators": AuthorsView()
         case "collections": CollectionsView()
-        case "galleries": GalleriesView()
+        case "galleries": ComicLibraryView(initialTab: "图集")
         case "comics": ComicLibraryView()
         default: BrowseView()
         }
@@ -597,7 +597,7 @@ struct HomeView: View {
                         .font(.headline)
                     Spacer()
                     NavigationLink("全部") {
-                        GalleriesView()
+                        ComicLibraryView(initialTab: "图集")
                     }
                     .font(.caption)
                 }

@@ -378,6 +378,7 @@ fn build_router(state: ServerState, static_dir: String) -> Router {
         .route("/api/health", get(health))
         .route("/api/covers/{asset_id}/{version}", get(cached_cover))
         .route("/api/comic-pages/{asset_id}/{page_index}", get(cached_comic_page))
+        .route("/api/online-comic-image", get(proxy_online_comic_image))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
@@ -439,6 +440,7 @@ async fn auth_middleware(
         || path.starts_with("/api/telegram-user-stream/")
         || path.starts_with("/api/telegram-user-thumb/")
         || path.starts_with("/api/scraper/proxy-image")
+        || path == "/api/online-comic-image"
         || path.starts_with("/api/movie-subtitles/")
     {
         return next.run(request).await;
@@ -707,6 +709,93 @@ async fn dispatch_command(
             };
             let app = app.clone();
             blocking_result_response(move || crate::comic_library::set_comic_work_cover(&app, req)).await
+        }
+        "get_online_comic_config" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::online_comics::get_online_comic_config(&app)).await
+        }
+        "save_online_comic_config" => {
+            let req: crate::online_comics::SaveOnlineComicConfigRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let app = app.clone();
+            blocking_result_response(move || crate::online_comics::save_online_comic_config(&app, req)).await
+        }
+        "browse_online_comics" => {
+            let source = payload.get("source").and_then(Value::as_str).unwrap_or("jm").to_owned();
+            let mode = payload.get("mode").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let category = payload.get("category").and_then(Value::as_str).map(str::to_owned);
+            let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let page = payload.get("page").and_then(Value::as_i64);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::online_comics::browse_online_comics(&app, &source, mode, query, category, sort, page)
+            })
+            .await
+        }
+        "list_online_comic_categories" => {
+            let source = payload.get("source").and_then(Value::as_str).unwrap_or("jm").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::online_comics::list_online_comic_categories(&app, &source)
+            })
+            .await
+        }
+        "toggle_online_comic_favorite" => {
+            let source = payload.get("source").and_then(Value::as_str).unwrap_or("pica").to_owned();
+            let comic_id = payload.get("comicId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::online_comics::toggle_online_comic_favorite(&app, &source, &comic_id)
+            })
+            .await
+        }
+        "search_comic_magnets" => {
+            let query = payload.get("query").and_then(Value::as_str).unwrap_or("").to_owned();
+            blocking_result_response(move || {
+                crate::online_comics::search_comic_magnets(&query)
+            })
+            .await
+        }
+        "start_online_comic_cbz" => {
+            let source = payload.get("source").and_then(Value::as_str).unwrap_or("jm").to_owned();
+            let comic_id = payload.get("comicId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let chapter_id = payload.get("chapterId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let title = payload.get("title").and_then(Value::as_str).unwrap_or("comic").to_owned();
+            let author = payload.get("author").and_then(Value::as_str).map(str::to_owned);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::online_comics::start_online_comic_cbz(&app, &source, &comic_id, &chapter_id, &title, author.as_deref())
+            })
+            .await
+        }
+        "get_online_comic_cbz_status" => {
+            let task_id = payload.get("taskId").and_then(Value::as_str).unwrap_or("").to_owned();
+            blocking_result_response(move || {
+                crate::online_comics::get_online_comic_cbz_status(&task_id)
+            })
+            .await
+        }
+        "get_online_comic_detail" => {
+            let source = payload.get("source").and_then(Value::as_str).unwrap_or("jm").to_owned();
+            let comic_id = payload.get("comicId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::online_comics::get_online_comic_detail(&app, &source, &comic_id)
+            })
+            .await
+        }
+        "get_online_comic_chapter_pages" => {
+            let source = payload.get("source").and_then(Value::as_str).unwrap_or("jm").to_owned();
+            let comic_id = payload.get("comicId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let chapter_id = payload.get("chapterId").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::online_comics::get_online_comic_chapter_pages(&app, &source, &comic_id, &chapter_id)
+            })
+            .await
         }
         "list_continue_reading_comics" => {
             let limit = payload.get("limit").and_then(Value::as_i64);
@@ -3480,6 +3569,26 @@ fn scraper_image_response(bytes: Vec<u8>) -> Response {
     // These are our decoded bytes: never forward upstream content-length or encoding.
     ([(CONTENT_TYPE, mime), (CACHE_CONTROL, "public, max-age=86400"),
       (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")], bytes).into_response()
+}
+
+async fn proxy_online_comic_image(
+    AxumState(context): AxumState<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    match crate::online_comics::fetch_online_comic_image(&context.app, params).await {
+        Ok((bytes, mime)) => {
+            let ct = axum::http::HeaderValue::from_str(&mime)
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("image/jpeg"));
+            let mut resp = Response::new(Body::from(bytes));
+            resp.headers_mut().insert(CONTENT_TYPE, ct);
+            resp.headers_mut().insert(
+                CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=86400"),
+            );
+            resp
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, err).into_response(),
+    }
 }
 
 #[cfg(test)]

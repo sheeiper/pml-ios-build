@@ -139,6 +139,93 @@ extension PMLAPIClient {
         return try await command("set_comic_work_cover", arguments: args)
     }
 
+    func getOnlineComicConfig() async throws -> OnlineComicConfigView {
+        try await command("get_online_comic_config")
+    }
+
+    func saveOnlineComicConfig(
+        jmDomains: [String]? = nil,
+        jmImageDomains: [String]? = nil,
+        picaEmail: String? = nil,
+        picaPassword: String? = nil,
+        picaChannel: String? = nil
+    ) async throws -> OnlineComicConfigView {
+        var args: [String: Any] = [:]
+        if let jmDomains { args["jmDomains"] = jmDomains }
+        if let jmImageDomains { args["jmImageDomains"] = jmImageDomains }
+        if let picaEmail { args["picaEmail"] = picaEmail }
+        if let picaPassword, !picaPassword.isEmpty { args["picaPassword"] = picaPassword }
+        if let picaChannel { args["picaChannel"] = picaChannel }
+        return try await command("save_online_comic_config", arguments: args)
+    }
+
+    func browseOnlineComics(
+        source: String,
+        mode: String? = nil,
+        query: String? = nil,
+        category: String? = nil,
+        sort: String? = nil,
+        page: Int = 1
+    ) async throws -> OnlineComicPageResult {
+        var args: [String: Any] = ["source": source, "page": page]
+        if let mode, !mode.isEmpty { args["mode"] = mode }
+        if let query, !query.isEmpty { args["query"] = query }
+        if let category, !category.isEmpty, category != "全部" { args["category"] = category }
+        if let sort, !sort.isEmpty { args["sort"] = sort }
+        return try await command("browse_online_comics", arguments: args)
+    }
+
+    func listOnlineComicCategories(source: String) async throws -> [String] {
+        try await command("list_online_comic_categories", arguments: ["source": source])
+    }
+
+    func toggleOnlineComicFavorite(source: String, comicId: String) async throws -> Bool {
+        try await command("toggle_online_comic_favorite", arguments: ["source": source, "comicId": comicId])
+    }
+
+    func searchComicMagnets(query: String) async throws -> [ComicMagnetItem] {
+        try await command("search_comic_magnets", arguments: ["query": query])
+    }
+
+    func startOnlineComicCbz(
+        source: String,
+        comicId: String,
+        chapterId: String,
+        title: String,
+        author: String? = nil
+    ) async throws -> CbzPackageTask {
+        var args: [String: Any] = [
+            "source": source,
+            "comicId": comicId,
+            "chapterId": chapterId,
+            "title": title,
+        ]
+        if let author, !author.isEmpty { args["author"] = author }
+        return try await command("start_online_comic_cbz", arguments: args)
+    }
+
+    func getOnlineComicCbzStatus(taskId: String) async throws -> CbzPackageTask {
+        try await command("get_online_comic_cbz_status", arguments: ["taskId": taskId])
+    }
+
+    func getOnlineComicDetail(source: String, comicId: String) async throws -> OnlineComicDetail {
+        try await command("get_online_comic_detail", arguments: ["source": source, "comicId": comicId])
+    }
+
+    func getOnlineComicChapterPages(source: String, comicId: String, chapterId: String) async throws -> OnlineChapterPagesResult {
+        try await command("get_online_comic_chapter_pages", arguments: [
+            "source": source,
+            "comicId": comicId,
+            "chapterId": chapterId,
+        ])
+    }
+
+    func onlineComicImageURL(relativePath: String) -> URL? {
+        guard !relativePath.isEmpty else { return nil }
+        if relativePath.hasPrefix("http") { return URL(string: relativePath) }
+        return URL(string: baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + relativePath)
+    }
+
     func searchComicOnlineSources(workId: String? = nil, query: String? = nil, useCoverHash: Bool = true) async throws -> [ComicExternalCandidate] {
         var args: [String: Any] = ["useCoverHash": useCoverHash]
         if let workId, !workId.isEmpty { args["workId"] = workId }

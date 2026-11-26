@@ -6,8 +6,16 @@ struct ComicLibraryView: View {
     @ObservedObject private var favs = EntityFavoritesStore.shared
 
     private enum ComicTab: String, CaseIterable, Identifiable {
-        case shelf = "书架", categories = "分类", data = "数据"
+        case shelf = "书架", categories = "分类", galleries = "图集", online = "在线", data = "数据"
         var id: String { rawValue }
+    }
+
+    init(initialTab: String? = nil) {
+        if let initialTab, let matched = ComicTab(rawValue: initialTab) {
+            _tab = State(initialValue: matched)
+        } else {
+            _tab = State(initialValue: .shelf)
+        }
     }
 
     @State private var tab: ComicTab = .shelf
@@ -103,6 +111,10 @@ struct ComicLibraryView: View {
                 shelfView
             case .categories:
                 categoriesView
+            case .galleries:
+                GalleriesView()
+            case .online:
+                OnlineComicsPaneView()
             case .data:
                 dataView
             }
@@ -1076,5 +1088,813 @@ struct ComicLibraryView: View {
             query: sourceQuery.trimmingCharacters(in: .whitespacesAndNewlines),
             useCoverHash: useCoverHash
         )) ?? []
+    }
+}
+
+// MARK: - 在线漫画源（禁漫天堂 JM + 哔咔漫画 PicACG）
+
+private struct OnlineComicsPaneView: View {
+    @EnvironmentObject private var model: AppModel
+
+    @State private var source = "jm"
+    @State private var mode = "browse"
+    @State private var query = ""
+    @State private var category = "全部"
+    @State private var categories: [String] = ["全部", "同人", "单本", "短篇", "韩漫", "美漫", "其他"]
+    @State private var sort = "mr"
+    @State private var page = 1
+    @State private var hasMore = false
+    @State private var loading = false
+    @State private var errorMsg = ""
+    @State private var items: [OnlineComicItem] = []
+
+    @State private var config: OnlineComicConfigView?
+    @State private var showConfigSheet = false
+    @State private var cfgJmDomains = ""
+    @State private var cfgJmImgDomains = ""
+    @State private var cfgPicaEmail = ""
+    @State private var cfgPicaPassword = ""
+    @State private var cfgPicaChannel = "1"
+    @State private var cfgFeedback = ""
+
+    @State private var selectedItem: OnlineComicItem?
+    @State private var detail: OnlineComicDetail?
+    @State private var detailLoading = false
+    @State private var chapterDesc = false
+    @State private var activeChapter: OnlineComicChapter?
+    @State private var readerImages: [String] = []
+    @State private var readerLoading = false
+    @State private var readerMode: ComicReadingMode = .webtoon
+    @State private var readerPage = 0
+    @State private var readerChromeVisible = true
+
+    // Magnet search & CBZ packaging
+    @State private var showMagnetSheet = false
+    @State private var magnetQuery = ""
+    @State private var magnetLoading = false
+    @State private var magnetItems: [ComicMagnetItem] = []
+    @State private var copiedMagnetHash = ""
+    @State private var cbzTask: CbzPackageTask?
+    @State private var cbzPollTask: Task<Void, Never>?
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+    ]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Picker("源", selection: $source) {
+                        Text("禁漫 (JM)").tag("jm")
+                        Text("哔咔 (PicACG)").tag("pica")
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: source) { _, newVal in
+                        mode = "browse"
+                        category = "全部"
+                        sort = (newVal == "jm" ? "mr" : "dd")
+                        Task {
+                            await loadCategories()
+                            await loadList(reset: true)
+                        }
+                    }
+
+                    Button {
+                        showConfigSheet = true
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                            .padding(8)
+                            .background(Color.secondary.opacity(0.14), in: Circle())
+                    }
+                }
+                .padding(.horizontal, 14)
+
+                HStack(spacing: 8) {
+                    TextField(source == "jm" ? "搜索书名、作者或 JM 号…" : "搜索哔咔书名/作者…", text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .submitLabel(.search)
+                        .onSubmit { Task { await loadList(reset: true) } }
+                    Button("搜索") { Task { await loadList(reset: true) } }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.pink)
+                }
+                .padding(.horizontal, 14)
+
+                // 模式条：分类发现 / 日周月总排行 / 随机 / 我的哔咔收藏
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        modeChip("分类发现", id: "browse")
+                        modeChip("日排行", id: "rank_day")
+                        modeChip("周排行", id: "rank_week")
+                        modeChip("月排行", id: "rank_month")
+                        if source == "jm" {
+                            modeChip("总排行", id: "rank_all")
+                        }
+                        modeChip("随机", id: "random")
+                        if source == "pica" {
+                            modeChip("我的哔咔收藏", id: "favorites")
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                }
+
+                if mode == "browse" {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(categories, id: \.self) { c in
+                                Button {
+                                    category = c
+                                    Task { await loadList(reset: true) }
+                                } label: {
+                                    Text(c)
+                                        .font(.caption.weight(.semibold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(category == c ? Color.pink : Color.secondary.opacity(0.14), in: Capsule())
+                                        .foregroundStyle(category == c ? .white : .primary)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                    }
+                }
+
+                if !errorMsg.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(errorMsg).font(.caption).foregroundStyle(.red)
+                        if source == "pica" && config?.picaLoggedIn != true {
+                            Button("配置哔咔账号") { showConfigSheet = true }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                }
+
+                if loading && items.isEmpty {
+                    ProgressView("正在拉取在线漫画…")
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 40)
+                } else {
+                    LazyVGrid(columns: columns, spacing: 12) {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
+                            Button {
+                                openDetail(item)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    ZStack(alignment: .topLeading) {
+                                        CachedImageView(
+                                            url: model.apiClient?.onlineComicImageURL(relativePath: item.coverUrl),
+                                            contentMode: .fill,
+                                            minHeight: 150,
+                                            maxPixel: 420
+                                        )
+                                        .aspectRatio(2.0 / 3.0, contentMode: .fill)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                                        if mode.hasPrefix("rank_") {
+                                            Text("#\(idx + 1)")
+                                                .font(.system(size: 10, weight: .heavy))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(idx < 3 ? Color.orange : Color.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 5))
+                                                .foregroundStyle(.white)
+                                                .padding(5)
+                                        }
+                                    }
+                                    Text(item.title)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.leading)
+                                    Text(item.author.isEmpty ? (item.source == "jm" ? "JM\(item.comicId)" : "哔咔") : item.author)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .onAppear {
+                                if item.id == items.last?.id && hasMore && !loading {
+                                    Task { await loadList(reset: false) }
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+
+                    if hasMore {
+                        Button("加载下一页") { Task { await loadList(reset: false) } }
+                            .buttonStyle(.bordered)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                    }
+                }
+            }
+            .padding(.vertical, 8)
+        }
+        .refreshable {
+            await loadList(reset: true)
+        }
+        .onDisappear { cbzPollTask?.cancel() }
+        .task {
+            await loadConfig()
+            await loadCategories()
+            await loadList(reset: true)
+        }
+        .sheet(isPresented: $showConfigSheet) {
+            NavigationStack {
+                Form {
+                    Section("哔咔漫画 (PicACG) 账号") {
+                        TextField("邮箱 / 账号", text: $cfgPicaEmail)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        SecureField(config?.picaHasPassword == true ? "密码（已保存，留空不变）" : "密码", text: $cfgPicaPassword)
+                        Picker("分流线路", selection: $cfgPicaChannel) {
+                            Text("分流 1").tag("1")
+                            Text("分流 2").tag("2")
+                            Text("分流 3").tag("3")
+                        }
+                    }
+                    Section("禁漫天堂 (JM) 域名池（逗号分隔）") {
+                        TextField("API 域名", text: $cfgJmDomains)
+                            .textInputAutocapitalization(.never)
+                        TextField("图片 CDN 域名", text: $cfgJmImgDomains)
+                            .textInputAutocapitalization(.never)
+                    }
+                    if !cfgFeedback.isEmpty {
+                        Section { Text(cfgFeedback).font(.caption).foregroundStyle(.purple) }
+                    }
+                    Section {
+                        Button("保存并测试登录") { Task { await saveConfig() } }
+                    }
+                }
+                .navigationTitle("在线漫画源设置")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("完成") { showConfigSheet = false }
+                    }
+                }
+            }
+        }
+        .sheet(item: $selectedItem) { item in
+            NavigationStack {
+                let chs = detail?.chapters ?? []
+                let orderedChs = chapterDesc ? Array(chs.reversed()) : chs
+                List {
+                    Section {
+                        HStack(alignment: .top, spacing: 12) {
+                            CachedImageView(
+                                url: model.apiClient?.onlineComicImageURL(relativePath: item.coverUrl),
+                                contentMode: .fill,
+                                minHeight: 148,
+                                maxPixel: 420
+                            )
+                            .frame(width: 100, height: 150)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(detail?.title ?? item.title).font(.headline)
+                                if let auths = detail?.authors, !auths.isEmpty {
+                                    Text("作者：\(auths.joined(separator: " / "))").font(.caption).foregroundStyle(.purple)
+                                }
+                                if let desc = detail?.description, !desc.isEmpty {
+                                    Text(desc).font(.caption2).foregroundStyle(.secondary).lineLimit(4)
+                                }
+                            }
+                        }
+
+                        if let tags = detail?.tags, !tags.isEmpty {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    ForEach(tags.prefix(16), id: \.self) { t in
+                                        Text("#\(t)")
+                                            .font(.caption2)
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(Color.purple.opacity(0.14), in: Capsule())
+                                            .foregroundStyle(.purple)
+                                    }
+                                }
+                            }
+                        }
+
+                        // 核心操作区：开始阅读 / 搜磁力 / 打包 CBZ / 哔咔收藏
+                        HStack(spacing: 8) {
+                            if let firstCh = chs.first {
+                                Button {
+                                    openChapter(comicId: detail?.id ?? item.comicId, chapter: firstCh)
+                                } label: {
+                                    Label("开始阅读", systemImage: "book.fill")
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .tint(.purple)
+                            }
+                            Button {
+                                magnetQuery = detail?.title ?? item.title
+                                magnetItems = []
+                                showMagnetSheet = true
+                                Task { await runMagnetSearch() }
+                            } label: {
+                                Label("搜磁力", systemImage: "link")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            if let firstCh = chs.first {
+                                Button {
+                                    Task {
+                                        await startCbzPackage(
+                                            comicId: detail?.id ?? item.comicId,
+                                            chapter: firstCh,
+                                            title: detail?.title ?? item.title,
+                                            author: detail?.authors.first
+                                        )
+                                    }
+                                } label: {
+                                    Label("CBZ", systemImage: "arrow.down.doc")
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(cbzTask?.status == "running")
+                            }
+
+                            if item.source == "pica" {
+                                Button {
+                                    Task { await togglePicaFav(comicId: detail?.id ?? item.comicId) }
+                                } label: {
+                                    Image(systemName: detail?.isFavourite == true ? "heart.fill" : "heart")
+                                        .foregroundStyle(.pink)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+
+                        if let task = cbzTask {
+                            VStack(alignment: .leading, spacing: 6) {
+                                if task.status == "running" {
+                                    ProgressView(value: Double(task.completed), total: Double(max(task.total, 1)))
+                                        .tint(.purple)
+                                    Text("正在打包 CBZ：\(task.completed) / \(task.total) 页…")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else if task.status == "done", let dl = task.downloadUrl, let url = model.apiClient?.onlineComicImageURL(relativePath: dl) {
+                                    HStack {
+                                        Label("CBZ 已生成", systemImage: "checkmark.circle.fill")
+                                            .font(.caption.bold())
+                                            .foregroundStyle(.green)
+                                        Spacer()
+                                        ShareLink(item: url) {
+                                            Label("保存到文件", systemImage: "square.and.arrow.up")
+                                                .font(.caption.bold())
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.mini)
+                                        .tint(.purple)
+                                    }
+                                } else if let err = task.error {
+                                    Text("打包失败：\(err)").font(.caption2).foregroundStyle(.red)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+
+                    if detailLoading {
+                        Section { ProgressView("加载章节中…") }
+                    } else if !orderedChs.isEmpty {
+                        Section {
+                            ForEach(orderedChs) { ch in
+                                Button {
+                                    openChapter(comicId: detail?.id ?? item.comicId, chapter: ch)
+                                } label: {
+                                    HStack {
+                                        Text(ch.title).foregroundStyle(.primary)
+                                        Spacer()
+                                        Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+                                    }
+                                }
+                                .contextMenu {
+                                    Button {
+                                        Task {
+                                            await startCbzPackage(
+                                                comicId: detail?.id ?? item.comicId,
+                                                chapter: ch,
+                                                title: "\(detail?.title ?? item.title) - \(ch.title)",
+                                                author: detail?.authors.first
+                                            )
+                                        }
+                                    } label: {
+                                        Label("打包本话为 CBZ", systemImage: "arrow.down.doc")
+                                    }
+                                }
+                            }
+                        } header: {
+                            HStack {
+                                Text("章节目录（\(chs.count) 话）")
+                                Spacer()
+                                if chs.count > 1 {
+                                    Button(chapterDesc ? "倒序" : "正序") {
+                                        chapterDesc.toggle()
+                                    }
+                                    .font(.caption)
+                                }
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("在线漫画详情")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("关闭") { selectedItem = nil }
+                    }
+                }
+                .sheet(isPresented: $showMagnetSheet) {
+                    NavigationStack {
+                        List {
+                            Section {
+                                HStack(spacing: 8) {
+                                    TextField("输入日文/中文书名或作者…", text: $magnetQuery)
+                                        .textFieldStyle(.roundedBorder)
+                                        .submitLabel(.search)
+                                        .onSubmit { Task { await runMagnetSearch() } }
+                                    Button("搜索") { Task { await runMagnetSearch() } }
+                                        .buttonStyle(.borderedProminent)
+                                        .tint(.purple)
+                                }
+                            }
+                            if magnetLoading {
+                                Section { ProgressView("正在搜索 Sukebei / Nyaa 磁力…") }
+                            } else if magnetItems.isEmpty {
+                                Section {
+                                    Text("未搜到磁力链接，可缩短书名关键词重试，或直接点「CBZ」打包保存。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } else {
+                                Section("磁力结果（\(magnetItems.count)）") {
+                                    ForEach(magnetItems) { m in
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            Text(m.title).font(.caption.weight(.semibold))
+                                            HStack(spacing: 10) {
+                                                Text(m.source)
+                                                    .font(.caption2.bold())
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(Color.blue.opacity(0.16), in: Capsule())
+                                                    .foregroundStyle(.blue)
+                                                Text(m.size).font(.caption2).foregroundStyle(.secondary)
+                                                Text("做种 \(m.seeders)").font(.caption2).foregroundStyle(.green)
+                                                Spacer()
+                                                Button {
+                                                    UIPasteboard.general.string = m.magnet
+                                                    copiedMagnetHash = m.infoHash
+                                                } label: {
+                                                    Label(
+                                                        copiedMagnetHash == m.infoHash ? "已复制" : "复制磁力",
+                                                        systemImage: copiedMagnetHash == m.infoHash ? "checkmark" : "doc.on.doc"
+                                                    )
+                                                    .font(.caption2.bold())
+                                                }
+                                                .buttonStyle(.borderedProminent)
+                                                .controlSize(.mini)
+                                                .tint(copiedMagnetHash == m.infoHash ? .green : .purple)
+                                            }
+                                        }
+                                        .padding(.vertical, 2)
+                                    }
+                                }
+                            }
+                        }
+                        .navigationTitle("搜索漫画磁力")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("完成") { showMagnetSheet = false }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .fullScreenCover(item: $activeChapter) { ch in
+            let chIdx = detail?.chapters.firstIndex(where: { $0.id == ch.id }) ?? -1
+            let hasPrev = chIdx > 0
+            let hasNext = detail != nil && chIdx >= 0 && chIdx < (detail!.chapters.count - 1)
+            NavigationStack {
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    if readerLoading {
+                        ProgressView("加载图片并自动解混淆…")
+                            .tint(.white)
+                            .foregroundStyle(.white)
+                    } else if readerMode == .webtoon {
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                ForEach(readerImages, id: \.self) { rel in
+                                    CachedImageView(
+                                        url: model.apiClient?.onlineComicImageURL(relativePath: rel),
+                                        contentMode: .fit,
+                                        minHeight: 360,
+                                        maxPixel: 1600
+                                    )
+                                }
+                                if hasNext, let nextCh = detail?.chapters[chIdx + 1] {
+                                    Button {
+                                        openChapter(comicId: detail?.id ?? "", chapter: nextCh)
+                                    } label: {
+                                        Label("继续阅读下一话：\(nextCh.title)", systemImage: "arrow.right.circle.fill")
+                                            .font(.subheadline.bold())
+                                            .padding(.horizontal, 18)
+                                            .padding(.vertical, 12)
+                                            .background(Color.purple, in: Capsule())
+                                            .foregroundStyle(.white)
+                                    }
+                                    .padding(.vertical, 28)
+                                }
+                            }
+                        }
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.2)) { readerChromeVisible.toggle() }
+                        }
+                    } else if readerMode == .double {
+                        let spreadCount = max(1, (readerImages.count + 1) / 2)
+                        TabView(selection: $readerPage) {
+                            ForEach(0..<spreadCount, id: \.self) { sIdx in
+                                let firstIdx = sIdx * 2
+                                let secondIdx = firstIdx + 1
+                                HStack(spacing: 2) {
+                                    if firstIdx < readerImages.count {
+                                        CachedImageView(
+                                            url: model.apiClient?.onlineComicImageURL(relativePath: readerImages[firstIdx]),
+                                            contentMode: .fit,
+                                            minHeight: 360,
+                                            maxPixel: 1400
+                                        )
+                                    }
+                                    if secondIdx < readerImages.count {
+                                        CachedImageView(
+                                            url: model.apiClient?.onlineComicImageURL(relativePath: readerImages[secondIdx]),
+                                            contentMode: .fit,
+                                            minHeight: 360,
+                                            maxPixel: 1400
+                                        )
+                                    }
+                                }
+                                .tag(sIdx)
+                            }
+                        }
+                        .tabViewStyle(.page(indexDisplayMode: .never))
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.2)) { readerChromeVisible.toggle() }
+                        }
+                    } else {
+                        TabView(selection: $readerPage) {
+                            ForEach(Array(readerImages.enumerated()), id: \.offset) { idx, rel in
+                                CachedImageView(
+                                    url: model.apiClient?.onlineComicImageURL(relativePath: rel),
+                                    contentMode: .fit,
+                                    minHeight: 400,
+                                    maxPixel: 1600
+                                )
+                                .tag(idx)
+                            }
+                        }
+                        .tabViewStyle(.page(indexDisplayMode: .never))
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.2)) { readerChromeVisible.toggle() }
+                        }
+                    }
+                }
+                .navigationTitle(ch.title)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar(readerChromeVisible ? .visible : .hidden, for: .navigationBar)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("完成") { activeChapter = nil }
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        HStack(spacing: 12) {
+                            if hasPrev, let prevCh = detail?.chapters[chIdx - 1] {
+                                Button {
+                                    openChapter(comicId: detail?.id ?? "", chapter: prevCh)
+                                } label: { Image(systemName: "chevron.left") }
+                            }
+                            if hasNext, let nextCh = detail?.chapters[chIdx + 1] {
+                                Button {
+                                    openChapter(comicId: detail?.id ?? "", chapter: nextCh)
+                                } label: { Image(systemName: "chevron.right") }
+                            }
+                            Menu {
+                                Picker("阅读模式", selection: $readerMode) {
+                                    ForEach(ComicReadingMode.allCases) { m in
+                                        Label(m.rawValue, systemImage: m.symbol).tag(m)
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis.circle")
+                            }
+                        }
+                    }
+                }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    if readerChromeVisible && !readerImages.isEmpty && readerMode != .webtoon {
+                        let maxIdx = readerMode == .double ? max(0, (readerImages.count + 1) / 2 - 1) : max(0, readerImages.count - 1)
+                        HStack(spacing: 10) {
+                            Text("\(min(readerPage + 1, maxIdx + 1)) / \(maxIdx + 1)")
+                                .font(.caption2.monospacedDigit().bold())
+                                .foregroundStyle(.white)
+                            if maxIdx > 0 {
+                                Slider(
+                                    value: Binding(
+                                        get: { Double(min(readerPage, maxIdx)) },
+                                        set: { readerPage = Int($0.rounded()) }
+                                    ),
+                                    in: 0...Double(maxIdx),
+                                    step: 1
+                                )
+                                .tint(.purple)
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+                    }
+                }
+            }
+        }
+    }
+
+    private func runMagnetSearch() async {
+        guard let client = model.apiClient else { return }
+        let q = magnetQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        magnetLoading = true
+        defer { magnetLoading = false }
+        magnetItems = (try? await client.searchComicMagnets(query: q)) ?? []
+    }
+
+    private func startCbzPackage(comicId: String, chapter: OnlineComicChapter, title: String, author: String?) async {
+        guard let client = model.apiClient else { return }
+        cbzPollTask?.cancel()
+        if let started = try? await client.startOnlineComicCbz(
+            source: source,
+            comicId: comicId,
+            chapterId: chapter.id,
+            title: title,
+            author: author
+        ) {
+            cbzTask = started
+            let tid = started.taskId
+            cbzPollTask = Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(1.2))
+                    if let st = try? await client.getOnlineComicCbzStatus(taskId: tid) {
+                        cbzTask = st
+                        if st.status != "running" { break }
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    private func modeChip(_ title: String, id: String) -> some View {
+        Button {
+            mode = id
+            Task { await loadList(reset: true) }
+        } label: {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(mode == id ? Color.purple : Color.secondary.opacity(0.14), in: Capsule())
+                .foregroundStyle(mode == id ? .white : .primary)
+        }
+    }
+
+    private func loadCategories() async {
+        guard let client = model.apiClient else { return }
+        if let list = try? await client.listOnlineComicCategories(source: source), !list.isEmpty {
+            categories = list
+        }
+    }
+
+    private func togglePicaFav(comicId: String) async {
+        guard let client = model.apiClient else { return }
+        if let isFav = try? await client.toggleOnlineComicFavorite(source: "pica", comicId: comicId), let d = detail {
+            detail = OnlineComicDetail(
+                source: d.source,
+                id: d.id,
+                title: d.title,
+                authors: d.authors,
+                coverUrl: d.coverUrl,
+                description: d.description,
+                tags: d.tags,
+                isFavourite: isFav,
+                chapters: d.chapters
+            )
+            if mode == "favorites" {
+                await loadList(reset: true)
+            }
+        }
+    }
+
+    private func loadConfig() async {
+        guard let client = model.apiClient else { return }
+        if let c = try? await client.getOnlineComicConfig() {
+            config = c
+            cfgJmDomains = c.jmDomains.joined(separator: ",")
+            cfgJmImgDomains = c.jmImageDomains.joined(separator: ",")
+            cfgPicaEmail = c.picaEmail
+            cfgPicaChannel = c.picaChannel
+        }
+    }
+
+    private func saveConfig() async {
+        guard let client = model.apiClient else { return }
+        do {
+            let jm = cfgJmDomains.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let jmImg = cfgJmImgDomains.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let updated = try await client.saveOnlineComicConfig(
+                jmDomains: jm,
+                jmImageDomains: jmImg,
+                picaEmail: cfgPicaEmail.trimmingCharacters(in: .whitespaces),
+                picaPassword: cfgPicaPassword.isEmpty ? nil : cfgPicaPassword,
+                picaChannel: cfgPicaChannel
+            )
+            config = updated
+            cfgPicaPassword = ""
+            cfgFeedback = updated.picaLoggedIn ? "已保存，哔咔登录成功！" : "配置已保存！"
+            await loadList(reset: true)
+        } catch {
+            cfgFeedback = "保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func loadList(reset: Bool) async {
+        guard let client = model.apiClient else { return }
+        if reset {
+            loading = true
+            page = 1
+            errorMsg = ""
+        } else {
+            page += 1
+        }
+        defer { loading = false }
+        do {
+            let res = try await client.browseOnlineComics(
+                source: source,
+                mode: mode,
+                query: mode == "browse" ? query.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
+                category: mode == "browse" ? category : nil,
+                sort: sort,
+                page: page
+            )
+            items = reset ? res.items : (items + res.items)
+            hasMore = res.hasMore
+        } catch {
+            errorMsg = error.localizedDescription
+            if reset { items = [] }
+        }
+    }
+
+    private func openDetail(_ item: OnlineComicItem) {
+        selectedItem = item
+        detail = nil
+        detailLoading = true
+        chapterDesc = false
+        cbzTask = nil
+        cbzPollTask?.cancel()
+        Task {
+            guard let client = model.apiClient else { return }
+            defer { detailLoading = false }
+            detail = try? await client.getOnlineComicDetail(source: item.source, comicId: item.comicId)
+        }
+    }
+
+    private func openChapter(comicId: String, chapter: OnlineComicChapter) {
+        selectedItem = nil
+        activeChapter = chapter
+        readerImages = []
+        readerPage = 0
+        readerChromeVisible = true
+        readerLoading = true
+        Task {
+            guard let client = model.apiClient else { return }
+            defer { readerLoading = false }
+            if let res = try? await client.getOnlineComicChapterPages(source: source, comicId: comicId, chapterId: chapter.id) {
+                readerImages = res.images
+            }
+        }
     }
 }

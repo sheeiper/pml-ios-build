@@ -485,3 +485,86 @@ struct ComicBatchProgress: Decodable {
     let lastError: String?
     let recentItems: [ComicBatchResultItem]?
 }
+
+struct OnlineComicConfigView: Decodable {
+    let jmDomains: [String]
+    let jmImageDomains: [String]
+    let picaEmail: String
+    let picaHasPassword: Bool
+    let picaLoggedIn: Bool
+    let picaChannel: String
+}
+
+struct OnlineComicItem: Decodable, Identifiable, Hashable {
+    var id: String { "\(source):\(comicId)" }
+    let source: String
+    let comicId: String
+    let title: String
+    let author: String
+    let coverUrl: String
+    let category: String
+    let tags: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case source
+        case comicId = "id"
+        case title, author, coverUrl, category, tags
+    }
+}
+
+struct OnlineComicPageResult: Decodable {
+    let source: String
+    let items: [OnlineComicItem]
+    let page: Int
+    let hasMore: Bool
+    let total: Int64?
+}
+
+struct OnlineComicChapter: Decodable, Identifiable, Hashable {
+    let id: String
+    let order: Int
+    let title: String
+}
+
+struct OnlineComicDetail: Decodable {
+    let source: String
+    let id: String
+    let title: String
+    let authors: [String]
+    let coverUrl: String
+    let description: String
+    let tags: [String]
+    let isFavourite: Bool?
+    let chapters: [OnlineComicChapter]
+}
+
+struct OnlineChapterPagesResult: Decodable {
+    let source: String
+    let comicId: String
+    let chapterId: String
+    let images: [String]
+}
+
+struct ComicMagnetItem: Decodable, Identifiable, Hashable {
+    var id: String { infoHash }
+    let title: String
+    let magnet: String
+    let infoHash: String
+    let size: String
+    let seeders: Int
+    let leechers: Int
+    let pubDate: String
+    let source: String
+}
+
+struct CbzPackageTask: Decodable {
+    let taskId: String
+    let status: String
+    let title: String
+    let total: Int
+    let completed: Int
+    let fileName: String?
+    let downloadUrl: String?
+    let sizeBytes: UInt64?
+    let error: String?
+}
