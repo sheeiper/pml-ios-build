@@ -50,8 +50,10 @@ public struct MovieLibraryView: View {
     @State private var enrichStats: PerformerEnrichStats?
     @State private var enrichProgress: PerformerEnrichProgress?
     @State private var pipelineDiff: MovieSyncDiffSummary?
+    @State private var pipelineSyncProgress: MovieDbSyncProgress?
     @State private var pipelineExtract: MovieExtractSummary?
     @State private var pipelineSyncMode: String?
+    @State private var syncPollTask: Task<Void, Never>?
     @State private var pipelineExtracting = false
     @State private var showDiffAdded = false
     @State private var showDiffRemoved = false
@@ -1343,6 +1345,18 @@ public struct MovieLibraryView: View {
                 Section("① 媒体库数据库（白名单目录）") {
                     Text("库内视频：\(batchStats?.totalWhitelistedVideos ?? 0) · 唯一番号：\(batchStats?.distinctNumbers ?? 0) · 已入库：\(batchStats?.alreadyScraped ?? 0)")
                         .font(.caption)
+                    if let sp = pipelineSyncProgress, sp.running || sp.phase == "done" {
+                        let totalDirs = max(sp.discoveredDirs, sp.scannedDirs, 1)
+                        let pct: Double = sp.phase == "done" ? 1.0 : sp.phase == "reconciling" ? 0.97 : sp.phase == "writing" ? 0.92 : min(0.9, Double(sp.scannedDirs) / Double(totalDirs) * 0.9)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(sp.running ? "同步中（\(Int(pct * 100))%）：已扫目录 \(sp.scannedDirs)/\(totalDirs) · 发现文件 \(sp.foundFiles)\(sp.skippedDirs > 0 ? " · 跳过 \(sp.skippedDirs)" : "")" : "同步已完成：扫描 \(sp.scannedDirs) 目录 · 发现 \(sp.foundFiles) 文件")
+                                .font(.caption2)
+                            ProgressView(value: pct, total: 1.0)
+                            if let cur = sp.currentDir, !cur.isEmpty {
+                                Text(cur).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                        }
+                    }
                     HStack(spacing: 12) {
                         Button {
                             Task { await runPipelineDbSync(mode: "incremental") }
@@ -1350,7 +1364,7 @@ public struct MovieLibraryView: View {
                             Label(pipelineSyncMode == "incremental" ? "增量更新中…" : "增量更新", systemImage: "bolt.fill")
                                 .font(.subheadline.weight(.semibold))
                         }
-                        .disabled(pipelineSyncMode != nil || batchProgress?.running == true)
+                        .disabled(pipelineSyncMode != nil || pipelineSyncProgress?.running == true || batchProgress?.running == true)
                         .tint(.purple)
 
                         Spacer()
@@ -1361,7 +1375,7 @@ public struct MovieLibraryView: View {
                             Label(pipelineSyncMode == "full" ? "全量更新中…" : "全量更新", systemImage: "arrow.triangle.2.circlepath")
                                 .font(.subheadline)
                         }
-                        .disabled(pipelineSyncMode != nil || batchProgress?.running == true)
+                        .disabled(pipelineSyncMode != nil || pipelineSyncProgress?.running == true || batchProgress?.running == true)
                     }
                 }
 
@@ -1483,20 +1497,53 @@ public struct MovieLibraryView: View {
         enrichStats = try? await c.getPerformerEnrichStats()
         enrichProgress = try? await c.getPerformerEnrichProgress()
         pipelineDiff = try? await c.getMovieSyncDiff()
+        pipelineSyncProgress = try? await c.getMovieDbSyncProgress()
+        if pipelineSyncProgress?.running == true {
+            pipelineSyncMode = pipelineSyncProgress?.mode
+            beginSyncPolling()
+        }
         if batchProgress?.running == true || enrichProgress?.running == true {
             beginScrapePolling()
+        }
+    }
+
+    private func beginSyncPolling() {
+        syncPollTask?.cancel()
+        syncPollTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(1200))
+                guard let c = model.apiClient else { break }
+                if let p = try? await c.getMovieDbSyncProgress() {
+                    pipelineSyncProgress = p
+                    if !p.running {
+                        pipelineSyncMode = nil
+                        if let d = p.diff { pipelineDiff = d }
+                        if let err = p.error, !err.isEmpty { errorMessage = "同步失败：\(err)" }
+                        await refreshConsoleState()
+                        await reload()
+                        break
+                    }
+                }
+            }
         }
     }
 
     private func runPipelineDbSync(mode: String) async {
         guard let c = model.apiClient else { return }
         pipelineSyncMode = mode
-        defer { pipelineSyncMode = nil }
         do {
-            pipelineDiff = try await c.runMovieDbSync(mode: mode)
-            await refreshConsoleState()
-            await reload()
+            let p = try await c.runMovieDbSync(mode: mode)
+            pipelineSyncProgress = p
+            if p.running {
+                beginSyncPolling()
+            } else {
+                pipelineSyncMode = nil
+                if let d = p.diff { pipelineDiff = d }
+                await refreshConsoleState()
+                await reload()
+            }
         } catch {
+            pipelineSyncMode = nil
             errorMessage = "数据库更新失败：\(error.localizedDescription)"
         }
     }

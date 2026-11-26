@@ -20,6 +20,122 @@ use crate::{media_library, AppHandle, State};
 
 pub const DOMAINS: [&str; 4] = ["recent", "pending", "vault", "comics"];
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieDbSyncProgress {
+    pub running: bool,
+    pub mode: String,
+    pub phase: String,
+    pub scanned_dirs: usize,
+    pub discovered_dirs: usize,
+    pub skipped_dirs: usize,
+    pub found_files: usize,
+    pub current_dir: Option<String>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub error: Option<String>,
+    pub diff: Option<crate::jav_scraper::MovieSyncDiffSummary>,
+}
+
+impl Default for MovieDbSyncProgress {
+    fn default() -> Self {
+        Self {
+            running: false,
+            mode: "incremental".to_string(),
+            phase: "idle".to_string(),
+            scanned_dirs: 0,
+            discovered_dirs: 0,
+            skipped_dirs: 0,
+            found_files: 0,
+            current_dir: None,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            diff: None,
+        }
+    }
+}
+
+static MOVIE_DB_SYNC_PROGRESS: OnceLock<StdMutex<MovieDbSyncProgress>> = OnceLock::new();
+
+fn sync_progress_lock() -> &'static StdMutex<MovieDbSyncProgress> {
+    MOVIE_DB_SYNC_PROGRESS.get_or_init(|| StdMutex::new(MovieDbSyncProgress::default()))
+}
+
+pub fn get_movie_db_sync_progress() -> MovieDbSyncProgress {
+    sync_progress_lock().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+pub fn start_movie_db_sync_progress(mode: &str) -> MovieDbSyncProgress {
+    let ts = now();
+    if let Ok(mut g) = sync_progress_lock().lock() {
+        *g = MovieDbSyncProgress {
+            running: true,
+            mode: mode.to_string(),
+            phase: "scanning".to_string(),
+            scanned_dirs: 0,
+            discovered_dirs: 1,
+            skipped_dirs: 0,
+            found_files: 0,
+            current_dir: None,
+            started_at: Some(ts),
+            finished_at: None,
+            error: None,
+            diff: None,
+        };
+        return g.clone();
+    }
+    MovieDbSyncProgress::default()
+}
+
+pub fn set_movie_db_sync_phase(phase: &str) {
+    if let Ok(mut g) = sync_progress_lock().lock() {
+        if g.running {
+            g.phase = phase.to_string();
+        }
+    }
+}
+
+pub fn finish_movie_db_sync_progress(diff: crate::jav_scraper::MovieSyncDiffSummary) {
+    let ts = now();
+    if let Ok(mut g) = sync_progress_lock().lock() {
+        g.running = false;
+        g.phase = "done".to_string();
+        if g.discovered_dirs < g.scanned_dirs {
+            g.discovered_dirs = g.scanned_dirs;
+        }
+        g.current_dir = None;
+        g.finished_at = Some(ts);
+        g.error = None;
+        g.diff = Some(diff);
+    }
+}
+
+pub fn fail_movie_db_sync_progress(err: String) {
+    let ts = now();
+    if let Ok(mut g) = sync_progress_lock().lock() {
+        g.running = false;
+        g.phase = "error".to_string();
+        g.current_dir = None;
+        g.finished_at = Some(ts);
+        g.error = Some(err);
+    }
+}
+
+fn note_sync_dir_progress(current_dir: &str, added_dirs: usize, skipped: usize, found_files_delta: usize) {
+    if let Ok(mut g) = sync_progress_lock().lock() {
+        if !g.running {
+            return;
+        }
+        g.phase = "scanning".to_string();
+        g.scanned_dirs += 1;
+        g.discovered_dirs = (g.discovered_dirs + added_dirs).max(g.scanned_dirs);
+        g.skipped_dirs += skipped;
+        g.found_files += found_files_delta;
+        g.current_dir = Some(current_dir.to_string());
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainSummary {
@@ -1083,6 +1199,9 @@ pub(crate) async fn scan_provider_tree(
             let entries = res?;
             validate_provider_listing(&directory, &entries)?;
             listings.push((directory.clone(), entries.clone()));
+            let mut dir_queued = 0usize;
+            let mut dir_skipped = 0usize;
+            let mut dir_files = 0usize;
             for entry in entries {
                 if entry.is_directory {
                     if recursive {
@@ -1092,15 +1211,18 @@ pub(crate) async fn scan_provider_tree(
                                 let etag_match = entry.etag.is_some() && entry.etag == *cached_etag;
                                 if mod_match || etag_match {
                                     // 目录修改时间或 etag 一致，且历史快照完整，跳过此子树递归
+                                    dir_skipped += 1;
                                     continue;
                                 }
                             }
                         }
+                        dir_queued += 1;
                         queue.push_back(entry.path);
                     }
                 } else if let Some(media_type) = domain_media_type(domain, &entry.path) {
                     let name = entry.name.clone();
                     let parent = parent_path(&entry.path);
+                    dir_files += 1;
                     files.push((
                         entry.path,
                         name,
@@ -1116,6 +1238,7 @@ pub(crate) async fn scan_provider_tree(
                     }
                 }
             }
+            note_sync_dir_progress(&directory, dir_queued, dir_skipped, dir_files);
         }
     }
 
@@ -1128,6 +1251,7 @@ pub(crate) async fn scan_provider_tree(
         return Err(error);
     }
 
+    set_movie_db_sync_phase("writing");
     let connection = open_v2(&app)?;
     let tx = connection.unchecked_transaction().map_err(|error| error.to_string())?;
     let mut missing = 0i64;

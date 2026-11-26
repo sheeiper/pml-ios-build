@@ -1560,50 +1560,77 @@ async fn dispatch_command(
         }
         "run_movie_db_sync" => {
             if SYNC_RECONCILE_RUNNING.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
-                return error_response("已有同步扫描任务正在进行中，请等待完成后再试");
+                return result_response(Ok(four_domains::get_movie_db_sync_progress()));
             }
-            struct SyncGuard;
-            impl Drop for SyncGuard {
-                fn drop(&mut self) {
-                    SYNC_RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-            }
-            let _sync_guard = SyncGuard;
-
             let mode = payload.get("mode").and_then(Value::as_str).unwrap_or("incremental").to_ascii_lowercase();
             let incremental = mode != "full";
-            let app_pre = app.clone();
-            let pre_res = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, std::collections::HashMap<String, (String, String)>), String> {
-                let conn = four_domains::open_v2(&app_pre)?;
-                let paths = crate::jav_scraper::get_scrape_whitelist(&conn).map_err(|e| e.to_string())?;
-                let snap = crate::jav_scraper::snapshot_whitelisted_videos(&conn).map_err(|e| e.to_string())?;
-                Ok((paths, snap))
-            }).await;
-            let (paths, before_snap) = match pre_res {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => return error_response(&e),
-                Err(e) => return error_response(&e.to_string()),
-            };
-            let (scanned_dirs, added, updated, removed) = match four_domains::sync_whitelisted_paths(
-                app.clone(),
-                app.state::<MediaLibraryState>(),
-                &paths,
-                true,
-                incremental,
-            ).await {
-                Ok(counts) => counts,
-                Err(e) => return error_response(&e),
-            };
-            let app_post = app.clone();
             let mode_label = if incremental { "incremental" } else { "full" }.to_string();
-            blocking_result_response(move || {
-                let conn = four_domains::open_v2(&app_post)?;
-                let after_snap = crate::jav_scraper::snapshot_whitelisted_videos(&conn).map_err(|e| e.to_string())?;
-                let diff = crate::jav_scraper::record_movie_sync_diff(&conn, &mode_label, scanned_dirs, &before_snap, &after_snap)
-                    .map_err(|e| format!("记录同步变动失败：{e}"))?;
-                let _ = crate::jav_scraper::reconcile_movie_library_changes(&conn, scanned_dirs, added, updated, removed);
-                Ok(diff)
-            }).await
+            let initial = four_domains::start_movie_db_sync_progress(&mode_label);
+            let app_bg = app.clone();
+
+            tokio::spawn(async move {
+                struct SyncGuard;
+                impl Drop for SyncGuard {
+                    fn drop(&mut self) {
+                        SYNC_RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let _sync_guard = SyncGuard;
+
+                let app_pre = app_bg.clone();
+                let pre_res = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, std::collections::HashMap<String, (String, String)>), String> {
+                    let conn = four_domains::open_v2(&app_pre)?;
+                    let paths = crate::jav_scraper::get_scrape_whitelist(&conn).map_err(|e| e.to_string())?;
+                    let snap = crate::jav_scraper::snapshot_whitelisted_videos(&conn).map_err(|e| e.to_string())?;
+                    Ok((paths, snap))
+                }).await;
+                let (paths, before_snap) = match pre_res {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        four_domains::fail_movie_db_sync_progress(e);
+                        return;
+                    }
+                    Err(e) => {
+                        four_domains::fail_movie_db_sync_progress(e.to_string());
+                        return;
+                    }
+                };
+
+                let (scanned_dirs, added, updated, removed) = match four_domains::sync_whitelisted_paths(
+                    app_bg.clone(),
+                    app_bg.state::<MediaLibraryState>(),
+                    &paths,
+                    true,
+                    incremental,
+                ).await {
+                    Ok(counts) => counts,
+                    Err(e) => {
+                        four_domains::fail_movie_db_sync_progress(e);
+                        return;
+                    }
+                };
+
+                four_domains::set_movie_db_sync_phase("reconciling");
+                let app_post = app_bg.clone();
+                let post_res = tokio::task::spawn_blocking(move || -> Result<crate::jav_scraper::MovieSyncDiffSummary, String> {
+                    let conn = four_domains::open_v2(&app_post)?;
+                    let after_snap = crate::jav_scraper::snapshot_whitelisted_videos(&conn).map_err(|e| e.to_string())?;
+                    let diff = crate::jav_scraper::record_movie_sync_diff(&conn, &mode_label, scanned_dirs, &before_snap, &after_snap)
+                        .map_err(|e| format!("记录同步变动失败：{e}"))?;
+                    let _ = crate::jav_scraper::reconcile_movie_library_changes(&conn, scanned_dirs, added, updated, removed);
+                    Ok(diff)
+                }).await;
+                match post_res {
+                    Ok(Ok(diff)) => four_domains::finish_movie_db_sync_progress(diff),
+                    Ok(Err(e)) => four_domains::fail_movie_db_sync_progress(e),
+                    Err(e) => four_domains::fail_movie_db_sync_progress(e.to_string()),
+                }
+            });
+
+            result_response(Ok(initial))
+        }
+        "get_movie_db_sync_progress" => {
+            result_response(Ok(four_domains::get_movie_db_sync_progress()))
         }
         "get_movie_sync_diff" => {
             let app = app.clone();

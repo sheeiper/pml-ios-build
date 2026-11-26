@@ -107,6 +107,8 @@ public struct BatchScrapeStats: Codable {
     public let alreadyScraped: Int
     public let remainingToScrape: Int
     public let failedCount: Int?
+    public let pendingRevalidation: Int?
+    public let unrecognizedVideos: Int?
 }
 
 public struct PerformerSourceCandidate: Codable, Identifiable {
@@ -144,6 +146,21 @@ public struct MovieSyncDiffSummary: Codable {
     public let removedCount: Int
     public let added: [SyncDiffFileItem]
     public let removed: [SyncDiffFileItem]
+}
+
+public struct MovieDbSyncProgress: Codable {
+    public let running: Bool
+    public let mode: String
+    public let phase: String
+    public let scannedDirs: Int
+    public let discoveredDirs: Int
+    public let skippedDirs: Int
+    public let foundFiles: Int
+    public let currentDir: String?
+    public let startedAt: Int64?
+    public let finishedAt: Int64?
+    public let error: String?
+    public let diff: MovieSyncDiffSummary?
 }
 
 public struct MovieExtractSummary: Codable {

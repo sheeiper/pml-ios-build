@@ -131,8 +131,12 @@ extension PMLAPIClient {
         )
     }
 
-    func runMovieDbSync(mode: String = "incremental") async throws -> MovieSyncDiffSummary {
-        try await command("run_movie_db_sync", arguments: ["mode": mode], as: MovieSyncDiffSummary.self)
+    func runMovieDbSync(mode: String = "incremental") async throws -> MovieDbSyncProgress {
+        try await command("run_movie_db_sync", arguments: ["mode": mode], as: MovieDbSyncProgress.self)
+    }
+
+    func getMovieDbSyncProgress() async throws -> MovieDbSyncProgress {
+        try await command("get_movie_db_sync_progress", arguments: [:], as: MovieDbSyncProgress.self)
     }
 
     func getMovieSyncDiff() async throws -> MovieSyncDiffSummary {
