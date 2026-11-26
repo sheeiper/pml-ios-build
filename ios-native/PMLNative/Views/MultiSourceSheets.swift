@@ -18,7 +18,7 @@ struct MovieMultiSourceSheet: View {
         NavigationStack {
             Group {
                 if loading {
-                    ProgressView("正在并发查询 JavDB / JavBus / Jav321 / AV-Wiki…")
+                    ProgressView("正在并发查询 JavDB / JavBus / Jav321 / AV-Wiki / JavFree…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if let errorMessage {
                     ContentUnavailableView("查询失败", systemImage: "exclamationmark.triangle", description: Text(errorMessage))
@@ -163,6 +163,25 @@ struct PerformerMultiSourceSheet: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 12) {
+                            if candidates.count > 1 {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("已查到 \(candidates.count) 个互补数据源，可一键聚合高清头像、档案、别名与中文简介")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Button {
+                                        Task { await adoptMerged() }
+                                    } label: {
+                                        Label(applyingKey == "merged:all" ? "正在聚合保存…" : "一键聚合保存（推荐）", systemImage: "sparkles")
+                                            .font(.subheadline.bold())
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.purple)
+                                    .disabled(applyingKey != nil)
+                                }
+                                .padding(12)
+                                .background(Color.purple.opacity(0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            }
                             ForEach(candidates) { cand in
                                 VStack(alignment: .leading, spacing: 10) {
                                     HStack(alignment: .top, spacing: 12) {
@@ -275,5 +294,231 @@ struct PerformerMultiSourceSheet: View {
             errorMessage = error.localizedDescription
         }
         applyingKey = nil
+    }
+
+    private func adoptMerged() async {
+        guard !candidates.isEmpty else { return }
+        func pickString(_ order: [String], _ getter: (PerformerSourceCandidate) -> String?) -> String? {
+            for src in order {
+                if let hit = candidates.first(where: { $0.source == src }),
+                   let val = getter(hit)?.trimmingCharacters(in: .whitespacesAndNewlines), !val.isEmpty {
+                    return val
+                }
+            }
+            for c in candidates {
+                if let val = getter(c)?.trimmingCharacters(in: .whitespacesAndNewlines), !val.isEmpty {
+                    return val
+                }
+            }
+            return nil
+        }
+        func pickInt(_ order: [String], _ getter: (PerformerSourceCandidate) -> Int?) -> Int? {
+            for src in order {
+                if let hit = candidates.first(where: { $0.source == src }), let val = getter(hit), val > 0 {
+                    return val
+                }
+            }
+            for c in candidates {
+                if let val = getter(c), val > 0 { return val }
+            }
+            return nil
+        }
+        var aliasSet = Set<String>()
+        var mergedAliases: [String] = []
+        for c in candidates {
+            for a in c.aliases {
+                let clean = a.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !clean.isEmpty, clean != performerName, aliasSet.insert(clean).inserted {
+                    mergedAliases.append(clean)
+                }
+            }
+        }
+        let merged = PerformerSourceCandidate(
+            source: "merged",
+            sourceLabel: "多源聚合",
+            name: performerName,
+            aliases: mergedAliases,
+            avatarUrl: pickString(["gfriends", "javbus", "javdb", "wikipedia"], { $0.avatarUrl }),
+            profileUrl: pickString(["javbus", "javdb", "wikipedia"], { $0.profileUrl }),
+            birthDate: pickString(["javbus", "javdb", "wikipedia"], { $0.birthDate }),
+            heightCm: pickInt(["javbus", "javdb", "wikipedia"], { $0.heightCm }),
+            measurements: pickString(["javbus", "javdb", "wikipedia"], { $0.measurements }),
+            hometown: pickString(["javbus", "javdb", "wikipedia"], { $0.hometown }),
+            hobby: pickString(["javbus", "javdb", "wikipedia"], { $0.hobby }),
+            bloodType: pickString(["wikipedia", "javbus", "javdb"], { $0.bloodType }),
+            debutYear: pickString(["wikipedia", "javbus", "javdb"], { $0.debutYear }),
+            agency: pickString(["wikipedia", "javbus", "javdb"], { $0.agency }),
+            bio: pickString(["wikipedia", "javbus", "javdb"], { $0.bio })
+        )
+        await adopt(merged, avatarOnly: false)
+    }
+}
+
+/// 同系列作品查看 Sheet（Tab 1: 库内已有，Tab 2: 全网同系列 / 未入库）
+struct MovieSeriesSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    let series: String
+    let onOpenLocalMovie: (MovieMetadata) -> Void
+    let onPlayAsset: (String, String) -> Void
+
+    private enum SeriesTab: String, CaseIterable, Identifiable {
+        case local = "库内已有"
+        case online = "全网 / 未入库"
+        var id: String { rawValue }
+    }
+
+    @State private var tab: SeriesTab = .local
+    @State private var localMovies: [MovieMetadata] = []
+    @State private var localLoading = true
+    @State private var onlineMovies: [PerformerRecentRelease] = []
+    @State private var onlineLoading = false
+    @State private var onlineLoaded = false
+    @State private var onlyUnowned = true
+    @State private var selectedOnline: PerformerRecentRelease?
+    @State private var errorMessage: String?
+
+    private var filteredOnline: [PerformerRecentRelease] {
+        onlyUnowned ? onlineMovies.filter { !$0.inLibrary } : onlineMovies
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 10) {
+                Picker("视图", selection: $tab) {
+                    ForEach(SeriesTab.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .onChange(of: tab) { _, next in
+                    if next == .online && !onlineLoaded && !onlineLoading {
+                        Task { await loadOnline(force: false) }
+                    }
+                }
+
+                if tab == .online {
+                    HStack {
+                        Toggle("仅看未入库", isOn: $onlyUnowned)
+                            .font(.caption.weight(.semibold))
+                        Spacer()
+                        Button {
+                            Task { await loadOnline(force: true) }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .disabled(onlineLoading)
+                    }
+                    .padding(.horizontal)
+                }
+
+                if let errorMessage {
+                    Text(errorMessage).font(.caption).foregroundStyle(.red).padding(.horizontal)
+                }
+
+                if tab == .local {
+                    if localLoading {
+                        ProgressView("正在加载库内同系列作品…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if localMovies.isEmpty {
+                        ContentUnavailableView("暂无库内作品", systemImage: "film.stack")
+                    } else {
+                        ScrollView {
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                                ForEach(localMovies) { m in
+                                    Button { onOpenLocalMovie(m) } label: {
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            ZStack {
+                                                Color.black.opacity(0.85)
+                                                if let raw = m.coverUrl, let url = model.proxyScraperImageURL(rawUrl: raw) {
+                                                    CachedImageView(url: url, contentMode: .fit, minHeight: 96, maxPixel: 480)
+                                                }
+                                            }
+                                            .aspectRatio(3 / 2, contentMode: .fit)
+                                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                                            Text(m.number).font(.caption2.bold()).foregroundStyle(.purple)
+                                            Text(m.title).font(.caption).lineLimit(2).foregroundStyle(.primary)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
+                } else {
+                    if onlineLoading {
+                        ProgressView("正在查询「\(series)」全网同系列…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if filteredOnline.isEmpty {
+                        ContentUnavailableView(
+                            onlyUnowned && !onlineMovies.isEmpty ? "查到的作品均已入库" : "暂未查到同系列作品",
+                            systemImage: "globe"
+                        )
+                    } else {
+                        ScrollView {
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                                ForEach(filteredOnline) { item in
+                                    Button { selectedOnline = item } label: {
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            ZStack {
+                                                Color.black.opacity(0.85)
+                                                if let raw = item.coverUrl, let url = model.proxyScraperImageURL(rawUrl: raw) {
+                                                    CachedImageView(url: url, contentMode: .fit, minHeight: 96, maxPixel: 480)
+                                                }
+                                            }
+                                            .overlay(alignment: .topTrailing) {
+                                                Text(item.inLibrary ? "库内已有" : "未入库")
+                                                    .font(.system(size: 9, weight: .bold))
+                                                    .padding(.horizontal, 5)
+                                                    .padding(.vertical, 2)
+                                                    .background((item.inLibrary ? Color.green : Color.orange).opacity(0.9), in: Capsule())
+                                                    .foregroundStyle(.white)
+                                                    .padding(5)
+                                            }
+                                            .aspectRatio(3 / 2, contentMode: .fit)
+                                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                                            Text(item.number).font(.caption2.bold()).foregroundStyle(.purple)
+                                            Text(item.title).font(.caption).lineLimit(2).foregroundStyle(.primary)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(series)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } }
+            }
+            .sheet(item: $selectedOnline) { rel in
+                OnlineMovieDetailSheet(release: rel, onPlayAsset: onPlayAsset)
+                    .environmentObject(model)
+            }
+            .task { await loadLocal() }
+        }
+    }
+
+    private func loadLocal() async {
+        guard let client = model.apiClient else { localLoading = false; return }
+        localLoading = true
+        do { localMovies = try await client.listMoviesBySeries(series: series) }
+        catch { errorMessage = error.localizedDescription }
+        localLoading = false
+    }
+
+    private func loadOnline(force: Bool) async {
+        guard let client = model.apiClient else { return }
+        onlineLoading = true
+        errorMessage = nil
+        do {
+            onlineMovies = try await client.getSeriesOnlineMovies(series: series, forceRefresh: force)
+            onlineLoaded = true
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        onlineLoading = false
     }
 }

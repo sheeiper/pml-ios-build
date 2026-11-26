@@ -45,6 +45,7 @@ public struct MovieDetailSheet: View {
     @State private var copyToast: String?
     @State private var showNoAssetAlert = false
     @State private var showMultiSourceSheet = false
+    @State private var activeSeriesSheet: String?
 
     public init(
         number: String? = nil,
@@ -198,79 +199,86 @@ public struct MovieDetailSheet: View {
                             }
                         }
 
-                        // Play & Rescrape Buttons
-                        HStack(spacing: 12) {
-                            Button {
-                                if let targetId = parts.first?.assetId ?? meta.assetId ?? assetId {
-                                    Task { await playLocally(assetId: targetId, title: meta.title) }
-                                } else {
-                                    showNoAssetAlert = true
-                                }
-                            } label: {
-                                HStack(spacing: 6) {
-                                    if resolvingPlayback {
-                                        ProgressView().tint(.white)
+                        // Play & Actions (2 clean rows so Play & Subtitle are never truncated)
+                        VStack(spacing: 8) {
+                            HStack(spacing: 10) {
+                                Button {
+                                    if let targetId = parts.first?.assetId ?? meta.assetId ?? assetId {
+                                        Task { await playLocally(assetId: targetId, title: meta.title) }
                                     } else {
-                                        Image(systemName: "play.fill")
+                                        showNoAssetAlert = true
                                     }
-                                    Text(resolvingPlayback ? "解析中…" : "立即播放")
-                                }
-                                .font(.headline)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.purple)
-                            .disabled(resolvingPlayback)
-
-                            Button {
-                                Task { await searchSubtitles(for: meta.number) }
-                            } label: {
-                                if subtitleSearching {
-                                    ProgressView()
-                                        .padding(.vertical, 8)
-                                        .padding(.horizontal, 12)
-                                } else {
-                                    Label("字幕", systemImage: "captions.bubble")
-                                        .font(.subheadline.bold())
-                                        .padding(.vertical, 8)
-                                        .padding(.horizontal, 6)
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(subtitleSearching)
-
-                            let isMovieFav = favs.isMovieFav(meta.number)
-                            Button {
-                                Task { await favs.toggle(client: appModel.apiClient, type: .movie, id: meta.number) }
-                            } label: {
-                                Image(systemName: isMovieFav ? "heart.fill" : "heart")
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if resolvingPlayback {
+                                            ProgressView().tint(.white)
+                                        } else {
+                                            Image(systemName: "play.fill")
+                                        }
+                                        Text(resolvingPlayback ? "解析中…" : "立即播放")
+                                            .lineLimit(1)
+                                    }
                                     .font(.headline)
-                                    .foregroundStyle(isMovieFav ? .pink : .primary)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.purple)
+                                .disabled(resolvingPlayback)
+
+                                Button {
+                                    Task { await searchSubtitles(for: meta.number) }
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        if subtitleSearching {
+                                            ProgressView()
+                                        } else {
+                                            Image(systemName: "captions.bubble")
+                                        }
+                                        Text("字幕")
+                                            .lineLimit(1)
+                                    }
+                                    .font(.subheadline.bold())
                                     .padding(.vertical, 8)
                                     .padding(.horizontal, 12)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(subtitleSearching)
                             }
-                            .buttonStyle(.bordered)
 
-                            Button {
-                                showMultiSourceSheet = true
-                            } label: {
-                                Image(systemName: "square.stack.3d.up")
-                                    .font(.headline)
-                                    .padding(.vertical, 8)
-                                    .padding(.horizontal, 12)
-                            }
-                            .buttonStyle(.bordered)
+                            HStack(spacing: 8) {
+                                let isMovieFav = favs.isMovieFav(meta.number)
+                                Button {
+                                    Task { await favs.toggle(client: appModel.apiClient, type: .movie, id: meta.number) }
+                                } label: {
+                                    Label(isMovieFav ? "已收藏" : "收藏", systemImage: isMovieFav ? "heart.fill" : "heart")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(isMovieFav ? .pink : .primary)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.bordered)
 
-                            Button {
-                                Task { await loadData(force: true) }
-                            } label: {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(.headline)
-                                    .padding(.vertical, 8)
-                                    .padding(.horizontal, 14)
+                                Button {
+                                    showMultiSourceSheet = true
+                                } label: {
+                                    Label("多源资料", systemImage: "square.stack.3d.up")
+                                        .font(.caption.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.bordered)
+
+                                Button {
+                                    Task { await loadData(force: true) }
+                                } label: {
+                                    Label("刷新", systemImage: "arrow.clockwise")
+                                        .font(.caption.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.bordered)
                             }
-                            .buttonStyle(.bordered)
                         }
 
                         // Chinese Subtitle Management (zh-CN / zh-TW only)
@@ -281,7 +289,7 @@ public struct MovieDetailSheet: View {
                         // Multi-part / local file switcher
                         if !parts.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
-                                Text(parts.count > 1 ? "多分片视频（共 \(parts.count) 个文件）" : "关联本地视频")
+                                Text(parts.count > 1 ? "多文件版本 / 分段（共 \(parts.count) 个文件）" : "关联本地视频")
                                     .font(.footnote.bold())
                                     .foregroundStyle(.secondary)
                                 ForEach(Array(parts.enumerated()), id: \.element.id) { idx, part in
@@ -299,15 +307,28 @@ public struct MovieDetailSheet: View {
                                                     .background(Color.purple.opacity(0.2), in: RoundedRectangle(cornerRadius: 4))
                                                     .foregroundStyle(.purple)
                                             }
-                                            VStack(alignment: .leading, spacing: 2) {
+                                            VStack(alignment: .leading, spacing: 3) {
                                                 Text(part.fileName)
                                                     .font(.caption.weight(.semibold))
                                                     .lineLimit(1)
                                                     .foregroundStyle(.primary)
-                                                Text(part.remotePath)
-                                                    .font(.system(size: 10))
-                                                    .lineLimit(1)
-                                                    .foregroundStyle(.secondary)
+                                                if let badges = part.badges, !badges.isEmpty {
+                                                    HStack(spacing: 4) {
+                                                        ForEach(badges, id: \.self) { b in
+                                                            Text(b)
+                                                                .font(.system(size: 10, weight: .bold))
+                                                                .padding(.horizontal, 5)
+                                                                .padding(.vertical, 1.5)
+                                                                .background(partBadgeColor(b).opacity(0.2), in: Capsule())
+                                                                .foregroundStyle(partBadgeColor(b))
+                                                        }
+                                                    }
+                                                } else {
+                                                    Text(part.remotePath)
+                                                        .font(.system(size: 10))
+                                                        .lineLimit(1)
+                                                        .foregroundStyle(.secondary)
+                                                }
                                             }
                                             Spacer()
                                             if part.sizeBytes > 0 {
@@ -338,6 +359,17 @@ public struct MovieDetailSheet: View {
                                             }
                                             .font(.caption.weight(.semibold))
                                             .foregroundStyle(.purple)
+                                        } else if spec.isSeries, let series = meta.series, !series.isEmpty {
+                                            Button {
+                                                activeSeriesSheet = series
+                                            } label: {
+                                                HStack(spacing: 4) {
+                                                    Text(series).lineLimit(2)
+                                                    Image(systemName: "chevron.right").font(.caption2)
+                                                }
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(.purple)
+                                            }
                                         } else {
                                             Text(spec.value)
                                                 .font(.caption.weight(.semibold))
@@ -531,6 +563,27 @@ public struct MovieDetailSheet: View {
             } message: {
                 Text(playbackErrorText ?? "")
             }
+            .sheet(isPresented: Binding(
+                get: { activeSeriesSheet != nil },
+                set: { if !$0 { activeSeriesSheet = nil } }
+            )) {
+                if let series = activeSeriesSheet {
+                    MovieSeriesSheet(
+                        series: series,
+                        onOpenLocalMovie: { movie in
+                            activeSeriesSheet = nil
+                            metadata = movie
+                            currentNumber = movie.number
+                            Task { await loadAux(for: movie.number) }
+                        },
+                        onPlayAsset: { targetId, title in
+                            activeSeriesSheet = nil
+                            Task { await playLocally(assetId: targetId, title: title) }
+                        }
+                    )
+                    .environmentObject(appModel)
+                }
+            }
             .fullScreenCover(item: $activeFullScreen) { modal in
                 switch modal {
                 case .sample(let idx):
@@ -610,16 +663,25 @@ public struct MovieDetailSheet: View {
         }
     }
 
-    private struct SpecItem { let label: String; let value: String; var isMaker: Bool = false }
+    private struct SpecItem { let label: String; let value: String; var isMaker: Bool = false; var isSeries: Bool = false }
 
     private func buildSpecs(_ meta: MovieMetadata) -> [SpecItem] {
         var list: [SpecItem] = []
         if let maker = meta.maker, !maker.isEmpty { list.append(SpecItem(label: "片商", value: maker, isMaker: true)) }
         if let label = meta.label, !label.isEmpty { list.append(SpecItem(label: "发行厂牌", value: label)) }
-        if let series = meta.series, !series.isEmpty { list.append(SpecItem(label: "所属系列", value: series)) }
+        if let series = meta.series, !series.isEmpty { list.append(SpecItem(label: "所属系列", value: series, isSeries: true)) }
         if let director = meta.director, !director.isEmpty { list.append(SpecItem(label: "导演", value: director)) }
         list.append(SpecItem(label: "数据来源", value: meta.source.isEmpty ? "未知" : meta.source))
         return list
+    }
+
+    private func partBadgeColor(_ badge: String) -> Color {
+        if badge.contains("LTX") { return .orange }
+        if badge.contains("特典") || badge.contains("花絮") { return .yellow }
+        if badge.contains("重复") { return .red }
+        if badge.contains("中字") || badge.contains("破解") { return .green }
+        if badge.contains("4K") || badge.contains("1080P") || badge.contains("AI修复") { return .blue }
+        return .purple
     }
 
     private func formatBytes(_ bytes: Int64) -> String {

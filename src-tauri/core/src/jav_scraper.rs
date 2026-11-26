@@ -87,7 +87,12 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             remote_path TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_movie_sync_diff_run ON movie_sync_diff_log(run_id, change_type);"
+        CREATE INDEX IF NOT EXISTS idx_movie_sync_diff_run ON movie_sync_diff_log(run_id, change_type);
+        CREATE TABLE IF NOT EXISTS movie_sync_diff_state (
+            run_id TEXT PRIMARY KEY,
+            consumed_at INTEGER NOT NULL,
+            summary TEXT NOT NULL
+        );"
     )?;
 
     // Automatically quarantine promotional clips and ad videos from unrecognized lists
@@ -158,10 +163,191 @@ pub struct MovieAssetPart {
     pub remote_path: String,
     pub size_bytes: i64,
     pub duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub part_kind: String,
+    #[serde(default)]
+    pub part_label: String,
+    #[serde(default)]
+    pub badges: Vec<String>,
+    #[serde(default)]
+    pub priority: i32,
+}
+
+fn has_token(upper: &str, token: &str) -> bool {
+    let bytes = upper.as_bytes();
+    let tbytes = token.as_bytes();
+    if tbytes.is_empty() || bytes.len() < tbytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + tbytes.len() <= bytes.len() {
+        if &bytes[i..i + tbytes.len()] == tbytes {
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let right_ok = i + tbytes.len() == bytes.len() || !bytes[i + tbytes.len()].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn detect_part_index(stem_upper: &str) -> Option<(i32, String)> {
+    if stem_upper.contains("前编") || stem_upper.contains("前編") {
+        return Some((1, "前编".to_string()));
+    }
+    if stem_upper.contains("后编") || stem_upper.contains("後編") {
+        return Some((2, "后编".to_string()));
+    }
+    for prefix in ["PART", "CD", "DISC", "FHD"] {
+        if let Some(pos) = stem_upper.rfind(prefix) {
+            let rest = &stem_upper[pos + prefix.len()..];
+            let trimmed = rest.trim_start_matches(['-', '_', ' ']);
+            let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() && digits.len() <= 2 {
+                if let Ok(n) = digits.parse::<i32>() {
+                    if (1..=20).contains(&n) {
+                        return Some((n, format!("分段 {n}")));
+                    }
+                }
+            }
+        }
+    }
+    // Trailing -1 / _2 / " 1" (common in FC2PPV-4470851-1, 25ID-042_2, IDBD-773 1)
+    let bytes = stem_upper.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    let digit_len = bytes.len() - end;
+    if (1..=2).contains(&digit_len) && end > 0 && matches!(bytes[end - 1], b'-' | b'_' | b' ') {
+        if let Ok(n) = stem_upper[end..].parse::<i32>() {
+            if (1..=20).contains(&n) {
+                return Some((n, format!("分段 {n}")));
+            }
+        }
+    }
+    None
+}
+
+fn enrich_movie_asset_parts(parts: &mut Vec<MovieAssetPart>) {
+    let mut seen_names = std::collections::HashSet::<String>::new();
+    let mut part_orders: Vec<(usize, i32, bool)> = Vec::with_capacity(parts.len());
+
+    for (idx, p) in parts.iter_mut().enumerate() {
+        let lower_name = p.file_name.to_ascii_lowercase();
+        let is_dup = !seen_names.insert(lower_name.clone());
+        let stem = p.file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&p.file_name);
+        let upper = stem.to_ascii_uppercase();
+        let ext = p.file_name.rsplit_once('.').map(|(_, e)| e.to_ascii_uppercase()).unwrap_or_default();
+
+        let mut badges: Vec<String> = Vec::new();
+        let mut priority: i32 = 0;
+
+        // Bonus / special detection
+        let is_bonus = has_token(&upper, "SP")
+            || upper.contains("_SP")
+            || upper.contains("-SP")
+            || upper.contains("OMAKE")
+            || has_token(&upper, "BONUS")
+            || p.file_name.contains("特典")
+            || p.file_name.contains("花絮");
+
+        // Quality / AI / Subtitle / Uncensored badges
+        if has_token(&upper, "LTX") || upper.contains("-LTX") || upper.contains("_LTX") {
+            badges.push("LTX AI破解".to_string());
+            priority += 100;
+        }
+        if upper.contains("RESTORED") {
+            badges.push("AI修复".to_string());
+            priority += 35;
+        }
+        if upper.contains("60FPS") {
+            badges.push("60帧".to_string());
+            priority += 15;
+        }
+        if has_token(&upper, "UC") {
+            badges.push("破解中字".to_string());
+            priority += 55;
+        } else if has_token(&upper, "C") || has_token(&upper, "CH") || p.file_name.contains("中字") {
+            badges.push("中字".to_string());
+            priority += 40;
+        } else if has_token(&upper, "U") || upper.contains("UNCENSORED") || p.file_name.contains("无码") {
+            badges.push("无码破解".to_string());
+            priority += 30;
+        }
+
+        if has_token(&upper, "4K") || upper.contains("2160P") {
+            badges.push("4K".to_string());
+            priority += 45;
+        } else if upper.contains("1080P") || has_token(&upper, "FHD") || upper.contains("FULLHD") || upper.contains("WHOLE2048") {
+            badges.push("1080P".to_string());
+            priority += 25;
+        } else if upper.contains("720P") || has_token(&upper, "HD") || has_token(&upper, "HIGH") {
+            badges.push("720P".to_string());
+            priority += 10;
+        } else if upper.contains("PSP") || has_token(&upper, "MID") || has_token(&upper, "DIVX") {
+            badges.push("低码".to_string());
+            priority -= 20;
+        }
+
+        let mut part_num: i32 = 0;
+        if is_dup {
+            p.part_kind = "duplicate".to_string();
+            badges.push("重复副本".to_string());
+            priority -= 80;
+        } else if is_bonus {
+            p.part_kind = "bonus".to_string();
+            badges.insert(0, "特典".to_string());
+            priority -= 50;
+        } else if let Some((n, label)) = detect_part_index(&upper) {
+            p.part_kind = "part".to_string();
+            part_num = n;
+            badges.insert(0, label);
+        } else {
+            p.part_kind = "main".to_string();
+            if badges.is_empty() && !ext.is_empty() {
+                badges.push(ext);
+            }
+        }
+
+        p.part_label = if badges.is_empty() {
+            "正片".to_string()
+        } else {
+            badges.join(" · ")
+        };
+        p.badges = badges;
+        p.priority = priority;
+        part_orders.push((idx, part_num, p.part_kind == "part"));
+    }
+
+    let has_segments = parts.iter().any(|p| p.part_kind == "part");
+    if has_segments {
+        // Keep segments ordered naturally (main/part 1, 2, 3... then bonus, then duplicates)
+        parts.sort_by(|a, b| {
+            let rank = |k: &str| match k {
+                "main" | "part" => 0,
+                "bonus" => 1,
+                _ => 2,
+            };
+            rank(&a.part_kind)
+                .cmp(&rank(&b.part_kind))
+                .then_with(|| a.file_name.to_ascii_lowercase().cmp(&b.file_name.to_ascii_lowercase()))
+        });
+    } else {
+        // Multiple versions: sort highest quality / LTX / 4K / subbed first so default Play picks the best one
+        parts.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| b.size_bytes.cmp(&a.size_bytes))
+                .then_with(|| a.file_name.to_ascii_lowercase().cmp(&b.file_name.to_ascii_lowercase()))
+        });
+    }
 }
 
 /// Return all non-missing video assets (parts / editions) bound to a movie number,
-/// ordered naturally by file name so multi-part FC2/JAV releases can switch parts cleanly.
+/// enriched with version/segment badges and sorted by best quality or segment order.
 pub fn list_movie_assets(conn: &Connection, number: &str) -> Result<Vec<MovieAssetPart>, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
     let upper = normalize_jav_number(number).unwrap_or_else(|| number.to_string());
@@ -182,6 +368,56 @@ pub fn list_movie_assets(conn: &Connection, number: &str) -> Result<Vec<MovieAss
             remote_path: r.get(2)?,
             size_bytes: r.get(3)?,
             duration_seconds: r.get(4)?,
+            part_kind: String::new(),
+            part_label: String::new(),
+            badges: Vec::new(),
+            priority: 0,
+        })
+    })?;
+    let mut parts: Vec<MovieAssetPart> = rows.collect::<Result<Vec<_>, _>>()?;
+    enrich_movie_asset_parts(&mut parts);
+    Ok(parts)
+}
+
+/// List all verified local library movies belonging to a given series name.
+pub fn list_movies_by_series(conn: &Connection, series: &str) -> Result<Vec<MovieMetadata>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let clean = series.trim();
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
+                director, release_date, duration_minutes, cover_url, sample_images_json,
+                tags_json, source, updated_at
+         FROM movie_metadata
+         WHERE verification_version = 1
+           AND source NOT IN ('javdb_not_found','not_found','')
+           AND cover_url IS NOT NULL AND cover_url != ''
+           AND series = ?1
+         ORDER BY COALESCE(release_date, '') DESC, updated_at DESC"
+    )?;
+    let rows = stmt.query_map(params![clean], |r| {
+        let actors_str: String = r.get(4)?;
+        let samples_str: String = r.get(12)?;
+        let tags_str: String = r.get(13)?;
+        Ok(MovieMetadata {
+            number: r.get(0)?,
+            asset_id: r.get(1)?,
+            title: r.get(2)?,
+            original_title: r.get(3)?,
+            actors: serde_json::from_str(&actors_str).unwrap_or_default(),
+            maker: r.get(5)?,
+            label: r.get(6)?,
+            series: r.get(7)?,
+            director: r.get(8)?,
+            release_date: r.get(9)?,
+            duration_minutes: r.get(10)?,
+            cover_url: r.get(11)?,
+            sample_images: serde_json::from_str(&samples_str).unwrap_or_default(),
+            tags: serde_json::from_str(&tags_str).unwrap_or_default(),
+            source: r.get(14)?,
+            updated_at: r.get(15)?,
         })
     })?;
     rows.collect()
@@ -1491,7 +1727,10 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         let tag = s.split('>').next()?;
         attribute(tag, "src").or_else(|| attribute(tag, "data-src"))
     });
-    let search_date = None::<String>;
+    let search_date = card.split("class=\"meta\"").nth(1)
+        .and_then(|s| s.split_once('>')).and_then(|(_, s)| s.split_once("</div>"))
+        .map(|(s, _)| plain_text(s))
+        .and_then(|d| normalize_release_date(Some(&d)));
 
     let detail_url = format!("https://javdb.com{}", detail_path);
     let detail_resp = client
@@ -1508,8 +1747,34 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         _ => String::new(),
     };
 
-    let is_captcha = html.contains("auth-captcha-image") || html.contains("driver-verify") || html.is_empty();
-    if is_captcha {
+    let is_login_or_captcha = html.contains("auth-captcha-image")
+        || html.contains("driver-verify")
+        || html.contains("<title> 登入")
+        || html.contains("<title>登入")
+        || html.is_empty();
+    if is_login_or_captcha {
+        // When JavDB gates the detail page behind login (common for FC2 & older uncensored titles),
+        // fall back to the exact-matched search card which already carries validated title, cover, and date.
+        if let (Some(st), Some(sc)) = (search_title.filter(|t| !t.is_empty()), search_cover.filter(|c| !c.is_empty())) {
+            return Ok(MovieMetadata {
+                number: number.to_string(),
+                asset_id: None,
+                title: st,
+                original_title: None,
+                actors: Vec::new(),
+                maker: if number.starts_with("FC2-") { Some("FC2".to_string()) } else { None },
+                label: None,
+                series: None,
+                director: None,
+                release_date: search_date,
+                duration_minutes: None,
+                cover_url: Some(sc),
+                sample_images: Vec::new(),
+                tags: if number.starts_with("FC2-") { vec!["FC2".to_string()] } else { Vec::new() },
+                source: "javdb".to_string(),
+                updated_at: chrono::Utc::now().timestamp(),
+            });
+        }
         return Err(format!("JavDB 详情页需要验证或加载失败【{number}】"));
     }
     let normalized_detail = detail_identity(&html, &["<strong>番號:</strong>", "<strong>番号:</strong>"]);
@@ -2158,34 +2423,63 @@ pub async fn scrape_from_avwiki(number: &str) -> Result<MovieMetadata, String> {
 pub async fn query_movie_multi_source(raw: &str) -> Result<Vec<MovieMetadata>, String> {
     let number = normalize_jav_number(raw).ok_or_else(|| "无效或有歧义的番号".to_string())?;
     let mut results: Vec<MovieMetadata> = Vec::new();
-    let is_date = number.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let nb = number.as_bytes();
+    let is_date = (nb.len() == 9 || nb.len() == 10)
+        && nb[..6].iter().all(u8::is_ascii_digit)
+        && matches!(nb[6], b'-' | b'_')
+        && nb[7..].iter().all(u8::is_ascii_digit);
 
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(18), async {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(22), async {
         if is_date {
             if number.contains('_') {
-                let (r1, r2) = tokio::join!(scrape_from_1pondo(&number), scrape_from_javdb(&number));
+                let (r1, r2, r3, r4) = tokio::join!(
+                    scrape_from_1pondo(&number),
+                    scrape_from_javbus(&number),
+                    scrape_from_javdb(&number),
+                    scrape_from_javfree(&number),
+                );
                 if let Ok(m) = r1 { results.push(m); }
                 if let Ok(m) = r2 { results.push(m); }
+                if let Ok(m) = r3 { results.push(m); }
+                if let Ok(m) = r4 { results.push(m); }
             } else {
-                let (r1, r2) = tokio::join!(scrape_from_caribbeancom(&number), scrape_from_javdb(&number));
+                let (r1, r2, r3, r4) = tokio::join!(
+                    scrape_from_caribbeancom(&number),
+                    scrape_from_javbus(&number),
+                    scrape_from_javdb(&number),
+                    scrape_from_javfree(&number),
+                );
                 if let Ok(m) = r1 { results.push(m); }
                 if let Ok(m) = r2 { results.push(m); }
+                if let Ok(m) = r3 { results.push(m); }
+                if let Ok(m) = r4 { results.push(m); }
             }
         } else if number.starts_with("FC2-") {
-            let (r1, r2) = tokio::join!(scrape_from_fc2(&number), scrape_from_javdb(&number));
+            let (r1, r2, r3, r4, r5) = tokio::join!(
+                scrape_from_fc2(&number),
+                scrape_from_javdb(&number),
+                scrape_from_javfree(&number),
+                scrape_from_avwiki(&number),
+                scrape_from_jav321(&number),
+            );
             if let Ok(m) = r1 { results.push(m); }
             if let Ok(m) = r2 { results.push(m); }
+            if let Ok(m) = r3 { results.push(m); }
+            if let Ok(m) = r4 { results.push(m); }
+            if let Ok(m) = r5 { results.push(m); }
         } else {
-            let (r_db, r_bus, r_321, r_wiki) = tokio::join!(
+            let (r_db, r_bus, r_321, r_wiki, r_jf) = tokio::join!(
                 scrape_from_javdb(&number),
                 scrape_from_javbus(&number),
                 scrape_from_jav321(&number),
                 scrape_from_avwiki(&number),
+                scrape_from_javfree(&number),
             );
             if let Ok(m) = r_db { results.push(m); }
             if let Ok(m) = r_bus { results.push(m); }
             if let Ok(m) = r_321 { results.push(m); }
             if let Ok(m) = r_wiki { results.push(m); }
+            if let Ok(m) = r_jf { results.push(m); }
         }
     }).await;
 
@@ -2208,6 +2502,129 @@ pub fn invalidate_metadata_cache(number: &str) {
 
 /// Shared successes avoid repeated network requests. Failures are never negative-cached:
 /// a timeout/challenge is not proof that an identity does not exist.
+async fn javfree_get_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    static JAVFREE_GATE: OnceLock<tokio::sync::Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    let gate = JAVFREE_GATE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let min_gap = std::time::Duration::from_millis(2200);
+
+    for attempt in 0..2 {
+        {
+            let mut last = gate.lock().await;
+            if let Some(prev) = *last {
+                let elapsed = prev.elapsed();
+                if elapsed < min_gap {
+                    tokio::time::sleep(min_gap - elapsed).await;
+                }
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let resp = client
+            .get(url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .send()
+            .await
+            .map_err(|e| format!("请求 JavFree 失败：{e}"))?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
+            let wait_secs = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(8)
+                .clamp(4, 15);
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("JavFree 状态码异常：{}", resp.status()));
+        }
+        return resp.text().await.map_err(|e| format!("读取 JavFree 响应失败：{e}"));
+    }
+    Err("JavFree 触发限流（429 Too Many Requests）".to_string())
+}
+
+/// Scrape from JavFree archive (`javfree.me`) — great coverage for delisted FC2-PPV and uncensored titles.
+pub async fn scrape_from_javfree(number: &str) -> Result<MovieMetadata, String> {
+    let client = scraper_client()?;
+    let query = if number.starts_with("FC2-") {
+        format!("FC2-PPV-{}", number.trim_start_matches("FC2-"))
+    } else {
+        number.to_string()
+    };
+    let slug_needle = query.to_ascii_lowercase();
+    let search_url = format!("https://javfree.me/?s={query}");
+    let search_html = javfree_get_text(&client, &search_url).await?;
+    // Match only main search result cards (exclude sidebar Random Posts)
+    let main_html = search_html.split("id=\"secondary\"").next().unwrap_or(&search_html);
+    let mut detail_url: Option<String> = None;
+    let mut fallback_cover: Option<String> = None;
+    for chunk in main_html.split("class=\"thumbnail-link\"").skip(1) {
+        let href = match attribute(chunk.split('>').next().unwrap_or(""), "href") {
+            Some(h) => h,
+            None => continue,
+        };
+        let lower_href = href.to_ascii_lowercase();
+        let exact_slug = lower_href.ends_with(&format!("/{slug_needle}"))
+            || lower_href.contains(&format!("/{slug_needle}/"))
+            || lower_href.contains(&format!("/{slug_needle}-"));
+        if exact_slug {
+            detail_url = Some(href);
+            if let Some(img_part) = chunk.split("<img ").nth(1) {
+                if let Some(src) = attribute(img_part.split('>').next().unwrap_or(""), "src") {
+                    fallback_cover = Some(if src.starts_with("//") { format!("https:{src}") } else { src });
+                }
+            }
+            break;
+        }
+    }
+    let detail_url = detail_url.ok_or_else(|| format!("JavFree 未找到番号【{number}】"))?;
+    let html = javfree_get_text(&client, &detail_url).await?;
+    let article = html.split("id=\"secondary\"").next().unwrap_or(&html);
+
+    let title = article
+        .split("<h1 class=\"entry-title\">")
+        .nth(1)
+        .and_then(|s| s.split_once("</h1>"))
+        .map(|(t, _)| plain_text(t))
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| format!("JavFree 详情页无标题【{number}】"))?;
+
+    let mut images: Vec<String> = Vec::new();
+    for img_part in article.split("<img ").skip(1) {
+        let tag = img_part.split('>').next().unwrap_or("");
+        if let Some(raw_src) = attribute(tag, "src").or_else(|| attribute(tag, "data-src")) {
+            let full = if raw_src.starts_with("//") { format!("https:{raw_src}") } else { raw_src };
+            if full.contains("cf.javfree.me/") && !full.contains("/100x66/") && !images.contains(&full) {
+                images.push(full);
+            }
+        }
+    }
+    let cover_url = images.first().cloned().or(fallback_cover);
+    if cover_url.is_none() {
+        return Err(format!("JavFree 详情页无封面【{number}】"));
+    }
+    let sample_images = if images.len() > 1 { images[1..].to_vec() } else { Vec::new() };
+
+    Ok(MovieMetadata {
+        number: number.to_string(),
+        asset_id: None,
+        title,
+        original_title: None,
+        actors: Vec::new(),
+        maker: if number.starts_with("FC2-") { Some("FC2".to_string()) } else { None },
+        label: None,
+        series: None,
+        director: None,
+        release_date: None,
+        duration_minutes: None,
+        cover_url,
+        sample_images,
+        tags: if number.starts_with("FC2-") { vec!["FC2".to_string()] } else { Vec::new() },
+        source: "javfree".to_string(),
+        updated_at: chrono::Utc::now().timestamp(),
+    })
+}
+
 pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
     let number = normalize_jav_number(raw).ok_or_else(|| "无效或有歧义的番号".to_string())?;
     let cache = metadata_cache();
@@ -2219,7 +2636,7 @@ pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
     // Bound concurrent source requests across single and batch callers.
     static GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
     let _permit = GATE.get_or_init(|| tokio::sync::Semaphore::new(3)).acquire().await.map_err(|e| e.to_string())?;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(45), async {
         let nb = number.as_bytes();
         let is_date = (nb.len() == 9 || nb.len() == 10)
             && nb[..6].iter().all(u8::is_ascii_digit)
@@ -2242,22 +2659,25 @@ pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
                 },
             }
         } else if number.starts_with("FC2-") {
-            // Prefer FC2 official page; fall back across JavDB -> AV-Wiki -> Jav321 for delisted FC2 titles.
+            // Prefer FC2 official page; fall back across JavDB -> JavFree -> AV-Wiki -> Jav321 for delisted FC2 titles.
             match scrape_from_fc2(&number).await {
                 Ok(meta) => Ok(meta),
                 Err(fc2_err) => match scrape_from_javdb(&number).await {
                     Ok(meta) => Ok(meta),
-                    Err(db_err) => match scrape_from_avwiki(&number).await {
+                    Err(db_err) => match scrape_from_javfree(&number).await {
                         Ok(meta) => Ok(meta),
-                        Err(avw_err) => scrape_from_jav321(&number)
-                            .await
-                            .map_err(|j321_err| format!("{fc2_err}; JavDB: {db_err}; AV-Wiki: {avw_err}; Jav321: {j321_err}")),
+                        Err(jf_err) => match scrape_from_avwiki(&number).await {
+                            Ok(meta) => Ok(meta),
+                            Err(avw_err) => scrape_from_jav321(&number)
+                                .await
+                                .map_err(|j321_err| format!("{fc2_err}; JavDB: {db_err}; JavFree: {jf_err}; AV-Wiki: {avw_err}; Jav321: {j321_err}")),
+                        },
                     },
                 },
             }
         } else {
             // Direct detail source is faster. Start the second source after a short hedge,
-            // then fall back to Jav321 and AV-Wiki if both JavBus & JavDB fail.
+            // then fall back to Jav321, AV-Wiki, and JavFree if both JavBus & JavDB fail.
             let bus = scrape_from_javbus(&number);
             let db = async {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2278,9 +2698,12 @@ pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
                 Ok(meta) => Ok(meta),
                 Err(p_err) => match scrape_from_jav321(&number).await {
                     Ok(meta) => Ok(meta),
-                    Err(j321_err) => scrape_from_avwiki(&number)
-                        .await
-                        .map_err(|avw_err| format!("{p_err}; Jav321: {j321_err}; AV-Wiki: {avw_err}")),
+                    Err(j321_err) => match scrape_from_avwiki(&number).await {
+                        Ok(meta) => Ok(meta),
+                        Err(avw_err) => scrape_from_javfree(&number)
+                            .await
+                            .map_err(|jf_err| format!("{p_err}; Jav321: {j321_err}; AV-Wiki: {avw_err}; JavFree: {jf_err}")),
+                    },
                 },
             }
         }
@@ -2720,6 +3143,32 @@ pub fn reconcile_movie_library_changes(
         pending_new_count,
         pending_new_numbers,
     })
+}
+
+/// Remove movie_metadata rows that no longer have any active (missing = 0) video asset bound.
+/// Called automatically after full/incremental DB sync reconciliation so deleted cloud files
+/// do not remain as unplayable ghosts in the movie library.
+pub fn prune_orphan_movie_metadata(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    let deleted = tx.execute(
+        "DELETE FROM movie_metadata
+         WHERE (asset_id IS NULL OR NOT EXISTS (SELECT 1 FROM assets a WHERE a.id = movie_metadata.asset_id AND a.missing = 0))
+           AND NOT EXISTS (
+               SELECT 1 FROM movie_asset_bindings b
+               JOIN assets a ON a.id = b.asset_id AND a.missing = 0
+               WHERE b.number = movie_metadata.number
+           )",
+        [],
+    )?;
+    if deleted > 0 {
+        let _ = tx.execute(
+            "DELETE FROM movie_cast WHERE NOT EXISTS (SELECT 1 FROM movie_metadata m WHERE m.number = movie_cast.number)",
+            [],
+        );
+    }
+    tx.commit()?;
+    Ok(deleted)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3233,6 +3682,12 @@ pub struct MovieSyncDiffSummary {
     pub removed_count: usize,
     pub added: Vec<SyncDiffFileItem>,
     pub removed: Vec<SyncDiffFileItem>,
+    #[serde(default)]
+    pub consumed: bool,
+    #[serde(default)]
+    pub consumed_at: Option<i64>,
+    #[serde(default)]
+    pub consumed_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3242,6 +3697,8 @@ pub struct MovieExtractSummary {
     pub scanned_videos: usize,
     pub extracted_numbers: usize,
     pub already_in_library: usize,
+    #[serde(default)]
+    pub bound_count: usize,
     pub pending_queue_count: usize,
     pub unrecognized_count: usize,
     pub pending_numbers_preview: Vec<String>,
@@ -3290,6 +3747,7 @@ pub fn record_movie_sync_diff(
 
     // Keep only latest run in diff log so table stays tiny
     conn.execute("DELETE FROM movie_sync_diff_log", [])?;
+    conn.execute("DELETE FROM movie_sync_diff_state", [])?;
     for item in &added {
         conn.execute(
             "INSERT INTO movie_sync_diff_log (run_id, mode, change_type, asset_id, file_name, remote_path, created_at)
@@ -3314,6 +3772,20 @@ pub fn record_movie_sync_diff(
 
     let added_count = added.len();
     let removed_count = removed.len();
+    let (consumed, consumed_at, consumed_summary) = if added_count == 0 {
+        let msg = if removed_count > 0 {
+            format!("本次无新增视频（清理移除 {removed_count} 个）")
+        } else {
+            "本次无新增视频文件".to_string()
+        };
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO movie_sync_diff_state (run_id, consumed_at, summary) VALUES (?1, ?2, ?3)",
+            params![run_id, now, msg],
+        );
+        (true, Some(now), Some(msg))
+    } else {
+        (false, None, None)
+    };
     added.truncate(120);
     removed.truncate(120);
 
@@ -3326,6 +3798,9 @@ pub fn record_movie_sync_diff(
         removed_count,
         added,
         removed,
+        consumed,
+        consumed_at,
+        consumed_summary,
     })
 }
 
@@ -3348,6 +3823,9 @@ pub fn get_latest_movie_sync_diff(conn: &Connection) -> Result<MovieSyncDiffSumm
             removed_count: 0,
             added: Vec::new(),
             removed: Vec::new(),
+            consumed: true,
+            consumed_at: None,
+            consumed_summary: None,
         });
     };
     let mut added = Vec::new();
@@ -3368,6 +3846,17 @@ pub fn get_latest_movie_sync_diff(conn: &Connection) -> Result<MovieSyncDiffSumm
     }
     let added_count = added.len();
     let removed_count = removed.len();
+    let state: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT consumed_at, summary FROM movie_sync_diff_state WHERE run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (consumed, consumed_at, consumed_summary) = match state {
+        Some((ts, sum)) => (true, Some(ts), Some(sum)),
+        None => (added_count == 0, None, None),
+    };
     added.truncate(120);
     removed.truncate(120);
     Ok(MovieSyncDiffSummary {
@@ -3379,6 +3868,9 @@ pub fn get_latest_movie_sync_diff(conn: &Connection) -> Result<MovieSyncDiffSumm
         removed_count,
         added,
         removed,
+        consumed,
+        consumed_at,
+        consumed_summary,
     })
 }
 
@@ -3392,7 +3884,7 @@ pub fn extract_movie_numbers_summary(conn: &Connection, scope: &str) -> Result<M
         }
     }
     let mut existing_meta = std::collections::HashSet::<String>::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT number FROM movie_metadata") {
+    if let Ok(mut stmt) = conn.prepare(VALID_SCRAPED_META_SQL) {
         if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
             for r in rows.flatten() { existing_meta.insert(r); }
         }
@@ -3460,6 +3952,7 @@ pub fn extract_movie_numbers_summary(conn: &Connection, scope: &str) -> Result<M
         }
     }
 
+    let bound_count = new_bindings.len();
     if !new_bindings.is_empty() {
         let _ = conn.execute_batch("SAVEPOINT extract_bind_sp");
         for (num, id) in new_bindings {
@@ -3479,15 +3972,49 @@ pub fn extract_movie_numbers_summary(conn: &Connection, scope: &str) -> Result<M
     let pending_queue_count = pending_queue.len();
     let pending_numbers_preview = pending_queue.into_iter().take(30).collect();
 
+    if scope == "new" {
+        if let Ok(Some(run_id)) = conn
+            .query_row("SELECT run_id FROM movie_sync_diff_log ORDER BY id DESC LIMIT 1", [], |r| r.get::<_, String>(0))
+            .optional()
+        {
+            let now = chrono::Utc::now().timestamp();
+            let summary = if pending_queue_count == 0 {
+                if bound_count > 0 {
+                    format!("已消化：{} 部均已在库（补绑 {} 个文件），新待刮 0 部", already_in_library, bound_count)
+                } else {
+                    format!("已消化：{} 部均已在库，新待刮 0 部", already_in_library)
+                }
+            } else {
+                format!("已提取：新待刮 {} 部，已在库 {} 部", pending_queue_count, already_in_library)
+            };
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO movie_sync_diff_state (run_id, consumed_at, summary) VALUES (?1, ?2, ?3)",
+                params![run_id, now, summary],
+            );
+        }
+    }
+
     Ok(MovieExtractSummary {
         scope: scope.to_string(),
         scanned_videos,
         extracted_numbers: extracted_set.len(),
         already_in_library,
+        bound_count,
         pending_queue_count,
         unrecognized_count,
         pending_numbers_preview,
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchScrapeResultItem {
+    pub number: String,
+    pub ok: bool,
+    pub title: Option<String>,
+    pub cover_url: Option<String>,
+    pub source: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3502,6 +4029,8 @@ pub struct BatchScrapeProgress {
     pub current_number: Option<String>,
     pub current_actor_status: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub recent_items: Vec<BatchScrapeResultItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3511,6 +4040,7 @@ pub struct BatchScrapeStats {
     pub distinct_numbers: usize,
     pub already_scraped: usize,
     pub remaining_to_scrape: usize,
+    pub new_to_scrape: usize,
     pub failed_count: usize,
     pub pending_revalidation: usize,
     pub unrecognized_videos: usize,
@@ -3529,6 +4059,7 @@ fn batch_progress_cell() -> &'static Mutex<BatchScrapeProgress> {
             current_number: None,
             current_actor_status: None,
             last_error: None,
+            recent_items: Vec::new(),
         })
     })
 }
@@ -3554,6 +4085,7 @@ pub fn get_batch_scrape_progress() -> BatchScrapeProgress {
         current_number: None,
         current_actor_status: None,
         last_error: None,
+        recent_items: Vec::new(),
     })
 }
 
@@ -3579,13 +4111,15 @@ pub fn stop_batch_scrape() {
     }
 }
 
+const VALID_SCRAPED_META_SQL: &str = "SELECT number FROM movie_metadata WHERE source NOT IN ('javdb_not_found', 'not_found', '') AND cover_url IS NOT NULL AND cover_url != ''";
+
 pub fn get_batch_scrape_stats(conn: &Connection) -> Result<BatchScrapeStats, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
     let (total_videos, number_assets) = whitelisted_number_assets(conn)?;
     let distinct_numbers: std::collections::HashSet<_> = number_assets.keys().cloned().collect();
 
     let mut already_scraped_set = std::collections::HashSet::<String>::new();
-    let mut check_stmt = conn.prepare("SELECT number FROM movie_metadata WHERE verification_version = 1 AND source NOT IN ('javdb_not_found', 'not_found', '') AND cover_url IS NOT NULL AND cover_url != ''")?;
+    let mut check_stmt = conn.prepare(VALID_SCRAPED_META_SQL)?;
     let scraped_rows = check_stmt.query_map([], |row| row.get::<_, String>(0))?;
     for r in scraped_rows.flatten() {
         already_scraped_set.insert(r);
@@ -3599,7 +4133,8 @@ pub fn get_batch_scrape_stats(conn: &Connection) -> Result<BatchScrapeStats, rus
     for r in fail_rows.flatten() {
         failed_set.insert(r);
     }
-    let failed_count = distinct_numbers.iter().filter(|num| failed_set.contains(*num)).count();
+    let failed_count = distinct_numbers.iter().filter(|num| failed_set.contains(*num) && !already_scraped_set.contains(*num)).count();
+    let new_to_scrape = remaining.saturating_sub(failed_count);
 
     let pending_revalidation: usize = conn.query_row("SELECT count(*) FROM movie_metadata WHERE verification_version=0", [], |row| row.get(0)).unwrap_or(0);
     let unrecognized_videos = total_videos.saturating_sub(number_assets.values().map(Vec::len).sum::<usize>());
@@ -3609,6 +4144,7 @@ pub fn get_batch_scrape_stats(conn: &Connection) -> Result<BatchScrapeStats, rus
         distinct_numbers: distinct_numbers.len(),
         already_scraped,
         remaining_to_scrape: remaining,
+        new_to_scrape,
         failed_count,
         pending_revalidation,
         unrecognized_videos,
@@ -3647,7 +4183,9 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
         g.succeeded = 0;
         g.failed = 0;
         g.current_number = None;
+        g.current_actor_status = None;
         g.last_error = None;
+        g.recent_items.clear();
     }
     stop_batch_flag().store(false, Ordering::SeqCst);
     pause_batch_flag().store(false, Ordering::SeqCst);
@@ -3709,7 +4247,7 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
             }
         }
         let mut existing_meta_set = std::collections::HashSet::<String>::new();
-        if let Ok(mut stmt) = conn.prepare("SELECT number FROM movie_metadata") {
+        if let Ok(mut stmt) = conn.prepare(VALID_SCRAPED_META_SQL) {
             if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
                 for r in rows.flatten() { existing_meta_set.insert(r); }
             }
@@ -3797,9 +4335,11 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
             }
 
             let scraped_actors: Vec<String>;
+            let mut scraped_meta_preview: Option<(String, Option<String>, String)> = None;
             let result = match scrape_movie_metadata(&number).await {
                 Ok(mut meta) => {
                     scraped_actors = meta.actors.clone();
+                    scraped_meta_preview = Some((meta.title.clone(), meta.cover_url.clone(), meta.source.clone()));
                     meta.asset_id = number_assets.get(&number).and_then(|ids| ids.first()).cloned();
                     save_movie_metadata(&conn, &meta).and_then(|_| {
                         if let Some(ids) = number_assets.get(&number) {
@@ -3862,9 +4402,34 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
             if let Ok(mut g) = batch_progress_cell().lock() {
                 g.completed += 1;
                 match result {
-                    Ok(()) => g.succeeded += 1,
-                    Err(e) => { g.failed += 1; g.last_error = Some(format!("{number}: {e}")); }
+                    Ok(()) => {
+                        g.succeeded += 1;
+                        let (title, cover_url, source) = scraped_meta_preview
+                            .map(|(t, c, s)| (Some(t), c, Some(s)))
+                            .unwrap_or((None, None, None));
+                        g.recent_items.insert(0, BatchScrapeResultItem {
+                            number: number.clone(),
+                            ok: true,
+                            title,
+                            cover_url,
+                            source,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        g.failed += 1;
+                        g.last_error = Some(format!("{number}: {e}"));
+                        g.recent_items.insert(0, BatchScrapeResultItem {
+                            number: number.clone(),
+                            ok: false,
+                            title: None,
+                            cover_url: None,
+                            source: None,
+                            error: Some(e),
+                        });
+                    }
                 }
+                g.recent_items.truncate(40);
             }
 
             // A modest inter-item delay; source requests have a shared concurrency bound.

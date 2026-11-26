@@ -1093,7 +1093,7 @@ fn domain_media_type(domain: &str, path: &str) -> Option<&'static str> {
     }
     match extension.as_str() {
         "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "heif" | "avif" | "bmp" | "tif" | "tiff" | "jxl" | "svg" => Some("image"),
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" | "ts" | "m2ts" | "mts" | "m4s" => Some("video"),
+        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "rmvb" | "rm" | "mpg" | "mpeg" | "vob" | "asf" | "3gp" | "f4v" | "webm" | "m4v" | "ts" | "m2ts" | "mts" | "m4s" => Some("video"),
         "zip" | "cbz" | "rar" | "cbr" | "7z" | "pdf" => Some("comicArchive"),
         _ => None,
     }

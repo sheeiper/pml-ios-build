@@ -89,6 +89,16 @@ public struct CleanupReport: Codable {
     public let freedBytes: Int64
 }
 
+public struct BatchScrapeResultItem: Codable, Identifiable {
+    public var id: String { "\(number)-\(ok)" }
+    public let number: String
+    public let ok: Bool
+    public let title: String?
+    public let coverUrl: String?
+    public let source: String?
+    public let error: String?
+}
+
 public struct BatchScrapeProgress: Codable {
     public let running: Bool
     public let paused: Bool
@@ -99,6 +109,7 @@ public struct BatchScrapeProgress: Codable {
     public let currentNumber: String?
     public let currentActorStatus: String?
     public let lastError: String?
+    public let recentItems: [BatchScrapeResultItem]?
 }
 
 public struct BatchScrapeStats: Codable {
@@ -106,6 +117,7 @@ public struct BatchScrapeStats: Codable {
     public let distinctNumbers: Int
     public let alreadyScraped: Int
     public let remainingToScrape: Int
+    public let newToScrape: Int?
     public let failedCount: Int?
     public let pendingRevalidation: Int?
     public let unrecognizedVideos: Int?
@@ -146,6 +158,9 @@ public struct MovieSyncDiffSummary: Codable {
     public let removedCount: Int
     public let added: [SyncDiffFileItem]
     public let removed: [SyncDiffFileItem]
+    public let consumed: Bool?
+    public let consumedAt: Int64?
+    public let consumedSummary: String?
 }
 
 public struct MovieDbSyncProgress: Codable {
@@ -168,6 +183,7 @@ public struct MovieExtractSummary: Codable {
     public let scannedVideos: Int
     public let extractedNumbers: Int
     public let alreadyInLibrary: Int
+    public let boundCount: Int?
     public let pendingQueueCount: Int
     public let unrecognizedCount: Int
     public let pendingNumbersPreview: [String]

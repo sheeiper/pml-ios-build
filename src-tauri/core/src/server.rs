@@ -1237,6 +1237,30 @@ async fn dispatch_command(
                 Ok(items)
             }).await
         }
+        "list_movies_by_series" => {
+            let series = payload.get("series").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::list_movies_by_series(&conn, &series)
+                    .map_err(|e| format!("查询系列作品失败：{e}"))
+            }).await
+        }
+        "get_series_online_movies" => {
+            let series = payload.get("series").and_then(Value::as_str).unwrap_or("").to_owned();
+            let force_refresh = payload.get("forceRefresh").and_then(Value::as_bool).unwrap_or(false);
+            let raw_items = match crate::performers::search_online_movies(&series, force_refresh).await {
+                Ok(v) => v,
+                Err(e) => return error_response(&e),
+            };
+            let app_check = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app_check)?;
+                let (_, _, items) = crate::performers::mark_library_ownership(&conn, raw_items, true)
+                    .map_err(|e| e.to_string())?;
+                Ok(items)
+            }).await
+        }
         "get_online_movie_detail" => {
             let number = payload.get("number").and_then(Value::as_str).unwrap_or("").trim().to_owned();
             if number.is_empty() {
@@ -1618,6 +1642,9 @@ async fn dispatch_command(
                     let diff = crate::jav_scraper::record_movie_sync_diff(&conn, &mode_label, scanned_dirs, &before_snap, &after_snap)
                         .map_err(|e| format!("记录同步变动失败：{e}"))?;
                     let _ = crate::jav_scraper::reconcile_movie_library_changes(&conn, scanned_dirs, added, updated, removed);
+                    if mode_label == "full" || diff.removed_count > 0 {
+                        let _ = crate::jav_scraper::prune_orphan_movie_metadata(&conn);
+                    }
                     Ok(diff)
                 }).await;
                 match post_res {

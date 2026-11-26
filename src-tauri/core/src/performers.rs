@@ -2360,7 +2360,7 @@ pub async fn search_online_movies(
     }
     let normalized = crate::jav_scraper::normalize_jav_number(raw);
     let search_term = normalized.as_deref().unwrap_or(raw).to_string();
-    let cache_key = format!("v2:{}", search_term.to_uppercase());
+    let cache_key = format!("v3:{}", search_term.to_uppercase());
     let now = chrono::Utc::now().timestamp();
     if !force_refresh {
         if let Ok(guard) = online_movie_search_cache().lock() {
@@ -2410,31 +2410,35 @@ pub async fn search_online_movies(
     let extra_fut = async {
         let mut extra = Vec::new();
         if let Some(ref norm) = normalized {
-            let (r321, rwiki) = tokio::join!(
+            let (r321, rwiki, rjf, rfc2) = tokio::join!(
                 crate::jav_scraper::scrape_from_jav321(norm),
-                crate::jav_scraper::scrape_from_avwiki(norm)
+                crate::jav_scraper::scrape_from_avwiki(norm),
+                crate::jav_scraper::scrape_from_javfree(norm),
+                async {
+                    if norm.starts_with("FC2-") {
+                        crate::jav_scraper::scrape_from_fc2(norm).await
+                    } else {
+                        Err(String::new())
+                    }
+                }
             );
-            if let Ok(m) = r321 {
-                extra.push(PerformerRecentRelease {
-                    number: m.number,
-                    title: m.title,
-                    release_date: m.release_date,
-                    cover_url: m.cover_url,
-                    detail_url: String::new(),
-                    in_library: false,
-                    source: "Jav321".to_string(),
-                });
-            }
-            if let Ok(m) = rwiki {
-                extra.push(PerformerRecentRelease {
-                    number: m.number,
-                    title: m.title,
-                    release_date: m.release_date,
-                    cover_url: m.cover_url,
-                    detail_url: String::new(),
-                    in_library: false,
-                    source: "AV-Wiki".to_string(),
-                });
+            for (res, label) in [
+                (rfc2, "FC2"),
+                (r321, "Jav321"),
+                (rwiki, "AV-Wiki"),
+                (rjf, "JavFree"),
+            ] {
+                if let Ok(m) = res {
+                    extra.push(PerformerRecentRelease {
+                        number: m.number,
+                        title: m.title,
+                        release_date: m.release_date,
+                        cover_url: m.cover_url,
+                        detail_url: String::new(),
+                        in_library: false,
+                        source: label.to_string(),
+                    });
+                }
             }
         }
         extra

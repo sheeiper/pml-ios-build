@@ -39,8 +39,10 @@ public struct MovieLibraryView: View {
     @State private var selectedMovie: MovieMetadata?
     @State private var selectedPerformer: MoviePerformer?
     @State private var preview: PreviewItem?
-    @State private var showScrapeSheet = false
     @State private var showFilterDrawer = false
+    @State private var showIssuesSection = false
+    @State private var autoFlowRunning = false
+    @State private var autoFlowNote: String? = nil
     @State private var onlineSearchPreset = ""
     @State private var pendingFilter: PendingSubFilter = .all
     @State private var issueOffset = 0
@@ -126,15 +128,11 @@ public struct MovieLibraryView: View {
                             }
                         )
                         .environmentObject(model)
+                    } else if mode == .pending {
+                        dataConsoleView
                     } else {
                         if mode == .movies, activeMovieFilterCount > 0 { activeMovieFilterStrip }
                         else if mode == .performers, activePerformerFilterCount > 0 { activePerformerFilterStrip }
-                        else if mode == .pending {
-                            pendingSubFilterBar
-                            if pendingFilter != .unrecognized && !issueCounts.isEmpty {
-                                issueFilters
-                            }
-                        }
 
                         if let errorMessage {
                             Label(errorMessage, systemImage: "exclamationmark.triangle")
@@ -148,7 +146,7 @@ public struct MovieLibraryView: View {
                 }
                 .navigationTitle(
                     mode == .movies ? "影视库 (\(total))"
-                    : mode == .pending ? "数据 (\(issueTotal + unrecognizedTotal))"
+                    : mode == .pending ? "数据管理"
                     : mode.rawValue
                 )
                 .navigationBarTitleDisplayMode(.inline)
@@ -168,9 +166,6 @@ public struct MovieLibraryView: View {
                                 .foregroundStyle(count > 0 ? .purple : .primary)
                             }
                         }
-                        Button { showScrapeSheet = true } label: {
-                            Label("数据管理", systemImage: "bolt.badge.clock.fill").foregroundStyle(.purple)
-                        }
                     }
                 }
                 .task {
@@ -187,8 +182,9 @@ public struct MovieLibraryView: View {
                 .refreshable {
                     await reload()
                     if mode == .movies { await loadDiscoveryData() }
+                    else if mode == .pending { await refreshConsoleState() }
                 }
-                .onDisappear { scrapePollTask?.cancel() }
+                .onDisappear { scrapePollTask?.cancel(); syncPollTask?.cancel() }
                 .sheet(item: $selectedMovie) { movie in
                     MovieDetailSheet(
                         number: movie.number,
@@ -222,7 +218,6 @@ public struct MovieLibraryView: View {
             GestureVideoPlayerSheet(url: item.url, title: item.title, assetId: item.assetId, startAt: item.startAt, fallbackURL: item.fallbackURL, sourceLabel: item.sourceLabel, remotePath: item.remotePath)
                 .id(item.id).environmentObject(model)
         }
-        .sheet(isPresented: $showScrapeSheet) { manualScrapeSheet }
         .sheet(isPresented: $showFilterDrawer) {
             filterDrawerSheet
                 .presentationDetents([.medium, .large])
@@ -249,7 +244,7 @@ public struct MovieLibraryView: View {
 
     @ViewBuilder private var content: some View {
         if loading && currentCount == 0 {
-            ProgressView("正在从服务器查询…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            movieSkeletonGrid
         } else if currentCount == 0 {
             VStack(spacing: 16) {
                 ContentUnavailableView(emptyTitle, systemImage: emptySymbol, description: Text(emptyDescription))
@@ -273,9 +268,6 @@ public struct MovieLibraryView: View {
                     case .movies:
                         if !hasActiveFilters, let hero = heroMovie {
                             heroBanner(hero)
-                        }
-                        if !topPerformers.isEmpty {
-                            castRail
                         }
                         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
                             ForEach(pageItems) { movie in
@@ -398,6 +390,36 @@ public struct MovieLibraryView: View {
         }
         .padding(12)
         .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var movieSkeletonGrid: some View {
+        ScrollView {
+            LazyVStack(spacing: 14) {
+                if mode == .movies && !hasActiveFilters {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color.secondary.opacity(0.14))
+                        .frame(height: 176)
+                }
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
+                    ForEach(0..<8, id: \.self) { _ in
+                        VStack(alignment: .leading, spacing: 8) {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color.secondary.opacity(0.16))
+                                .aspectRatio(3 / 2, contentMode: .fit)
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(Color.secondary.opacity(0.14))
+                                .frame(height: 12)
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(Color.secondary.opacity(0.10))
+                                .frame(width: 90, height: 10)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.top, 10)
+            .redacted(reason: .placeholder)
+        }
     }
 
     private var castRail: some View {
@@ -553,7 +575,7 @@ public struct MovieLibraryView: View {
     }
     private var emptyDescription: String {
         switch mode {
-        case .movies: return onlyFavMovies ? "点击影片卡片或详情页的红心即可加入收藏。" : "服务端仅返回已验证影视记录；点击右上角数据管理可增量同步与刮削。"
+        case .movies: return onlyFavMovies ? "点击影片卡片或详情页的红心即可加入收藏。" : "服务端仅返回已验证影视记录；切换到顶部「数据」页可增量同步与刮削。"
         case .search: return ""
         case .pending: return "刮削失败与无法识别番号的视频会统一归集在这里处理。"
         case .performers: return onlyFavPerformers ? "点击演员卡片或详情页的红心即可加入收藏。" : "完成影片刮削后会自动入库演员档案。"
@@ -1339,155 +1361,327 @@ public struct MovieLibraryView: View {
         preview = PreviewItem(url: source.url, isVideo: true, assetId: assetId, title: title, fallbackURL: source.fallbackURL, sourceLabel: source.label, remotePath: nil)
     }
 
-    private var manualScrapeSheet: some View {
-        NavigationStack {
-            Form {
-                Section("① 媒体库数据库（白名单目录）") {
-                    Text("库内视频：\(batchStats?.totalWhitelistedVideos ?? 0) · 唯一番号：\(batchStats?.distinctNumbers ?? 0) · 已入库：\(batchStats?.alreadyScraped ?? 0)")
-                        .font(.caption)
-                    if let sp = pipelineSyncProgress, sp.running || sp.phase == "done" {
-                        let totalDirs = max(sp.discoveredDirs, sp.scannedDirs, 1)
-                        let pct: Double = sp.phase == "done" ? 1.0 : sp.phase == "reconciling" ? 0.97 : sp.phase == "writing" ? 0.92 : min(0.9, Double(sp.scannedDirs) / Double(totalDirs) * 0.9)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(sp.running ? "同步中（\(Int(pct * 100))%）：已扫目录 \(sp.scannedDirs)/\(totalDirs) · 发现文件 \(sp.foundFiles)\(sp.skippedDirs > 0 ? " · 跳过 \(sp.skippedDirs)" : "")" : "同步已完成：扫描 \(sp.scannedDirs) 目录 · 发现 \(sp.foundFiles) 文件")
-                                .font(.caption2)
-                            ProgressView(value: pct, total: 1.0)
-                            if let cur = sp.currentDir, !cur.isEmpty {
-                                Text(cur).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                            }
-                        }
-                    }
-                    HStack(spacing: 12) {
-                        Button {
-                            Task { await runPipelineDbSync(mode: "incremental") }
-                        } label: {
-                            Label(pipelineSyncMode == "incremental" ? "增量更新中…" : "增量更新", systemImage: "bolt.fill")
+    private var dataConsoleView: some View {
+        let unconsumedAdded = (pipelineDiff?.consumed == true) ? 0 : (pipelineDiff?.addedCount ?? 0)
+        let pureNewCount = batchStats?.newToScrape ?? max(0, (batchStats?.remainingToScrape ?? 0) - (batchStats?.failedCount ?? 0))
+        let failedCount = batchStats?.failedCount ?? 0
+        let unrecCount = batchStats?.unrecognizedVideos ?? unrecognizedTotal
+        let totalIssuesCount = issueTotal + unrecognizedTotal
+
+        return List {
+            if let errorMessage {
+                Section {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+            }
+
+            // 顶部 5 项 KPI 汇总 + 一键增量入库（与 Web 端布局完全一致）
+            Section {
+                HStack(spacing: 0) {
+                    kpiCell(value: "\(batchStats?.totalWhitelistedVideos ?? 0)", label: "库内视频", color: .primary)
+                    kpiCell(value: "\(batchStats?.alreadyScraped ?? 0)", label: "已入库", color: .green)
+                    kpiCell(value: "\(pureNewCount)", label: "待刮新片", color: .purple)
+                    kpiCell(value: "\(failedCount)", label: "失败待重试", color: .orange)
+                    kpiCell(value: "\(unrecCount)", label: "未识别", color: .secondary)
+                }
+                .padding(.vertical, 2)
+
+                Button {
+                    Task { await runOneClickIncremental() }
+                } label: {
+                    HStack {
+                        Spacer()
+                        if autoFlowRunning {
+                            ProgressView().controlSize(.small).padding(.trailing, 4)
+                            Text("流水线执行中…").font(.subheadline.weight(.semibold))
+                        } else {
+                            Label("一键增量入库", systemImage: "bolt.fill")
                                 .font(.subheadline.weight(.semibold))
                         }
-                        .disabled(pipelineSyncMode != nil || pipelineSyncProgress?.running == true || batchProgress?.running == true)
-                        .tint(.purple)
-
                         Spacer()
-
-                        Button {
-                            Task { await runPipelineDbSync(mode: "full") }
-                        } label: {
-                            Label(pipelineSyncMode == "full" ? "全量更新中…" : "全量更新", systemImage: "arrow.triangle.2.circlepath")
-                                .font(.subheadline)
-                        }
-                        .disabled(pipelineSyncMode != nil || pipelineSyncProgress?.running == true || batchProgress?.running == true)
                     }
+                    .padding(.vertical, 4)
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
+                .disabled(autoFlowRunning || pipelineSyncMode != nil || pipelineSyncProgress?.running == true || batchProgress?.running == true || pipelineExtracting)
 
-                Section("② 变动视频文件（最近一次同步）") {
-                    if let diff = pipelineDiff, let runId = diff.runId, !runId.isEmpty {
-                        Text("\(diff.mode == "full" ? "全量" : "增量") · 扫描 \(diff.scannedDirs) 目录 · 新增 \(diff.addedCount) · 删除 \(diff.removedCount)")
-                            .font(.caption)
-                        if diff.addedCount > 0 {
-                            DisclosureGroup("新增视频（\(diff.addedCount)）", isExpanded: $showDiffAdded) {
-                                ForEach(diff.added.prefix(30)) { item in
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.fileName).font(.caption).lineLimit(1)
-                                        Text(item.remotePath).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                    }
-                                }
-                            }
-                            .font(.caption)
-                        }
-                        if diff.removedCount > 0 {
-                            DisclosureGroup("删除/改名视频（\(diff.removedCount)）", isExpanded: $showDiffRemoved) {
-                                ForEach(diff.removed.prefix(30)) { item in
-                                    Text(item.fileName).font(.caption).foregroundStyle(.red).lineLimit(1)
-                                }
-                            }
-                            .font(.caption)
-                        }
-                    } else {
-                        Text("暂无同步变动记录，请先执行步骤 ①。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Section("③ 自动提取番号（待刮削总表）") {
-                    Text("待刮削：\(batchStats?.remainingToScrape ?? 0) · 失败待重试：\(batchStats?.failedCount ?? 0) · 未识别：\(batchStats?.unrecognizedVideos ?? 0)")
+                if let note = autoFlowNote, !note.isEmpty {
+                    Text(note)
                         .font(.caption)
-                    HStack(spacing: 12) {
-                        Button(pipelineExtracting ? "提取中…" : "仅提取新增") {
-                            Task { await runPipelineExtract(scope: "new") }
-                        }
-                        .disabled(pipelineExtracting)
-                        .tint(.purple)
+                        .foregroundStyle(.purple)
+                }
+            }
 
-                        Spacer()
-
-                        Button("重跑未识别") {
-                            Task { await runPipelineExtract(scope: "unrecognized") }
+            // 阶段 ①：网盘同步 & 变动识别
+            Section {
+                if let sp = pipelineSyncProgress, sp.running || sp.phase == "done" {
+                    let totalDirs = max(sp.discoveredDirs, sp.scannedDirs, 1)
+                    let pct: Double = sp.phase == "done" ? 1.0 : sp.phase == "reconciling" ? 0.97 : sp.phase == "writing" ? 0.92 : min(0.9, Double(sp.scannedDirs) / Double(totalDirs) * 0.9)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(sp.running ? "同步中（\(Int(pct * 100))%）：已扫目录 \(sp.scannedDirs)/\(totalDirs) · 发现文件 \(sp.foundFiles)\(sp.skippedDirs > 0 ? " · 跳过 \(sp.skippedDirs)" : "")" : "同步已完成：扫描 \(sp.scannedDirs) 目录 · 发现 \(sp.foundFiles) 文件")
+                            .font(.caption2)
+                        ProgressView(value: pct, total: 1.0)
+                        if let cur = sp.currentDir, !cur.isEmpty {
+                            Text(cur).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                         }
-                        .disabled(pipelineExtracting)
                     }
-                    if let ex = pipelineExtract {
-                        Text("扫描 \(ex.scannedVideos) 视频 · 识别 \(ex.extractedNumbers) 番号 · 未识别 \(ex.unrecognizedCount) · 待刮削 \(ex.pendingQueueCount)")
+                }
+                HStack(spacing: 12) {
+                    Button {
+                        Task { await runPipelineDbSync(mode: "incremental") }
+                    } label: {
+                        Label(pipelineSyncMode == "incremental" ? "增量更新中…" : "增量更新", systemImage: "bolt.fill")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .disabled(pipelineSyncMode != nil || pipelineSyncProgress?.running == true || batchProgress?.running == true)
+                    .tint(.purple)
+
+                    Spacer()
+
+                    Button {
+                        Task { await runPipelineDbSync(mode: "full") }
+                    } label: {
+                        Label(pipelineSyncMode == "full" ? "全量更新中…" : "全量更新", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.subheadline)
+                    }
+                    .disabled(pipelineSyncMode != nil || pipelineSyncProgress?.running == true || batchProgress?.running == true)
+                }
+
+                if let diff = pipelineDiff, let runId = diff.runId, !runId.isEmpty {
+                    HStack {
+                        Text("上次\(diff.mode == "full" ? "全量" : "增量") · 新增 +\(diff.addedCount) · 删除 -\(diff.removedCount)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                        if !ex.pendingNumbersPreview.isEmpty {
-                            Text("待刮削预览：\(ex.pendingNumbersPreview.prefix(12).joined(separator: "、"))\(ex.pendingQueueCount > 12 ? " 等共 \(ex.pendingQueueCount) 部" : "")")
+                        Spacer()
+                        Text(unconsumedAdded > 0 ? "待提取 +\(unconsumedAdded)" : "已消化 ✓")
+                            .font(.caption2.bold())
+                            .foregroundStyle(unconsumedAdded > 0 ? .purple : .green)
+                    }
+                    if let sum = diff.consumedSummary, diff.consumed == true, !sum.isEmpty {
+                        Text("✓ \(sum)")
+                            .font(.caption2)
+                            .foregroundStyle(.green)
+                    }
+                    if diff.addedCount > 0 {
+                        DisclosureGroup("新增视频（\(diff.addedCount)）", isExpanded: $showDiffAdded) {
+                            ForEach(diff.added.prefix(30)) { item in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.fileName).font(.caption).lineLimit(1)
+                                    Text(item.remotePath).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                            }
+                        }
+                        .font(.caption)
+                    }
+                    if diff.removedCount > 0 {
+                        DisclosureGroup("删除/改名视频（\(diff.removedCount)）", isExpanded: $showDiffRemoved) {
+                            ForEach(diff.removed.prefix(30)) { item in
+                                Text(item.fileName).font(.caption).foregroundStyle(.red).lineLimit(1)
+                            }
+                        }
+                        .font(.caption)
+                    }
+                }
+            } header: {
+                Text("① 网盘同步 & 变动识别")
+            }
+
+            // 阶段 ②：番号提取 & 文件绑定
+            Section {
+                HStack(spacing: 12) {
+                    Button(pipelineExtracting ? "提取中…" : (unconsumedAdded > 0 ? "提取本批新增（\(unconsumedAdded)）" : "核对新增")) {
+                        Task { await runPipelineExtract(scope: "new") }
+                    }
+                    .disabled(pipelineExtracting)
+                    .tint(.purple)
+
+                    Spacer()
+
+                    Button("重跑未识别") {
+                        Task { await runPipelineExtract(scope: "unrecognized") }
+                    }
+                    .disabled(pipelineExtracting)
+                }
+                if let ex = pipelineExtract {
+                    Text("扫描 \(ex.scannedVideos) 视频 · 识别 \(ex.extractedNumbers) 番号（已在库 \(ex.alreadyInLibrary)）· 移交待刮 \(ex.pendingQueueCount)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if !ex.pendingNumbersPreview.isEmpty {
+                        Text("待刮削预览：\(ex.pendingNumbersPreview.prefix(12).joined(separator: "、"))\(ex.pendingQueueCount > 12 ? " 等共 \(ex.pendingQueueCount) 部" : "")")
+                            .font(.caption2)
+                            .foregroundStyle(.purple)
+                    }
+                }
+            } header: {
+                Text("② 番号提取 & 文件绑定")
+            }
+
+            // 阶段 ③：刮削入库 & 演员补全
+            Section {
+                if let progress = batchProgress, progress.running {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("当前：\(progress.currentNumber ?? "准备中…") (\(progress.completed)/\(progress.total) · 剩余 \(max(0, progress.total - progress.completed)))")
+                            .font(.caption2)
+                        if let actorStatus = progress.currentActorStatus, !actorStatus.isEmpty {
+                            Text(actorStatus)
                                 .font(.caption2)
                                 .foregroundStyle(.purple)
                         }
+                        ProgressView(value: Double(progress.completed), total: Double(max(progress.total, 1)))
+                    }
+                    Button("停止刮削", role: .destructive) { Task { await stopScrape() } }
+                } else {
+                    Button {
+                        Task { await startManualScrape(mode: "new") }
+                    } label: {
+                        Label("刮削新片队列（\(pureNewCount)）", systemImage: "play.fill")
+                            .font(.body.weight(.semibold))
+                    }
+                    .tint(.purple)
+                    .disabled(pureNewCount == 0)
+
+                    if failedCount > 0 {
+                        Button("重试失败项（\(failedCount)）") {
+                            Task { await startManualScrape(mode: "failed") }
+                        }
                     }
                 }
 
-                Section("④ 执行刮削（自动补全缺失演员）") {
-                    if let progress = batchProgress, progress.running {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("当前：\(progress.currentNumber ?? "准备中…") (\(progress.completed)/\(progress.total) · 剩余 \(max(0, progress.total - progress.completed)))")
-                                .font(.caption2)
-                            if let actorStatus = progress.currentActorStatus, !actorStatus.isEmpty {
-                                Text(actorStatus)
+                if let recent = batchProgress?.recentItems, !recent.isEmpty {
+                    DisclosureGroup("本次刮削回执（\(recent.count)）") {
+                        ForEach(recent.prefix(20)) { item in
+                            HStack(spacing: 6) {
+                                Image(systemName: item.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                    .foregroundStyle(item.ok ? .green : .red)
+                                    .font(.caption)
+                                Text(item.number)
+                                    .font(.caption.bold())
+                                Text(item.ok ? (item.title ?? "") : (item.error ?? "失败"))
                                     .font(.caption2)
-                                    .foregroundStyle(.purple)
-                            }
-                            ProgressView(value: Double(progress.completed), total: Double(max(progress.total, 1)))
-                        }
-                        Button("停止刮削", role: .destructive) { Task { await stopScrape() } }
-                    } else {
-                        Button {
-                            Task { await startManualScrape(mode: "new") }
-                        } label: {
-                            Label("开始刮削待刮削队列（\(batchStats?.remainingToScrape ?? 0)）", systemImage: "play.fill")
-                                .font(.body.weight(.semibold))
-                        }
-                        .tint(.purple)
-                        .disabled((batchStats?.remainingToScrape ?? 0) == 0)
-
-                        if (batchStats?.failedCount ?? 0) > 0 {
-                            Button("重试失败项（\(batchStats?.failedCount ?? 0)）") {
-                                Task { await startManualScrape(mode: "failed") }
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
                             }
                         }
                     }
+                    .font(.caption)
+                }
 
-                    let missingActors = enrichStats?.missingCount ?? 0
-                    if let ep = enrichProgress, ep.running {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("补全演员中：\(ep.currentName ?? "扫描中…") (\(ep.completed)/\(ep.total))")
-                                .font(.caption2)
-                            ProgressView(value: Double(ep.completed), total: Double(max(ep.total, 1)))
-                        }
-                        Button("停止演员补全", role: .destructive) { Task { await stopEnrich() } }
-                    } else if missingActors > 0 {
-                        Button("独立补全缺失演员资料（\(missingActors)）") {
-                            Task { await startEnrich(forceAll: false) }
-                        }
-                        .font(.caption)
+                let missingActors = enrichStats?.missingCount ?? 0
+                if let ep = enrichProgress, ep.running {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("补全演员中：\(ep.currentName ?? "扫描中…") (\(ep.completed)/\(ep.total))")
+                            .font(.caption2)
+                        ProgressView(value: Double(ep.completed), total: Double(max(ep.total, 1)))
                     }
+                    Button("停止演员补全", role: .destructive) { Task { await stopEnrich() } }
+                } else if missingActors > 0 {
+                    Button("独立补全缺失演员资料（\(missingActors)）") {
+                        Task { await startEnrich(forceAll: false) }
+                    }
+                    .font(.caption)
+                }
+            } header: {
+                Text("③ 刮削入库 & 演员补全")
+            }
+
+            // 底部默认折叠的异常记录明细（与 Web 端一致）
+            Section {
+                DisclosureGroup(isExpanded: $showIssuesSection) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        pendingSubFilterBar
+                        if pendingFilter != .unrecognized && !issueCounts.isEmpty {
+                            issueFilters
+                        }
+                        if pendingFilter != .unrecognized && !issues.isEmpty {
+                            ForEach(issues) { issue in
+                                issueCell(issue).onAppear { loadMoreIfNeeded(issue) }
+                            }
+                        }
+                        if pendingFilter != .failed && !unrecognized.isEmpty {
+                            ForEach(unrecognized) { item in
+                                unrecognizedCell(item).onAppear { loadMoreIfNeeded(item) }
+                            }
+                        }
+                        if (pendingFilter == .all && issues.isEmpty && unrecognized.isEmpty)
+                            || (pendingFilter == .failed && issues.isEmpty)
+                            || (pendingFilter == .unrecognized && unrecognized.isEmpty) {
+                            Text("暂无异常记录")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 6)
+                        }
+                    }
+                    .padding(.top, 4)
+                } label: {
+                    HStack {
+                        Label("异常记录明细", systemImage: "exclamationmark.triangle")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("失败 \(issueTotal) · 未识别 \(unrecognizedTotal)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } footer: {
+                if totalIssuesCount > 0 {
+                    Text("历史刮削失败与无法识别番号的视频默认折叠收纳，展开可逐条重试或手动指定番号。")
                 }
             }
-            .navigationTitle("数据流水线")
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("关闭") { showScrapeSheet = false } } }
         }
+        .listStyle(.insetGrouped)
         .task { await refreshConsoleState() }
+    }
+
+    private func kpiCell(value: String, label: String, color: Color) -> some View {
+        VStack(spacing: 2) {
+            Text(value)
+                .font(.headline.monospacedDigit())
+                .foregroundStyle(color)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func runOneClickIncremental() async {
+        guard let c = model.apiClient, !autoFlowRunning else { return }
+        autoFlowRunning = true
+        autoFlowNote = "阶段 ①/③：正在增量同步网盘目录…"
+        defer { autoFlowRunning = false }
+        do {
+            var p = try await c.runMovieDbSync(mode: "incremental")
+            pipelineSyncProgress = p
+            while p.running && !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(1200))
+                p = try await c.getMovieDbSyncProgress()
+                pipelineSyncProgress = p
+            }
+            if let err = p.error, !err.isEmpty {
+                errorMessage = err
+                autoFlowNote = nil
+                return
+            }
+            autoFlowNote = "阶段 ②/③：正在提取新增番号并补齐绑定…"
+            let ex = try await c.extractMovieNumbers(scope: "new")
+            pipelineExtract = ex
+            await refreshConsoleState()
+            if ex.pendingQueueCount > 0 {
+                autoFlowNote = "阶段 ③/③：发现 \(ex.pendingQueueCount) 部新片，已启动实时刮削…"
+                await startManualScrape(mode: "new")
+            } else {
+                autoFlowNote = ex.alreadyInLibrary > 0
+                    ? "本轮已完成：\(ex.alreadyInLibrary) 部均已在库，无需新刮削。"
+                    : "本轮已完成：当前暂无新增视频需要刮削。"
+                await reload()
+            }
+        } catch {
+            errorMessage = "一键增量入库失败：\(error.localizedDescription)"
+            autoFlowNote = nil
+        }
     }
 
     private func refreshConsoleState() async {
@@ -1611,11 +1805,16 @@ public struct MovieLibraryView: View {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
                 guard let c = model.apiClient else { return }
+                let prevCompleted = batchProgress?.completed ?? -1
                 batchProgress = try? await c.getBatchScrapeProgress()
                 enrichProgress = try? await c.getPerformerEnrichProgress()
+                if (batchProgress?.completed ?? -1) != prevCompleted {
+                    batchStats = try? await c.getBatchScrapeStats()
+                }
                 if batchProgress?.running != true && enrichProgress?.running != true {
                     batchStats = try? await c.getBatchScrapeStats()
                     enrichStats = try? await c.getPerformerEnrichStats()
+                    pipelineDiff = try? await c.getMovieSyncDiff()
                     await loadDiscoveryData()
                     return
                 }

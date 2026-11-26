@@ -147,6 +147,14 @@ extension PMLAPIClient {
         try await command("extract_movie_numbers", arguments: ["scope": scope], as: MovieExtractSummary.self)
     }
 
+    func listMoviesBySeries(series: String) async throws -> [MovieMetadata] {
+        try await command("list_movies_by_series", arguments: ["series": series], as: [MovieMetadata].self)
+    }
+
+    func getSeriesOnlineMovies(series: String, forceRefresh: Bool = false) async throws -> [PerformerRecentRelease] {
+        try await command("get_series_online_movies", arguments: ["series": series, "forceRefresh": forceRefresh], as: [PerformerRecentRelease].self)
+    }
+
     func getMoviePerformer(id: String) async throws -> MoviePerformerDetail {
         try await command("get_movie_performer", arguments: ["id": id], as: MoviePerformerDetail.self)
     }

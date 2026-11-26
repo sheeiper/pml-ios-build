@@ -161,17 +161,13 @@ struct MoviePerformerDetailSheet: View {
     private func actionsBar(_ person: MoviePerformer) -> some View {
         HStack(spacing: 8) {
             Button {
-                Task { await enrich(force: !(person.avatarUrl ?? "").isEmpty) }
+                showMultiSourceSheet = true
             } label: {
-                Label(
-                    enriching ? "获取中…" : ((person.avatarUrl ?? "").isEmpty ? "自动获取资料" : "刷新网络资料"),
-                    systemImage: "sparkles"
-                )
-                .font(.caption.weight(.semibold))
+                Label("查询资料", systemImage: "magnifyingglass")
+                    .font(.caption.weight(.semibold))
             }
             .buttonStyle(.borderedProminent)
             .tint(.purple)
-            .disabled(enriching)
 
             if let onFilterMovies {
                 Button {
@@ -185,14 +181,6 @@ struct MoviePerformerDetailSheet: View {
             }
 
             Spacer()
-
-            Button {
-                showMultiSourceSheet = true
-            } label: {
-                Label("多源", systemImage: "square.stack.3d.up")
-                    .font(.caption.weight(.semibold))
-            }
-            .buttonStyle(.bordered)
 
             Button {
                 showEditor = true

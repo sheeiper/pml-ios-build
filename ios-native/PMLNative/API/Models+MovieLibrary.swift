@@ -48,6 +48,10 @@ public struct MovieAssetPart: Codable, Identifiable, Hashable {
     public let remotePath: String
     public let sizeBytes: Int64
     public let durationSeconds: Double?
+    public let partKind: String?
+    public let partLabel: String?
+    public let badges: [String]?
+    public let priority: Int?
 }
 
 public struct RelatedMoviesGrouped: Codable {
