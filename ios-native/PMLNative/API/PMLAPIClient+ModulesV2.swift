@@ -36,6 +36,7 @@ extension PMLAPIClient {
         kind: String,
         name: String,
         remotePath: String,
+        remotePaths: [String]? = nil,
         domain: String? = nil,
         enabled: Bool? = nil,
         sortOrder: Int64? = nil
@@ -46,6 +47,7 @@ extension PMLAPIClient {
             "name": name,
             "remotePath": remotePath,
         ]
+        if let remotePaths { args["remotePaths"] = remotePaths }
         if let domain { args["domain"] = domain }
         if let enabled { args["enabled"] = enabled }
         if let sortOrder { args["sortOrder"] = sortOrder }
@@ -60,6 +62,123 @@ extension PMLAPIClient {
         var args: [String: Any] = [:]
         if let moduleId, !moduleId.isEmpty { args["moduleId"] = moduleId }
         return try await command("rebuild_module_indexes", arguments: args)
+    }
+
+    // MARK: 漫画库 V1
+
+    func rebuildComicLibrary() async throws -> ComicLibraryStats {
+        try await command("rebuild_comic_library")
+    }
+
+    func getComicLibraryStats() async throws -> ComicLibraryStats {
+        try await command("get_comic_library_stats")
+    }
+
+    func queryComicLibrary(
+        query: String? = nil,
+        category: String? = nil,
+        year: String? = nil,
+        author: String? = nil,
+        parody: String? = nil,
+        tag: String? = nil,
+        language: String = "all",
+        readStatus: String = "all",
+        onlySeries: Bool = false,
+        onlyUncensored: Bool = false,
+        onlyFullColor: Bool = false,
+        onlyDl: Bool = false,
+        onlyFavorites: Bool = false,
+        sort: String? = nil,
+        limit: Int = 48,
+        offset: Int = 0
+    ) async throws -> ComicLibraryPage {
+        var args: [String: Any] = [
+            "language": language,
+            "readStatus": readStatus,
+            "onlySeries": onlySeries,
+            "onlyUncensored": onlyUncensored,
+            "onlyFullColor": onlyFullColor,
+            "onlyDl": onlyDl,
+            "onlyFavorites": onlyFavorites,
+            "limit": limit,
+            "offset": offset,
+        ]
+        if let query, !query.isEmpty { args["query"] = query }
+        if let category, !category.isEmpty { args["category"] = category }
+        if let year, !year.isEmpty { args["year"] = year }
+        if let author, !author.isEmpty { args["author"] = author }
+        if let parody, !parody.isEmpty { args["parody"] = parody }
+        if let tag, !tag.isEmpty { args["tag"] = tag }
+        if let sort, !sort.isEmpty { args["sort"] = sort }
+        return try await command("query_comic_library", arguments: args)
+    }
+
+    func saveComicReadingProgress(
+        workId: String,
+        volumeId: String,
+        assetId: String,
+        currentPage: Int64,
+        totalPages: Int64
+    ) async throws {
+        try await perform("save_comic_reading_progress", arguments: [
+            "workId": workId,
+            "volumeId": volumeId,
+            "assetId": assetId,
+            "currentPage": currentPage,
+            "totalPages": totalPages,
+        ])
+    }
+
+    func listContinueReadingComics(limit: Int = 12) async throws -> [ComicWorkItem] {
+        try await command("list_continue_reading_comics", arguments: ["limit": limit])
+    }
+
+    func setComicWorkCover(workId: String, pageIndex: Int, assetId: String? = nil) async throws -> ComicWorkItem {
+        var args: [String: Any] = ["workId": workId, "pageIndex": pageIndex]
+        if let assetId, !assetId.isEmpty { args["assetId"] = assetId }
+        return try await command("set_comic_work_cover", arguments: args)
+    }
+
+    func searchComicOnlineSources(workId: String? = nil, query: String? = nil, useCoverHash: Bool = true) async throws -> [ComicExternalCandidate] {
+        var args: [String: Any] = ["useCoverHash": useCoverHash]
+        if let workId, !workId.isEmpty { args["workId"] = workId }
+        if let query, !query.isEmpty { args["query"] = query }
+        return try await command("search_comic_online_sources", arguments: args)
+    }
+
+    func applyComicExternalSource(workId: String, candidate: ComicExternalCandidate) async throws -> ComicWorkDetail {
+        let data = try JSONEncoder().encode(candidate)
+        let candObj = try JSONSerialization.jsonObject(with: data)
+        return try await command("apply_comic_external_source", arguments: [
+            "workId": workId,
+            "candidate": candObj,
+        ])
+    }
+
+    func startComicBatchScrape(useCoverHash: Bool = true) async throws -> ComicBatchProgress {
+        try await command("start_comic_batch_scrape", arguments: ["useCoverHash": useCoverHash])
+    }
+
+    func stopComicBatchScrape() async throws -> ComicBatchProgress {
+        try await command("stop_comic_batch_scrape")
+    }
+
+    func getComicBatchScrapeProgress() async throws -> ComicBatchProgress {
+        try await command("get_comic_batch_scrape_progress")
+    }
+
+    func getComicWorkDetail(workId: String) async throws -> ComicWorkDetail {
+        try await command("get_comic_work_detail", arguments: ["workId": workId])
+    }
+
+    func listComicAuthors(query: String? = nil, limit: Int = 200) async throws -> [ComicAuthorItem] {
+        var args: [String: Any] = ["limit": limit]
+        if let query, !query.isEmpty { args["query"] = query }
+        return try await command("list_comic_authors", arguments: args)
+    }
+
+    func listComicFilterOptions() async throws -> ComicFilterOptions {
+        try await command("list_comic_filter_options")
     }
 
     // MARK: 实体级收藏（影片 / 演员 / 创作者）

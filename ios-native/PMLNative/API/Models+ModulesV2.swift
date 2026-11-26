@@ -7,6 +7,7 @@ struct LibraryModuleInfo: Decodable, Identifiable, Hashable {
     let kind: String
     let name: String
     let remotePath: String
+    let remotePaths: [String]?
     let domain: String
     let enabled: Bool
     let sortOrder: Int64
@@ -14,6 +15,11 @@ struct LibraryModuleInfo: Decodable, Identifiable, Hashable {
     let assetCount: Int64
     let totalBytes: Int64
     let entityCount: Int64
+
+    var allPaths: [String] {
+        if let list = remotePaths, !list.isEmpty { return list }
+        return remotePath.isEmpty ? [] : [remotePath]
+    }
 
     var kindLabel: String {
         switch kind {
@@ -336,4 +342,146 @@ enum PMLFormatters {
         }
         return String(format: "%02d:%02d", m, s)
     }
+}
+
+
+// MARK: - 漫画库 V1（脱离目录自动识别作者与系列）
+
+struct ComicWorkItem: Decodable, Identifiable, Hashable {
+    let id: String
+    let title: String
+    let authors: [String]
+    let circle: String?
+    let parody: String?
+    let eventTag: String?
+    let translators: [String]
+    let tags: [String]
+    let language: String
+    let isUncensored: Bool
+    let isFullColor: Bool
+    let isDl: Bool
+    let isOngoing: Bool
+    let coverAssetId: String?
+    let coverIsArchive: Bool
+    let coverPageIndex: Int?
+    let volumeCount: Int64
+    let totalBytes: Int64
+    let source: String
+    let category: String?
+    let publishedAt: String?
+    let rating: Double?
+    let summary: String?
+    let updatedAt: Int64
+    let lastReadVolumeId: String?
+    let lastReadVolumeLabel: String?
+    let readPage: Int64?
+    let readTotalPages: Int64?
+    let readPercent: Int64?
+    let readStatus: String?
+    let lastReadAt: Int64?
+}
+
+struct ComicVolumeItem: Decodable, Identifiable, Hashable {
+    let id: String
+    let workId: String
+    let volumeLabel: String
+    let sortIndex: Double
+    let isArchive: Bool
+    let assetId: String
+    let folderPath: String?
+    let fileName: String
+    let remotePath: String
+    let pageCount: Int64
+    let sizeBytes: Int64
+    let readPage: Int64?
+    let completed: Bool?
+}
+
+struct ComicWorkDetail: Decodable {
+    let work: ComicWorkItem
+    let volumes: [ComicVolumeItem]
+    let relatedByAuthor: [ComicWorkItem]
+    let relatedByParody: [ComicWorkItem]
+}
+
+struct ComicLibraryPage: Decodable {
+    let items: [ComicWorkItem]
+    let total: Int64
+    let hasMore: Bool
+}
+
+struct ComicAuthorItem: Decodable, Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let circle: String?
+    let workCount: Int64
+    let volumeCount: Int64
+    let coverAssetId: String?
+    let coverIsArchive: Bool
+}
+
+struct ComicFilterFacet: Decodable, Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let count: Int64
+}
+
+struct ComicFilterOptions: Decodable {
+    let categories: [ComicFilterFacet]?
+    let genres: [ComicFilterFacet]?
+    let years: [ComicFilterFacet]?
+    let authors: [ComicFilterFacet]
+    let parodies: [ComicFilterFacet]
+    let tags: [ComicFilterFacet]
+}
+
+struct ComicLibraryStats: Decodable {
+    let totalWorks: Int64
+    let totalVolumes: Int64
+    let totalSeries: Int64
+    let totalAuthors: Int64
+    let zhCount: Int64
+    let rawCount: Int64
+    let uncensoredCount: Int64
+    let archiveVolumes: Int64
+    let folderVolumes: Int64
+    let enrichedCount: Int64?
+}
+
+struct ComicExternalCandidate: Codable, Identifiable {
+    var id: String { "\(source):\(externalId)" }
+    let source: String
+    let externalId: String
+    let externalUrl: String?
+    let title: String
+    let authors: [String]
+    let circle: String?
+    let parody: String?
+    let tags: [String]
+    let rating: Double?
+    let publishedAt: String?
+    let summary: String?
+    let coverUrl: String?
+    let matchReason: String
+}
+
+struct ComicBatchResultItem: Decodable, Identifiable {
+    var id: String { "\(workId)-\(ok)" }
+    let workId: String
+    let title: String
+    let ok: Bool
+    let source: String?
+    let tagsAdded: Int
+    let error: String?
+}
+
+struct ComicBatchProgress: Decodable {
+    let running: Bool
+    let total: Int
+    let completed: Int
+    let succeeded: Int
+    let failed: Int
+    let currentTitle: String?
+    let lastError: String?
+    let recentItems: [ComicBatchResultItem]?
 }

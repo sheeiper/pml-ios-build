@@ -1,5 +1,7 @@
 pub mod four_domains;
 pub mod library_modules;
+pub mod comic_library;
+pub mod comic_scraper;
 pub mod media_library;
 pub mod telegram_public;
 pub mod v2_catalog;

@@ -42,10 +42,14 @@ struct LibraryModulesSettingsView: View {
                                     .background(Color.accentColor.opacity(0.14), in: Capsule())
                             }
 
-                            Text(mod.remotePath)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(mod.allPaths, id: \.self) { p in
+                                    Text(p)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
 
                             HStack {
                                 Text("\(mod.entityCount) \(mod.entityUnitLabel) · \(mod.assetCount) 文件 · \(PMLFormatters.bytes(mod.totalBytes))")
@@ -145,7 +149,7 @@ private struct EditLibraryModuleSheet: View {
     @State private var id: String
     @State private var kind: String
     @State private var name: String
-    @State private var remotePath: String
+    @State private var paths: [String]
     @State private var enabled: Bool
     @State private var saving = false
     @State private var errorText = ""
@@ -164,7 +168,8 @@ private struct EditLibraryModuleSheet: View {
         _id = State(initialValue: existing?.id ?? "")
         _kind = State(initialValue: existing?.kind ?? "collections")
         _name = State(initialValue: existing?.name ?? "")
-        _remotePath = State(initialValue: existing?.remotePath ?? "/115open/文件/")
+        let initialPaths = existing?.allPaths ?? []
+        _paths = State(initialValue: initialPaths.isEmpty ? ["/115open/文件/"] : initialPaths)
         _enabled = State(initialValue: existing?.enabled ?? true)
     }
 
@@ -182,10 +187,39 @@ private struct EditLibraryModuleSheet: View {
                         }
                     }
                     TextField("显示名称", text: $name)
-                    TextField("115 远程路径", text: $remotePath)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
                     Toggle("启用该模块", isOn: $enabled)
+                }
+
+                Section {
+                    ForEach(paths.indices, id: \.self) { idx in
+                        HStack {
+                            TextField("115 远程路径", text: $paths[idx])
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            if paths.count > 1 {
+                                Button(role: .destructive) {
+                                    paths.remove(at: idx)
+                                } label: {
+                                    Image(systemName: "minus.circle.fill")
+                                        .foregroundStyle(.red)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                    Button {
+                        paths.append("/115open/")
+                    } label: {
+                        Label("添加目录", systemImage: "plus.circle")
+                    }
+                } header: {
+                    Text("绑定 115 目录（支持多个）")
+                } footer: {
+                    if kind == "movies" {
+                        Text("保存后将自动同步为影视库刮削白名单。")
+                    } else if kind == "comics" {
+                        Text("保存后第 1 个路径将同步为漫画主目录，所有路径均纳入漫画模块扫描。")
+                    }
                 }
 
                 if !errorText.isEmpty {
@@ -212,6 +246,13 @@ private struct EditLibraryModuleSheet: View {
 
     private func save() async {
         guard let client = model.apiClient else { return }
+        let cleaned = paths
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let primary = cleaned.first else {
+            errorText = "请至少填写一个 115 目录路径"
+            return
+        }
         saving = true
         errorText = ""
         defer { saving = false }
@@ -220,7 +261,8 @@ private struct EditLibraryModuleSheet: View {
                 id: id.trimmingCharacters(in: .whitespacesAndNewlines),
                 kind: kind,
                 name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-                remotePath: remotePath.trimmingCharacters(in: .whitespacesAndNewlines),
+                remotePath: primary,
+                remotePaths: cleaned,
                 domain: kind == "comics" ? "comics" : "vault",
                 enabled: enabled,
                 sortOrder: existing?.sortOrder

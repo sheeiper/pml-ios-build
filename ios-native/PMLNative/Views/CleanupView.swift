@@ -4,9 +4,6 @@ public struct CleanupView: View {
     @EnvironmentObject private var appModel: AppModel
 
     @State private var whitelist: [String] = []
-    @State private var newPath: String = ""
-    @State private var savingWhitelist = false
-    @State private var whitelistNotice: String?
 
     @State private var scanning = false
     @State private var deleting = false
@@ -29,74 +26,39 @@ public struct CleanupView: View {
 
     public var body: some View {
         Form {
-            // 1. 刮削白名单目录
+            // 1. 影视库刮削目录（统一收口至「设置 → 五大模块路径与同步」）
             Section {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("仅在以下白名单目录中的视频才会自动刮削日本商业元数据与剧照；未配置则自动刮削保持静默。")
+                    Text("刮削目录已与「多模块资料库 → 媒体库」双向同步，请统一在模块设置中管理，避免多处配置冲突。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    HStack {
-                        TextField("例如：/115open/文件/日本电影", text: $newPath)
-                            .textFieldStyle(.roundedBorder)
-
-                        Button("添加") {
-                            let p = newPath.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !p.isEmpty && !whitelist.contains(p) {
-                                whitelist.append(p)
-                                newPath = ""
-                            }
-                        }
-                        .disabled(newPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-
                     if !whitelist.isEmpty {
-                        ForEach(Array(whitelist.enumerated()), id: \.offset) { idx, path in
+                        ForEach(whitelist, id: \.self) { path in
                             HStack {
                                 Image(systemName: "folder")
                                     .foregroundStyle(.indigo)
                                 Text(path)
                                     .font(.subheadline)
-                                Spacer()
-                                Button(role: .destructive) {
-                                    whitelist.remove(at: idx)
-                                } label: {
-                                    Image(systemName: "trash")
-                                        .foregroundStyle(.red)
-                                }
-                                .buttonStyle(.borderless)
                             }
                             .padding(.vertical, 2)
                         }
                     } else {
-                        Text("当前未配置任何白名单目录")
+                        Text("当前未配置任何影视库目录")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
 
-                    HStack {
-                        Button {
-                            Task { await saveWhitelist() }
-                        } label: {
-                            if savingWhitelist {
-                                ProgressView()
-                            } else {
-                                Label("保存白名单设置", systemImage: "checkmark")
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-
-                        if let notice = whitelistNotice {
-                            Text(notice)
-                                .font(.caption2)
-                                .foregroundStyle(.green)
-                        }
+                    NavigationLink {
+                        LibraryModulesSettingsView()
+                    } label: {
+                        Label("前往多模块资料库管理目录", systemImage: "square.stack.3d.up.fill")
+                            .font(.subheadline.weight(.medium))
                     }
                     .padding(.top, 4)
                 }
             } header: {
-                Label("刮削目录白名单限定", systemImage: "shield.lefthalf.filled")
+                Label("影视库刮削目录（已统一收口）", systemImage: "shield.lefthalf.filled")
             }
 
             // 1.5 全自动后台批量刮削
@@ -336,22 +298,6 @@ public struct CleanupView: View {
         case "video": return .red
         default: return .secondary
         }
-    }
-
-    private func saveWhitelist() async {
-        guard let client = appModel.apiClient else {
-            whitelistNotice = "未连接到数据源"
-            return
-        }
-        savingWhitelist = true
-        whitelistNotice = nil
-        do {
-            try await client.setScrapeWhitelist(paths: whitelist)
-            whitelistNotice = "保存成功！"
-        } catch {
-            whitelistNotice = "保存失败: \(error.localizedDescription)"
-        }
-        savingWhitelist = false
     }
 
     private func startScan() async {

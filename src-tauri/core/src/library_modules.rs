@@ -13,6 +13,7 @@ pub struct LibraryModuleInfo {
     pub kind: String,
     pub name: String,
     pub remote_path: String,
+    pub remote_paths: Vec<String>,
     pub domain: String,
     pub enabled: bool,
     pub sort_order: i64,
@@ -240,7 +241,99 @@ pub(crate) fn ensure_module_schema(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("为 authors 添加 social_links_json 列失败：{e}"))?;
     }
 
+    if !has_column(conn, "library_modules", "extra_paths_json")? {
+        conn.execute(
+            "ALTER TABLE library_modules ADD COLUMN extra_paths_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )
+        .map_err(|e| format!("为 library_modules 添加 extra_paths_json 列失败：{e}"))?;
+    }
+
     seed_default_modules(conn)?;
+    sync_legacy_directory_configs(conn)?;
+    Ok(())
+}
+
+fn parse_module_paths(primary: &str, extra_json: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let p0 = primary.trim().trim_end_matches('/').to_string();
+    if !p0.is_empty() {
+        out.push(p0);
+    }
+    if let Some(raw) = extra_json {
+        if let Ok(extras) = serde_json::from_str::<Vec<String>>(raw) {
+            for item in extras {
+                let clean = item.trim().trim_end_matches('/').to_string();
+                if !clean.is_empty() && !out.contains(&clean) {
+                    out.push(clean);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn normalize_module_paths(primary: &str, remote_paths: Option<Vec<String>>) -> (String, String, Vec<String>) {
+    let mut all = Vec::new();
+    if let Some(list) = remote_paths {
+        for item in list {
+            let clean = item.trim().trim_end_matches('/').to_string();
+            if !clean.is_empty() && !all.contains(&clean) {
+                all.push(clean);
+            }
+        }
+    }
+    if all.is_empty() {
+        let p0 = primary.trim().trim_end_matches('/').to_string();
+        if !p0.is_empty() {
+            all.push(p0);
+        }
+    }
+    let first = all.first().cloned().unwrap_or_default();
+    let extras: Vec<String> = all.iter().skip(1).cloned().collect();
+    let extra_json = serde_json::to_string(&extras).unwrap_or_else(|_| "[]".to_string());
+    (first, extra_json, all)
+}
+
+/// One-time migration: unify legacy `scrape_whitelist` into `library_modules(movies)`
+/// so all module paths live in one single source of truth.
+fn sync_legacy_directory_configs(conn: &Connection) -> Result<(), String> {
+    let done = conn
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = 'modules_unified_paths_v1'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    if done {
+        return Ok(());
+    }
+
+    let mut wl_paths = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT path FROM scrape_whitelist WHERE enabled = 1 ORDER BY created_at ASC, path ASC") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for r in rows.flatten() {
+                let clean = r.trim().trim_end_matches('/').to_string();
+                if !clean.is_empty() && !wl_paths.contains(&clean) {
+                    wl_paths.push(clean);
+                }
+            }
+        }
+    }
+    if !wl_paths.is_empty() {
+        let (first, extra_json, _) = normalize_module_paths(&wl_paths[0], Some(wl_paths.clone()));
+        let _ = conn.execute(
+            "UPDATE library_modules SET remote_path = ?1, extra_paths_json = ?2, updated_at = ?3 WHERE kind = 'movies'",
+            params![first, extra_json, now()],
+        );
+    }
+
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('modules_unified_paths_v1', '1')",
+        [],
+    );
     Ok(())
 }
 
@@ -300,7 +393,7 @@ pub fn list_modules(app: &AppHandle) -> Result<Vec<LibraryModuleInfo>, String> {
     let conn = four_domains::open_v2(app)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, name, remote_path, domain, enabled, sort_order, last_scanned_at
+            "SELECT id, kind, name, remote_path, COALESCE(extra_paths_json, '[]'), domain, enabled, sort_order, last_scanned_at
              FROM library_modules
              ORDER BY sort_order ASC, id ASC",
         )
@@ -313,17 +406,19 @@ pub fn list_modules(app: &AppHandle) -> Result<Vec<LibraryModuleInfo>, String> {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)? != 0,
-                row.get::<_, i64>(6)?,
-                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)? != 0,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
             ))
         })
         .map_err(|e| e.to_string())?;
 
     let mut modules = Vec::new();
     for row in rows {
-        let (id, kind, name, remote_path, domain, enabled, sort_order, last_scanned_at) =
+        let (id, kind, name, remote_path, extra_paths_json, domain, enabled, sort_order, last_scanned_at) =
             row.map_err(|e| e.to_string())?;
+        let remote_paths = parse_module_paths(&remote_path, Some(&extra_paths_json));
 
         let (asset_count, total_bytes): (i64, i64) = conn
             .query_row(
@@ -367,6 +462,7 @@ pub fn list_modules(app: &AppHandle) -> Result<Vec<LibraryModuleInfo>, String> {
             kind,
             name,
             remote_path,
+            remote_paths,
             domain,
             enabled,
             sort_order,
@@ -386,6 +482,8 @@ pub struct UpsertModuleRequest {
     pub kind: String,
     pub name: String,
     pub remote_path: String,
+    #[serde(default)]
+    pub remote_paths: Option<Vec<String>>,
     pub domain: Option<String>,
     pub enabled: Option<bool>,
     pub sort_order: Option<i64>,
@@ -399,7 +497,8 @@ pub fn upsert_module(
     let id = req.id.trim().to_string();
     let kind = req.kind.trim().to_string();
     let name = req.name.trim().to_string();
-    let remote_path = req.remote_path.trim().trim_end_matches('/').to_string();
+    let (remote_path, extra_paths_json, all_paths) =
+        normalize_module_paths(&req.remote_path, req.remote_paths);
     if id.is_empty() || kind.is_empty() || name.is_empty() || remote_path.is_empty() {
         return Err("模块 id、kind、name、remotePath 均不能为空".into());
     }
@@ -413,19 +512,36 @@ pub fn upsert_module(
     let conn = four_domains::open_v2(app)?;
     conn.execute(
         "INSERT INTO library_modules
-         (id, kind, name, remote_path, domain, enabled, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+         (id, kind, name, remote_path, extra_paths_json, domain, enabled, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
          ON CONFLICT(id) DO UPDATE SET
            kind = excluded.kind,
            name = excluded.name,
            remote_path = excluded.remote_path,
+           extra_paths_json = excluded.extra_paths_json,
            domain = excluded.domain,
            enabled = excluded.enabled,
            sort_order = excluded.sort_order,
            updated_at = excluded.updated_at",
-        params![&id, &kind, &name, &remote_path, &domain, enabled, sort_order, ts],
+        params![&id, &kind, &name, &remote_path, &extra_paths_json, &domain, enabled, sort_order, ts],
     )
     .map_err(|e| e.to_string())?;
+
+    // Keep legacy tables strictly in sync so there is only ONE source of truth.
+    if kind == "movies" {
+        let _ = conn.execute("DELETE FROM scrape_whitelist", []);
+        for p in &all_paths {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO scrape_whitelist (path, enabled, created_at) VALUES (?1, 1, ?2)",
+                params![p, ts],
+            );
+        }
+    } else if kind == "comics" {
+        let _ = conn.execute(
+            "UPDATE domain_roots SET remote_path = ?1, updated_at = ?2 WHERE domain = 'comics'",
+            params![&remote_path, ts],
+        );
+    }
 
     let list = list_modules(app)?;
     list.into_iter()
@@ -464,9 +580,9 @@ pub(crate) fn rebuild_module_index_with_conn(
     conn: &mut Connection,
     module_id: &str,
 ) -> Result<ModuleRebuildSummary, String> {
-    let (kind, remote_path, domain): (String, String, String) = conn
+    let (kind, remote_path, extra_paths_json): (String, String, String) = conn
         .query_row(
-            "SELECT kind, remote_path, domain FROM library_modules WHERE id = ?1",
+            "SELECT kind, remote_path, COALESCE(extra_paths_json, '[]') FROM library_modules WHERE id = ?1",
             params![module_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -474,28 +590,32 @@ pub(crate) fn rebuild_module_index_with_conn(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("未找到模块：{module_id}"))?;
 
-    let root = remote_path.trim_end_matches('/').to_string();
+    let all_paths = parse_module_paths(&remote_path, Some(&extra_paths_json));
+    let root = all_paths.first().cloned().unwrap_or_else(|| remote_path.trim_end_matches('/').to_string());
     let prefix = format!("{root}/");
-    let like_pattern = format!("{prefix}%");
 
     let tx = conn
         .transaction()
         .map_err(|e| format!("开启索引重建事务失败：{e}"))?;
 
-    // 1. Tag assets belonging to this module's root path.
+    // 1. Tag assets belonging to ANY of this module's configured paths.
     tx.execute(
-        "UPDATE assets SET module_id = NULL WHERE module_id = ?1 AND NOT (remote_path = ?2 OR remote_path LIKE ?3)",
-        params![module_id, &root, &like_pattern],
+        "UPDATE assets SET module_id = NULL WHERE module_id = ?1",
+        params![module_id],
     )
     .map_err(|e| e.to_string())?;
 
-    let tagged_assets = tx
-        .execute(
-            "UPDATE assets SET module_id = ?1
-             WHERE domain = ?2 AND (remote_path = ?3 OR remote_path LIKE ?4)",
-            params![module_id, &domain, &root, &like_pattern],
-        )
-        .map_err(|e| e.to_string())? as i64;
+    let mut tagged_assets: i64 = 0;
+    for p in &all_paths {
+        let lp = format!("{p}/%");
+        tagged_assets += tx
+            .execute(
+                "UPDATE assets SET module_id = ?1
+                 WHERE missing = 0 AND (remote_path = ?2 OR remote_path LIKE ?3)",
+                params![module_id, p, &lp],
+            )
+            .map_err(|e| e.to_string())? as i64;
+    }
 
     let (entity_count, item_count) = match kind.as_str() {
         "creators" => rebuild_creators_index(&tx, module_id, &prefix)?,
@@ -936,37 +1056,59 @@ pub async fn scan_module(
     full: bool,
 ) -> Result<ModuleScanResult, String> {
     four_domains::ensure_v2(&app)?;
-    let (domain, remote_path): (String, String) = {
+    let (domain, remote_path, extra_paths_json): (String, String, String) = {
         let conn = four_domains::open_v2(&app)?;
         conn.query_row(
-            "SELECT domain, remote_path FROM library_modules WHERE id = ?1",
+            "SELECT domain, remote_path, COALESCE(extra_paths_json, '[]') FROM library_modules WHERE id = ?1",
             params![module_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("未找到模块：{module_id}"))?
     };
 
-    let folder_path = if domain == "comics" {
-        String::new()
-    } else {
-        remote_path.trim_end_matches('/').to_string()
+    let all_paths = parse_module_paths(&remote_path, Some(&extra_paths_json));
+    let mut scan = four_domains::ScanSummary {
+        domain: domain.clone(),
+        scan_id: String::new(),
+        scanned: 0,
+        added: 0,
+        updated: 0,
+        missing: 0,
+        deleted: 0,
+        conflicts: 0,
     };
-
-    let scan = four_domains::scan_provider_tree(
-        app.clone(),
-        state,
-        &domain,
-        &folder_path,
-        true,
-        !full,
-    )
-    .await?;
+    for (idx, p) in all_paths.iter().enumerate() {
+        let folder_path = if domain == "comics" && idx == 0 {
+            String::new()
+        } else {
+            p.trim_end_matches('/').to_string()
+        };
+        let s = four_domains::scan_provider_tree(
+            app.clone(),
+            state.clone(),
+            &domain,
+            &folder_path,
+            true,
+            !full,
+        )
+        .await?;
+        scan.scan_id = s.scan_id;
+        scan.scanned += s.scanned;
+        scan.added += s.added;
+        scan.updated += s.updated;
+        scan.missing += s.missing;
+        scan.deleted += s.deleted;
+        scan.conflicts += s.conflicts;
+    }
 
     let rebuild = {
         let mut conn = four_domains::open_v2(&app)?;
         let summary = rebuild_module_index_with_conn(&mut conn, module_id)?;
+        if summary.kind == "comics" {
+            let _ = crate::comic_library::rebuild_comic_library_with_conn(&mut conn);
+        }
         conn.execute(
             "UPDATE library_modules SET last_scanned_at = ?1, updated_at = ?1 WHERE id = ?2",
             params![now(), module_id],
@@ -1397,6 +1539,7 @@ pub struct EntityFavoriteIds {
     pub movies: Vec<String>,
     pub performers: Vec<String>,
     pub creators: Vec<String>,
+    pub comics: Vec<String>,
 }
 
 pub(crate) fn ensure_entity_favorites_table(conn: &Connection) -> rusqlite::Result<()> {
@@ -1418,7 +1561,7 @@ pub fn toggle_entity_favorite(
     entity_id: &str,
 ) -> Result<bool, String> {
     let kind = entity_type.trim().to_ascii_lowercase();
-    if !matches!(kind.as_str(), "movie" | "performer" | "creator") {
+    if !matches!(kind.as_str(), "movie" | "performer" | "creator" | "comic") {
         return Err(format!("不支持的收藏类型：{entity_type}"));
     }
     let eid = entity_id.trim();
@@ -1469,6 +1612,7 @@ pub fn list_entity_favorite_ids(app: &AppHandle) -> Result<EntityFavoriteIds, St
             "movie" => result.movies.push(row.1),
             "performer" => result.performers.push(row.1),
             "creator" => result.creators.push(row.1),
+            "comic" => result.comics.push(row.1),
             _ => {}
         }
     }

@@ -69,8 +69,9 @@ extension PMLAPIClient {
     }
 
     /// 复用网页版同一套 `/api/comic-pages/{asset}/{page}` 路由。
-    func comicPageURL(assetId: String, pageIndex: Int) -> URL? {
-        URL(string: "/api/comic-pages/\(assetId)/\(pageIndex)", relativeTo: configuration.baseURL)?.absoluteURL
+    func comicPageURL(assetId: String, pageIndex: Int, thumb: Bool = false) -> URL? {
+        let suffix = thumb ? "?thumb=1" : ""
+        return URL(string: "/api/comic-pages/\(assetId)/\(pageIndex)\(suffix)", relativeTo: configuration.baseURL)?.absoluteURL
     }
 
     // MARK: - 短视频

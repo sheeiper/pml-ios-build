@@ -3480,6 +3480,118 @@ pub async fn read_comic_archive_page(
     })
 }
 
+async fn compress_comic_thumb_420(raw_bytes: &[u8]) -> Option<Vec<u8>> {
+    use tokio::io::AsyncWriteExt;
+    use std::process::Stdio;
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale='min(420,iw)':-2",
+            "-q:v",
+            "4",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(raw_bytes).await;
+        let _ = stdin.shutdown().await;
+    }
+    let out = tokio::time::timeout(std::time::Duration::from_secs(6), child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if out.status.success() && out.stdout.len() > 256 {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+pub async fn read_comic_cover_fast(
+    app: &AppHandle,
+    state: &State<'_, MediaLibraryState>,
+    asset_id: &str,
+    page_index: usize,
+) -> Result<(String, Vec<u8>), String> {
+    static COVER_SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let safe_id: String = asset_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let cache_dir = PathBuf::from("/data/cache/comic_covers");
+    let cache_file = cache_dir.join(format!("{safe_id}_p{page_index}_420.jpg"));
+
+    let detect_mime = |bytes: &[u8]| -> String {
+        if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            "image/jpeg".to_string()
+        } else if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+            "image/png".to_string()
+        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            "image/webp".to_string()
+        } else if bytes.starts_with(b"GIF8") {
+            "image/gif".to_string()
+        } else {
+            "image/jpeg".to_string()
+        }
+    };
+
+    if let Ok(bytes) = tokio::fs::read(&cache_file).await {
+        if !bytes.is_empty() {
+            return Ok((detect_mime(&bytes), bytes));
+        }
+    }
+
+    let sem = COVER_SEM.get_or_init(|| tokio::sync::Semaphore::new(3));
+    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+
+    if let Ok(bytes) = tokio::fs::read(&cache_file).await {
+        if !bytes.is_empty() {
+            return Ok((detect_mime(&bytes), bytes));
+        }
+    }
+
+    // Fast Range-only path: NEVER download an entire multi-hundred-MB archive just for a thumbnail
+    let fetch_fut = async {
+        let meta = ensure_remote_zip_meta(app, state, asset_id).await?;
+        let entry = meta
+            .get(page_index)
+            .ok_or_else(|| "压缩包页码超出范围".to_string())?;
+        fetch_remote_zip_page(app, state, asset_id, entry).await
+    };
+
+    let (raw_mime, raw_bytes) = tokio::time::timeout(std::time::Duration::from_secs(15), fetch_fut)
+        .await
+        .map_err(|_| "提取漫画缩略图超时".to_string())??;
+
+    let (final_mime, final_bytes) = if raw_bytes.len() > 65_536 {
+        match compress_comic_thumb_420(&raw_bytes).await {
+            Some(compressed) => ("image/jpeg".to_string(), compressed),
+            None => (raw_mime, raw_bytes),
+        }
+    } else {
+        (raw_mime, raw_bytes)
+    };
+
+    let _ = tokio::fs::create_dir_all(&cache_dir).await;
+    let _ = tokio::fs::write(&cache_file, &final_bytes).await;
+    Ok((final_mime, final_bytes))
+}
+
 pub async fn read_comic_archive_page_binary(
     app: &AppHandle,
     state: &State<'_, MediaLibraryState>,

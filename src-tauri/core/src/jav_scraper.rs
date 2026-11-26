@@ -3569,14 +3569,24 @@ pub fn set_scrape_whitelist(conn: &mut Connection, paths: Vec<String>) -> Result
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM scrape_whitelist", [])?;
     let now = chrono::Utc::now().timestamp();
+    let mut clean_list = Vec::new();
     for p in paths {
         let clean = normalize_scrape_path(&p);
-        if !clean.is_empty() {
+        if !clean.is_empty() && !clean_list.contains(&clean) {
             tx.execute(
                 "INSERT OR IGNORE INTO scrape_whitelist (path, enabled, created_at) VALUES (?1, 1, ?2)",
                 params![clean, now],
             )?;
+            clean_list.push(clean);
         }
+    }
+    if !clean_list.is_empty() {
+        let first = &clean_list[0];
+        let extra_json = serde_json::to_string(&clean_list[1..]).unwrap_or_else(|_| "[]".to_string());
+        let _ = tx.execute(
+            "UPDATE library_modules SET remote_path = ?1, extra_paths_json = ?2, updated_at = ?3 WHERE kind = 'movies'",
+            params![first, extra_json, now],
+        );
     }
     tx.commit()?;
     Ok(())

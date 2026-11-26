@@ -657,6 +657,97 @@ async fn dispatch_command(
             let app = app.clone();
             blocking_result_response(move || crate::library_modules::list_modules(&app)).await
         }
+        "rebuild_comic_library" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::rebuild_comic_library(&app)).await
+        }
+        "get_comic_library_stats" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::get_comic_library_stats(&app)).await
+        }
+        "query_comic_library" => {
+            let req: crate::comic_library::QueryComicLibraryRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(_) => crate::comic_library::QueryComicLibraryRequest::default(),
+            };
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::query_comic_library(&app, req)).await
+        }
+        "get_comic_work_detail" => {
+            let work_id = payload
+                .get("workId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::get_comic_work_detail(&app, &work_id)).await
+        }
+        "list_comic_authors" => {
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let limit = payload.get("limit").and_then(Value::as_i64);
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::list_comic_authors(&app, query, limit)).await
+        }
+        "list_comic_filter_options" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::list_comic_filter_options(&app)).await
+        }
+        "save_comic_reading_progress" => {
+            let req: crate::comic_library::SaveComicProgressRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::save_comic_reading_progress(&app, req)).await
+        }
+        "set_comic_work_cover" => {
+            let req: crate::comic_library::SetComicCoverRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::set_comic_work_cover(&app, req)).await
+        }
+        "list_continue_reading_comics" => {
+            let limit = payload.get("limit").and_then(Value::as_i64);
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_library::list_continue_reading_comics(&app, limit)).await
+        }
+        "search_comic_online_sources" => {
+            let work_id = payload.get("workId").and_then(Value::as_str).map(str::to_owned);
+            let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
+            let use_cover_hash = payload.get("useCoverHash").and_then(Value::as_bool).unwrap_or(true);
+            let state = app.state::<MediaLibraryState>();
+            match crate::comic_scraper::search_comic_online_sources(app.clone(), state, work_id, query, use_cover_hash).await {
+                Ok(value) => (StatusCode::OK, Json(json!(value))).into_response(),
+                Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response(),
+            }
+        }
+        "apply_comic_external_source" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ApplyReq {
+                work_id: String,
+                candidate: crate::comic_scraper::ComicExternalCandidate,
+            }
+            let req: ApplyReq = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_scraper::apply_comic_external_source(&app, &req.work_id, req.candidate)).await
+        }
+        "start_comic_batch_scrape" => {
+            let use_cover_hash = payload.get("useCoverHash").and_then(Value::as_bool).unwrap_or(true);
+            let app = app.clone();
+            blocking_result_response(move || crate::comic_scraper::start_comic_batch_scrape(app, use_cover_hash)).await
+        }
+        "stop_comic_batch_scrape" => {
+            (StatusCode::OK, Json(json!(crate::comic_scraper::stop_comic_batch_scrape()))).into_response()
+        }
+        "get_comic_batch_scrape_progress" => {
+            (StatusCode::OK, Json(json!(crate::comic_scraper::get_comic_batch_scrape_progress()))).into_response()
+        }
         "upsert_library_module" => {
             let req: crate::library_modules::UpsertModuleRequest = match parse_args(&payload) {
                 Ok(value) => value,
@@ -2874,14 +2965,25 @@ async fn cached_cover(AxumState(context):AxumState<ServerState>,Path((asset_id,v
     response
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ComicPageQuery {
+    thumb: Option<u8>,
+}
+
 async fn cached_comic_page(
     AxumState(context): AxumState<ServerState>,
     Path((asset_id, page_index)): Path<(String, usize)>,
+    Query(query): Query<ComicPageQuery>,
     headers: HeaderMap,
 ) -> Response {
     let app = context.app.clone();
     let state = app.state::<MediaLibraryState>();
-    let cache_key = format!("{asset_id}|{page_index}");
+    let is_thumb = query.thumb == Some(1);
+    let cache_key = if is_thumb {
+        format!("{asset_id}|{page_index}|thumb")
+    } else {
+        format!("{asset_id}|{page_index}")
+    };
     let cached = COMIC_PAGE_CACHE
         .lock()
         .ok()
@@ -2889,7 +2991,11 @@ async fn cached_comic_page(
     let result = match cached {
         Some(hit) => Ok(hit),
         None => {
-            let fetched = media_library::read_comic_archive_page_binary(&app, &state, &asset_id, page_index).await;
+            let fetched = if is_thumb {
+                media_library::read_comic_cover_fast(&app, &state, &asset_id, page_index).await
+            } else {
+                media_library::read_comic_archive_page_binary(&app, &state, &asset_id, page_index).await
+            };
             if let Ok(value) = &fetched {
                 if let Ok(mut cache) = COMIC_PAGE_CACHE.lock() {
                     if cache.len() > 80 {

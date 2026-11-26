@@ -247,6 +247,7 @@ struct HomeView: View {
         case "creators": AuthorsView()
         case "collections": CollectionsView()
         case "galleries": GalleriesView()
+        case "comics": ComicLibraryView()
         default: BrowseView()
         }
     }
@@ -668,7 +669,14 @@ struct HomeView: View {
     private var comicsSection: some View {
         if !comics.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                Text("漫画馆藏").font(.headline)
+                HStack {
+                    Text("漫画馆藏").font(.headline)
+                    Spacer()
+                    NavigationLink("全部") {
+                        ComicLibraryView()
+                    }
+                    .font(.caption)
+                }
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
                         ForEach(comics) { asset in
