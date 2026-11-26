@@ -5,15 +5,17 @@ enum EntityFavoriteType: String {
     case movie
     case performer
     case creator
+    case comic
 }
 
 struct EntityFavoriteIds: Decodable {
     let movies: [String]
     let performers: [String]
     let creators: [String]
+    let comics: [String]?
 }
 
-/// 全局实体收藏状态（影片 / 演员 / 创作者），与服务端 `entity_favorites` 同步。
+/// 全局实体收藏状态（影片 / 演员 / 创作者 / 漫画），与服务端 `entity_favorites` 同步。
 @MainActor
 final class EntityFavoritesStore: ObservableObject {
     static let shared = EntityFavoritesStore()
@@ -21,6 +23,7 @@ final class EntityFavoritesStore: ObservableObject {
     @Published private(set) var movies: Set<String> = []
     @Published private(set) var performers: Set<String> = []
     @Published private(set) var creators: Set<String> = []
+    @Published private(set) var comics: Set<String> = []
     private var loaded = false
 
     func ensureLoaded(client: PMLAPIClient?, force: Bool = false) async {
@@ -30,6 +33,7 @@ final class EntityFavoritesStore: ObservableObject {
             movies = Set(ids.movies)
             performers = Set(ids.performers)
             creators = Set(ids.creators)
+            comics = Set(ids.comics ?? [])
             loaded = true
         }
     }
@@ -39,12 +43,14 @@ final class EntityFavoritesStore: ObservableObject {
         case .movie: return movies.contains(id)
         case .performer: return performers.contains(id)
         case .creator: return creators.contains(id)
+        case .comic: return comics.contains(id)
         }
     }
 
     func isMovieFav(_ id: String) -> Bool { isFavorited(.movie, id: id) }
     func isPerformerFav(_ id: String) -> Bool { isFavorited(.performer, id: id) }
     func isCreatorFav(_ id: String) -> Bool { isFavorited(.creator, id: id) }
+    func isComicFav(_ id: String) -> Bool { isFavorited(.comic, id: id) }
 
     func toggle(_ type: EntityFavoriteType, id: String, client: PMLAPIClient?) async {
         guard let client, !id.isEmpty else { return }
@@ -70,6 +76,8 @@ final class EntityFavoritesStore: ObservableObject {
             if favorited { performers.insert(id) } else { performers.remove(id) }
         case .creator:
             if favorited { creators.insert(id) } else { creators.remove(id) }
+        case .comic:
+            if favorited { comics.insert(id) } else { comics.remove(id) }
         }
     }
 }

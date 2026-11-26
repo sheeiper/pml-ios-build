@@ -142,7 +142,7 @@ struct ComicLibraryView: View {
         guard let aid = assetId, !aid.isEmpty, let client = model.apiClient else { return nil }
         return isArchive
             ? client.comicPageURL(assetId: aid, pageIndex: pageIndex, thumb: true)
-            : client.thumbnailURL(assetId: aid)
+            : client.v2CoverURL(assetId: aid, isArchive: false)
     }
 
     private var shelfView: some View {
@@ -623,9 +623,9 @@ struct ComicLibraryView: View {
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
                                 Button {
-                                    Task { await favs.toggle(client: model.apiClient, entityType: "comic", entityId: work.id) }
+                                    Task { await favs.toggle(.comic, id: work.id, client: model.apiClient) }
                                 } label: {
-                                    Image(systemName: favs.isFavorite(entityType: "comic", entityId: work.id) ? "heart.fill" : "heart")
+                                    Image(systemName: favs.isComicFav(work.id) ? "heart.fill" : "heart")
                                         .foregroundStyle(.pink)
                                 }
                                 .buttonStyle(.bordered)
