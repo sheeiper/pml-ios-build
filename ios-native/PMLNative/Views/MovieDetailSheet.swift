@@ -18,8 +18,22 @@ public struct MovieDetailSheet: View {
     @State private var metadata: MovieMetadata?
     @State private var parts: [MovieAssetPart] = []
     @State private var relatedGrouped: RelatedMoviesGrouped?
-    @State private var selectedSampleIndex: Int?
+    @State private var activeFullScreen: DetailFullScreen?
+    @State private var resolvingPlayback = false
+    @State private var playbackErrorText: String?
     @State private var selectedPerformer: MoviePerformer?
+
+    private enum DetailFullScreen: Identifiable {
+        case sample(Int)
+        case player(PreviewItem)
+
+        var id: String {
+            switch self {
+            case .sample(let idx): return "sample-\(idx)"
+            case .player(let item): return "player-\(item.id)"
+            }
+        }
+    }
     @State private var currentNumber: String?
     @State private var savedSubtitles: [SavedMovieSubtitle] = []
     @State private var subtitleCandidates: [SubtitleSearchCandidate] = []
@@ -30,6 +44,7 @@ public struct MovieDetailSheet: View {
     @State private var subtitleDeletingId: String?
     @State private var copyToast: String?
     @State private var showNoAssetAlert = false
+    @State private var showMultiSourceSheet = false
 
     public init(
         number: String? = nil,
@@ -75,6 +90,16 @@ public struct MovieDetailSheet: View {
                                 .font(.subheadline)
                                 .multilineTextAlignment(.center)
                                 .foregroundStyle(.secondary)
+                            Button {
+                                showMultiSourceSheet = true
+                            } label: {
+                                Image(systemName: "square.stack.3d.up")
+                                    .font(.headline)
+                                    .padding(.vertical, 8)
+                                    .padding(.horizontal, 12)
+                            }
+                            .buttonStyle(.bordered)
+
                             Button {
                                 Task { await loadData(force: true) }
                             } label: {
@@ -177,19 +202,26 @@ public struct MovieDetailSheet: View {
                         HStack(spacing: 12) {
                             Button {
                                 if let targetId = parts.first?.assetId ?? meta.assetId ?? assetId {
-                                    dismiss()
-                                    onPlay?(targetId)
+                                    Task { await playLocally(assetId: targetId, title: meta.title) }
                                 } else {
                                     showNoAssetAlert = true
                                 }
                             } label: {
-                                Label("立即播放", systemImage: "play.fill")
-                                    .font(.headline)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
+                                HStack(spacing: 6) {
+                                    if resolvingPlayback {
+                                        ProgressView().tint(.white)
+                                    } else {
+                                        Image(systemName: "play.fill")
+                                    }
+                                    Text(resolvingPlayback ? "解析中…" : "立即播放")
+                                }
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(.purple)
+                            .disabled(resolvingPlayback)
 
                             Button {
                                 Task { await searchSubtitles(for: meta.number) }
@@ -221,6 +253,16 @@ public struct MovieDetailSheet: View {
                             .buttonStyle(.bordered)
 
                             Button {
+                                showMultiSourceSheet = true
+                            } label: {
+                                Image(systemName: "square.stack.3d.up")
+                                    .font(.headline)
+                                    .padding(.vertical, 8)
+                                    .padding(.horizontal, 12)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button {
                                 Task { await loadData(force: true) }
                             } label: {
                                 Image(systemName: "arrow.clockwise")
@@ -244,8 +286,7 @@ public struct MovieDetailSheet: View {
                                     .foregroundStyle(.secondary)
                                 ForEach(Array(parts.enumerated()), id: \.element.id) { idx, part in
                                     Button {
-                                        dismiss()
-                                        onPlay?(part.assetId)
+                                        Task { await playLocally(assetId: part.assetId, title: part.fileName) }
                                     } label: {
                                         HStack(spacing: 8) {
                                             Image(systemName: "play.circle.fill")
@@ -379,7 +420,7 @@ public struct MovieDetailSheet: View {
                                         ForEach(Array(meta.sampleImages.enumerated()), id: \.offset) { idx, sample in
                                             if let url = appModel.proxyScraperImageURL(rawUrl: sample) {
                                                 Button {
-                                                    selectedSampleIndex = idx
+                                                    activeFullScreen = .sample(idx)
                                                 } label: {
                                                     CachedImageView(url: url, contentMode: .fill, minHeight: 100, maxPixel: 540)
                                                         .frame(width: 150, height: 100)
@@ -468,21 +509,50 @@ public struct MovieDetailSheet: View {
                 )
                 .environmentObject(appModel)
             }
+            .sheet(isPresented: $showMultiSourceSheet) {
+                if let targetNum = metadata?.number ?? currentNumber ?? number {
+                    MovieMultiSourceSheet(number: targetNum, currentSource: metadata?.source) { saved in
+                        metadata = saved
+                        showMultiSourceSheet = false
+                    }
+                    .environmentObject(appModel)
+                }
+            }
             .alert("未找到本地视频文件", isPresented: $showNoAssetAlert) {
                 Button("知道了", role: .cancel) {}
             } message: {
-                Text("该作品当前仅有影视百科资料，网盘或本地尚未匹配到对应的视频文件。可在影视库【数据管理】中执行增量同步。")
+                Text("该作品当前仅有影视百科资料，网盘或本地尚未匹配到对应的视频文件。可在影视库【数据】中执行增量同步。")
             }
-            .fullScreenCover(item: Binding<SampleGallerySelection?>(
-                get: { selectedSampleIndex.map { SampleGallerySelection(index: $0) } },
-                set: { selectedSampleIndex = $0?.index }
-            )) { selection in
-                SampleGalleryPagerView(
-                    images: metadata?.sampleImages ?? [],
-                    initialIndex: selection.index,
-                    onClose: { selectedSampleIndex = nil }
-                )
-                .environmentObject(appModel)
+            .alert("无法播放视频", isPresented: Binding(
+                get: { playbackErrorText != nil },
+                set: { if !$0 { playbackErrorText = nil } }
+            )) {
+                Button("知道了", role: .cancel) { playbackErrorText = nil }
+            } message: {
+                Text(playbackErrorText ?? "")
+            }
+            .fullScreenCover(item: $activeFullScreen) { modal in
+                switch modal {
+                case .sample(let idx):
+                    SampleGalleryPagerView(
+                        images: metadata?.sampleImages ?? [],
+                        initialIndex: idx,
+                        onClose: { activeFullScreen = nil }
+                    )
+                    .environmentObject(appModel)
+                case .player(let item):
+                    GestureVideoPlayerSheet(
+                        url: item.url,
+                        title: item.title,
+                        assetId: item.assetId,
+                        startAt: item.startAt,
+                        fallbackURL: item.fallbackURL,
+                        sourceLabel: item.sourceLabel,
+                        remotePath: item.remotePath
+                    )
+                    .id(item.id)
+                    .environmentObject(appModel)
+                }
             }
             .task {
                 currentNumber = number
@@ -571,6 +641,25 @@ public struct MovieDetailSheet: View {
             let exact = list.items.first(where: { $0.name == name || $0.aliases.contains(name) })
             selectedPerformer = exact ?? list.items.first
         }
+    }
+
+    private func playLocally(assetId: String, title: String) async {
+        guard !resolvingPlayback else { return }
+        resolvingPlayback = true
+        defer { resolvingPlayback = false }
+        guard let source = await appModel.playbackSource(assetId: assetId, remotePath: remotePath) else {
+            playbackErrorText = appModel.playbackError ?? "无法解析视频直链，请检查服务器或 AList 配置"
+            return
+        }
+        activeFullScreen = .player(PreviewItem(
+            url: source.url,
+            isVideo: true,
+            assetId: assetId,
+            title: title,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: remotePath
+        ))
     }
 
     private func ageAtRelease(for actress: String, releaseDate: String?) -> Int? {

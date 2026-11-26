@@ -97,6 +97,7 @@ public struct BatchScrapeProgress: Codable {
     public let succeeded: Int
     public let failed: Int
     public let currentNumber: String?
+    public let currentActorStatus: String?
     public let lastError: String?
 }
 
@@ -106,4 +107,51 @@ public struct BatchScrapeStats: Codable {
     public let alreadyScraped: Int
     public let remainingToScrape: Int
     public let failedCount: Int?
+}
+
+public struct PerformerSourceCandidate: Codable, Identifiable {
+    public var id: String { source }
+    public let source: String
+    public let sourceLabel: String
+    public let name: String
+    public let aliases: [String]
+    public let avatarUrl: String?
+    public let profileUrl: String?
+    public let birthDate: String?
+    public let heightCm: Int?
+    public let measurements: String?
+    public let hometown: String?
+    public let hobby: String?
+    public let bloodType: String?
+    public let debutYear: String?
+    public let agency: String?
+    public let bio: String?
+}
+
+public struct SyncDiffFileItem: Codable, Identifiable {
+    public var id: String { assetId + "|" + remotePath }
+    public let assetId: String
+    public let fileName: String
+    public let remotePath: String
+}
+
+public struct MovieSyncDiffSummary: Codable {
+    public let runId: String?
+    public let mode: String
+    public let ranAt: Int64?
+    public let scannedDirs: Int
+    public let addedCount: Int
+    public let removedCount: Int
+    public let added: [SyncDiffFileItem]
+    public let removed: [SyncDiffFileItem]
+}
+
+public struct MovieExtractSummary: Codable {
+    public let scope: String
+    public let scannedVideos: Int
+    public let extractedNumbers: Int
+    public let alreadyInLibrary: Int
+    public let pendingQueueCount: Int
+    public let unrecognizedCount: Int
+    public let pendingNumbersPreview: [String]
 }

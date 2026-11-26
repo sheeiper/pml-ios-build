@@ -11,12 +11,29 @@ struct OnlineMovieSearchTabView: View {
     @State private var query = ""
     @State private var history: [String] = []
     @State private var results: [PerformerRecentRelease] = []
+    @State private var activeSource = "ALL"
     @State private var loading = false
     @State private var searchedOnce = false
     @State private var errorMessage: String?
     @State private var selectedRelease: PerformerRecentRelease?
 
     private let historyKey = "pml.onlineMovieSearchHistory"
+
+    private var sourceStats: [(source: String, count: Int)] {
+        var order: [String] = []
+        var counts: [String: Int] = [:]
+        for item in results {
+            let key = item.source.isEmpty ? "其他" : item.source
+            if counts[key] == nil { order.append(key) }
+            counts[key, default: 0] += 1
+        }
+        return order.map { ($0, counts[$0] ?? 0) }
+    }
+
+    private var visibleResults: [PerformerRecentRelease] {
+        if activeSource == "ALL" { return results }
+        return results.filter { ($0.source.isEmpty ? "其他" : $0.source) == activeSource }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -44,9 +61,26 @@ struct OnlineMovieSearchTabView: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                if sourceStats.count > 1 {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            sourcePill("全部 (\(results.count))", active: activeSource == "ALL") {
+                                activeSource = "ALL"
+                            }
+                            ForEach(sourceStats, id: \.source) { stat in
+                                sourcePill("\(stat.source) (\(stat.count))", active: activeSource == stat.source) {
+                                    activeSource = stat.source
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                    }
+                    .padding(.bottom, 6)
+                }
+
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                        ForEach(results) { item in
+                        ForEach(visibleResults, id: \.id) { item in
                             Button {
                                 selectedRelease = item
                             } label: {
@@ -236,9 +270,22 @@ struct OnlineMovieSearchTabView: View {
         UserDefaults.standard.set(history, forKey: historyKey)
     }
 
+    private func sourcePill(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(active ? Color.purple : Color.secondary.opacity(0.14), in: Capsule())
+                .foregroundStyle(active ? .white : .primary)
+        }
+        .buttonStyle(.plain)
+    }
+
     private func runSearch(forceRefresh: Bool) async {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let client = model.apiClient else { return }
+        activeSource = "ALL"
         loading = true
         searchedOnce = true
         errorMessage = nil
@@ -272,7 +319,21 @@ struct OnlineMovieDetailSheet: View {
 
     @State private var copiedMagnet: String?
     @State private var copyToast: String?
-    @State private var activeSampleIndex: Int?
+    @State private var activeFullScreen: OnlineDetailFullScreen?
+    @State private var resolvingPlayback = false
+    @State private var playbackErrorText: String?
+
+    private enum OnlineDetailFullScreen: Identifiable {
+        case sample(Int)
+        case player(PreviewItem)
+
+        var id: String {
+            switch self {
+            case .sample(let idx): return "sample-\(idx)"
+            case .player(let item): return "player-\(item.id)"
+            }
+        }
+    }
 
     private var displayNumber: String { detail?.number ?? release.number }
     private var displayTitle: String {
@@ -322,14 +383,34 @@ struct OnlineMovieDetailSheet: View {
                 async let magnetTask: Void = loadMagnets(forceRefresh: false)
                 _ = await (metaTask, magnetTask)
             }
-            .fullScreenCover(isPresented: Binding(
-                get: { activeSampleIndex != nil },
-                set: { if !$0 { activeSampleIndex = nil } }
+            .fullScreenCover(item: $activeFullScreen) { modal in
+                switch modal {
+                case .sample(let idx):
+                    OnlineSampleGalleryViewer(
+                        urls: samples.compactMap { model.proxyScraperImageURL(rawUrl: $0) },
+                        initialIndex: idx
+                    )
+                case .player(let item):
+                    GestureVideoPlayerSheet(
+                        url: item.url,
+                        title: item.title,
+                        assetId: item.assetId,
+                        startAt: item.startAt,
+                        fallbackURL: item.fallbackURL,
+                        sourceLabel: item.sourceLabel,
+                        remotePath: item.remotePath
+                    )
+                    .id(item.id)
+                    .environmentObject(model)
+                }
+            }
+            .alert("无法播放视频", isPresented: Binding(
+                get: { playbackErrorText != nil },
+                set: { if !$0 { playbackErrorText = nil } }
             )) {
-                OnlineSampleGalleryViewer(
-                    urls: samples.compactMap { model.proxyScraperImageURL(rawUrl: $0) },
-                    initialIndex: activeSampleIndex ?? 0
-                )
+                Button("知道了", role: .cancel) { playbackErrorText = nil }
+            } message: {
+                Text(playbackErrorText ?? "")
             }
         }
     }
@@ -411,16 +492,43 @@ struct OnlineMovieDetailSheet: View {
     private var actionButtonsSection: some View {
         if let assetId = detail?.assetId, !assetId.isEmpty {
             Button {
-                onPlayAsset?(assetId, displayTitle)
+                Task { await playLocally(assetId: assetId, title: displayTitle) }
             } label: {
-                Label("立即播放本地视频", systemImage: "play.fill")
-                    .font(.subheadline.bold())
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+                HStack(spacing: 6) {
+                    if resolvingPlayback {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "play.fill")
+                    }
+                    Text(resolvingPlayback ? "正在解析播放地址…" : "立即播放本地视频")
+                }
+                .font(.subheadline.bold())
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
             }
             .buttonStyle(.borderedProminent)
             .tint(.purple)
+            .disabled(resolvingPlayback)
         }
+    }
+
+    private func playLocally(assetId: String, title: String) async {
+        guard !resolvingPlayback else { return }
+        resolvingPlayback = true
+        defer { resolvingPlayback = false }
+        guard let source = await model.playbackSource(assetId: assetId, remotePath: nil) else {
+            playbackErrorText = model.playbackError ?? "无法解析视频直链，请检查服务器或 AList 配置"
+            return
+        }
+        activeFullScreen = .player(PreviewItem(
+            url: source.url,
+            isVideo: true,
+            assetId: assetId,
+            title: title,
+            fallbackURL: source.fallbackURL,
+            sourceLabel: source.label,
+            remotePath: nil
+        ))
     }
 
     @ViewBuilder
@@ -506,7 +614,7 @@ struct OnlineMovieDetailSheet: View {
                     HStack(spacing: 10) {
                         ForEach(Array(samples.enumerated()), id: \.offset) { idx, raw in
                             Button {
-                                activeSampleIndex = idx
+                                activeFullScreen = .sample(idx)
                             } label: {
                                 ZStack {
                                     Color.black.opacity(0.85)

@@ -95,6 +95,54 @@ extension PMLAPIClient {
         )
     }
 
+    func queryMovieMultiSource(number: String) async throws -> [MovieMetadata] {
+        try await command(
+            "query_movie_multi_source",
+            arguments: ["number": number],
+            as: [MovieMetadata].self
+        )
+    }
+
+    func applyMovieMetadataSource(_ metadata: MovieMetadata) async throws -> MovieMetadata {
+        let data = try JSONEncoder().encode(metadata)
+        let obj = try JSONSerialization.jsonObject(with: data)
+        return try await command(
+            "apply_movie_metadata_source",
+            arguments: ["metadata": obj],
+            as: MovieMetadata.self
+        )
+    }
+
+    func queryPerformerMultiSource(id: String) async throws -> [PerformerSourceCandidate] {
+        try await command(
+            "query_performer_multi_source",
+            arguments: ["id": id],
+            as: [PerformerSourceCandidate].self
+        )
+    }
+
+    func applyPerformerSourceCandidate(id: String, candidate: PerformerSourceCandidate, avatarOnly: Bool = false) async throws -> MoviePerformer {
+        let data = try JSONEncoder().encode(candidate)
+        let obj = try JSONSerialization.jsonObject(with: data)
+        return try await command(
+            "apply_performer_source_candidate",
+            arguments: ["id": id, "candidate": obj, "avatarOnly": avatarOnly],
+            as: MoviePerformer.self
+        )
+    }
+
+    func runMovieDbSync(mode: String = "incremental") async throws -> MovieSyncDiffSummary {
+        try await command("run_movie_db_sync", arguments: ["mode": mode], as: MovieSyncDiffSummary.self)
+    }
+
+    func getMovieSyncDiff() async throws -> MovieSyncDiffSummary {
+        try await command("get_movie_sync_diff", arguments: [:], as: MovieSyncDiffSummary.self)
+    }
+
+    func extractMovieNumbers(scope: String = "new") async throws -> MovieExtractSummary {
+        try await command("extract_movie_numbers", arguments: ["scope": scope], as: MovieExtractSummary.self)
+    }
+
     func getMoviePerformer(id: String) async throws -> MoviePerformerDetail {
         try await command("get_movie_performer", arguments: ["id": id], as: MoviePerformerDetail.self)
     }

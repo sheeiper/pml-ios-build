@@ -76,7 +76,18 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_movie_subtitles_number ON movie_subtitles(number);
-        CREATE INDEX IF NOT EXISTS idx_assets_media_missing ON assets(media_type, missing);"
+        CREATE INDEX IF NOT EXISTS idx_assets_media_missing ON assets(media_type, missing);
+        CREATE TABLE IF NOT EXISTS movie_sync_diff_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            change_type TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            remote_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_movie_sync_diff_run ON movie_sync_diff_log(run_id, change_type);"
     )?;
 
     // Automatically quarantine promotional clips and ad videos from unrecognized lists
@@ -1411,22 +1422,59 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         return Err(format!("JavDB 详情番号不匹配【{number}】"));
     }
 
-    // Parse Title
+    // Parse Title (prefer Chinese current-title, preserve original Japanese origin-title)
     let mut title = number.to_string();
+    let mut original_title: Option<String> = None;
     if let Some(start) = html.find("<h2 class=\"title is-4\">") {
         let rest = &html[start + "<h2 class=\"title is-4\">".len()..];
         if let Some(end) = rest.find("</h2>") {
             let raw_title = &rest[..end];
-            let clean: String = raw_title
-                .replace("<strong>", "")
-                .replace("</strong>", "")
-                .replace("<strong class=\"current-title\">", "")
-                .trim()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
+            let strip_tags = |s: &str| -> String {
+                let mut out = String::with_capacity(s.len());
+                let mut in_tag = false;
+                for ch in s.chars() {
+                    match ch {
+                        '<' => in_tag = true,
+                        '>' => in_tag = false,
+                        _ if !in_tag => out.push(ch),
+                        _ => {}
+                    }
+                }
+                out.replace("&amp;", "&")
+                    .replace("&quot;", "\"")
+                    .replace("&#39;", "'")
+                    .replace("&nbsp;", " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            if let Some(o_pos) = raw_title.find("class=\"origin-title\"") {
+                if let Some(gt) = raw_title[o_pos..].find('>') {
+                    let after = &raw_title[o_pos + gt + 1..];
+                    if let Some(cend) = after.find("</span>") {
+                        let orig = strip_tags(&after[..cend]);
+                        if !orig.is_empty() {
+                            original_title = Some(orig);
+                        }
+                    }
+                }
+            }
+            let current_slice = if let Some(c_pos) = raw_title.find("class=\"current-title\"") {
+                if let Some(gt) = raw_title[c_pos..].find('>') {
+                    let after = &raw_title[c_pos + gt + 1..];
+                    after.find("</strong>").map(|cend| &after[..cend]).unwrap_or(raw_title)
+                } else {
+                    raw_title
+                }
+            } else {
+                raw_title
+            };
+            let clean = strip_tags(current_slice);
             if !clean.is_empty() {
                 title = clean;
+            }
+            if original_title.as_deref().map(|o| o.eq_ignore_ascii_case(&title)).unwrap_or(false) {
+                original_title = None;
             }
         }
     }
@@ -1575,7 +1623,7 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         number: number.to_string(),
         asset_id: None,
         title,
-        original_title: None,
+        original_title,
         actors,
         maker,
         label: None,
@@ -1767,6 +1815,280 @@ pub async fn scrape_from_1pondo(number: &str) -> Result<MovieMetadata, String> {
         source: "1pondo".to_string(),
         updated_at: now,
     })
+}
+
+/// Fetch metadata from Jav321 (fast, Chinese UI, covers DMM/FANZA & MGS/amateur codes).
+pub async fn scrape_from_jav321(number: &str) -> Result<MovieMetadata, String> {
+    let client = scraper_client()?;
+    let resp = client
+        .post("https://www.jav321.com/search")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,ja;q=0.7")
+        .form(&[("sn", number)])
+        .send()
+        .await
+        .map_err(|e| format!("请求 Jav321 失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Jav321 响应状态异常：{}", resp.status()));
+    }
+    let final_url = resp.url().to_string();
+    if !final_url.contains("/video/") {
+        return Err(format!("Jav321 未找到番号【{number}】"));
+    }
+    let html = resp.text().await.map_err(|e| format!("读取 Jav321 失败：{e}"))?;
+
+    let strip_html = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_tag = false;
+        for ch in s.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(ch),
+                _ => {}
+            }
+        }
+        out.replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&nbsp;", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    // Verify code identity from <b>品番</b>: xxx
+    let mut verified_code = false;
+    if let Some(pos) = html.find("<b>品番</b>") {
+        let slice = &html[pos..html.len().min(pos + 160)];
+        let plain = strip_html(slice);
+        if normalize_jav_number(&plain.replace("品番", "").replace(':', "").trim()).as_deref() == Some(number)
+            || plain.to_ascii_uppercase().contains(&number.to_ascii_uppercase())
+        {
+            verified_code = true;
+        }
+    }
+    if !verified_code {
+        return Err(format!("Jav321 详情番号不匹配【{number}】"));
+    }
+
+    // Title from <h3>...<small>
+    let mut title = number.to_string();
+    if let Some(h3_start) = html.find("<h3") {
+        if let Some(gt) = html[h3_start..].find('>') {
+            let after = &html[h3_start + gt + 1..];
+            let end = after.find("<small>").or_else(|| after.find("</h3>")).unwrap_or(after.len().min(400));
+            let t = strip_html(&after[..end]);
+            if !t.is_empty() { title = t; }
+        }
+    }
+
+    // Cover URL: first DMM/MGS video image, upgrading ps.jpg -> pl.jpg for HD wide cover
+    let mut cover_url: Option<String> = None;
+    let mut sample_images: Vec<String> = Vec::new();
+    let mut seen_imgs = std::collections::HashSet::new();
+    for seg in html.split("src=\"").skip(1) {
+        let Some(end) = seg.find('"') else { continue; };
+        let raw = &seg[..end];
+        if !raw.starts_with("http://") && !raw.starts_with("https://") { continue; }
+        let lower = raw.to_ascii_lowercase();
+        if !lower.ends_with(".jpg") && !lower.ends_with(".jpeg") && !lower.ends_with(".webp") { continue; }
+        if lower.contains("/actjpgs/") || lower.contains("logo") || lower.contains("banner") { continue; }
+        if cover_url.is_none() && (lower.contains("ps.jpg") || lower.contains("pl.jpg") || lower.contains("pb_e_") || lower.contains("pf_o1_")) {
+            let hd = raw.replace("ps.jpg", "pl.jpg").replace("http://pics.dmm.co.jp", "https://pics.dmm.co.jp");
+            cover_url = Some(hd);
+            continue;
+        }
+        if (lower.contains("jp-") || lower.contains("cap_e_") || lower.contains("/snapshot/")) && seen_imgs.insert(raw.to_string()) {
+            sample_images.push(raw.replace("http://pics.dmm.co.jp", "https://pics.dmm.co.jp"));
+            if sample_images.len() >= 12 { break; }
+        }
+    }
+    let Some(final_cover) = cover_url else {
+        return Err(format!("Jav321 未找到封面【{number}】"));
+    };
+
+    // Actors from /star/...
+    let mut actors: Vec<String> = Vec::new();
+    let mut seen_actors = std::collections::HashSet::new();
+    for seg in html.split("/star/").skip(1) {
+        if let Some(gt) = seg.find('>') {
+            if let Some(end) = seg[gt + 1..].find("</a>") {
+                let name = strip_html(&seg[gt + 1..gt + 1 + end]);
+                if !name.is_empty() && name.chars().count() <= 24 && seen_actors.insert(name.clone()) {
+                    actors.push(name);
+                    if actors.len() >= 12 { break; }
+                }
+            }
+        }
+    }
+
+    // Maker from /company/
+    let maker = html.split("/company/").nth(1).and_then(|seg| {
+        let gt = seg.find('>')?;
+        let end = seg[gt + 1..].find("</a>")?;
+        let s = strip_html(&seg[gt + 1..gt + 1 + end]);
+        if s.is_empty() { None } else { Some(s) }
+    });
+
+    // Series from /series/
+    let series = html.split("/series/").nth(1).and_then(|seg| {
+        let gt = seg.find('>')?;
+        let end = seg[gt + 1..].find("</a>")?;
+        let s = strip_html(&seg[gt + 1..gt + 1 + end]);
+        if s.is_empty() { None } else { Some(s) }
+    });
+
+    // Tags from /genre/
+    let mut tags: Vec<String> = Vec::new();
+    let mut seen_tags = std::collections::HashSet::new();
+    for seg in html.split("/genre/").skip(1) {
+        if let Some(gt) = seg.find('>') {
+            if let Some(end) = seg[gt + 1..].find("</a>") {
+                let t = strip_html(&seg[gt + 1..gt + 1 + end]);
+                if !t.is_empty() && seen_tags.insert(t.clone()) {
+                    tags.push(t);
+                    if tags.len() >= 15 { break; }
+                }
+            }
+        }
+    }
+
+    // Release date & duration
+    let release_date = html.find("<b>配信開始日</b>").and_then(|pos| {
+        let slice = &html[pos..html.len().min(pos + 120)];
+        let plain = strip_html(slice);
+        plain.split_whitespace().find(|tok| tok.len() == 10 && tok.chars().nth(4) == Some('-')).map(str::to_string)
+    });
+    let duration_minutes = html.find("<b>収録時間</b>").and_then(|pos| {
+        let slice = &html[pos..html.len().min(pos + 120)];
+        let plain = strip_html(slice);
+        plain.split(|c: char| !c.is_ascii_digit()).find_map(|d| d.parse::<i32>().ok()).filter(|&m| m > 0 && m < 600)
+    });
+
+    Ok(MovieMetadata {
+        number: number.to_string(),
+        asset_id: None,
+        title,
+        original_title: None,
+        actors,
+        maker,
+        label: None,
+        series,
+        director: None,
+        release_date,
+        duration_minutes,
+        cover_url: Some(final_cover),
+        sample_images,
+        tags,
+        source: "jav321".to_string(),
+        updated_at: chrono::Utc::now().timestamp(),
+    })
+}
+
+/// Fetch metadata from AV-Wiki (great for MGS/amateur actress resolution: SIRO/LUXU/GANA/MIUM).
+pub async fn scrape_from_avwiki(number: &str) -> Result<MovieMetadata, String> {
+    let client = scraper_client()?;
+    let slug = number.to_ascii_lowercase();
+    let url = format!("https://av-wiki.net/{slug}/");
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        .send()
+        .await
+        .map_err(|e| format!("请求 AV-Wiki 失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("AV-Wiki 未收录【{number}】"));
+    }
+    let html = resp.text().await.map_err(|e| format!("读取 AV-Wiki 失败：{e}"))?;
+    if !html.to_ascii_uppercase().contains(&number.to_ascii_uppercase()) {
+        return Err(format!("AV-Wiki 页面不匹配【{number}】"));
+    }
+    let extract_meta = |prop: &str| -> Option<String> {
+        let pat = format!("property=\"{prop}\"");
+        let pos = html.find(&pat)?;
+        let slice = &html[pos..html.len().min(pos + 320)];
+        let cpos = slice.find("content=\"")?;
+        let rest = &slice[cpos + 9..];
+        let end = rest.find('"')?;
+        let val = rest[..end].trim().to_string();
+        if val.is_empty() { None } else { Some(val) }
+    };
+    let title = extract_meta("og:title").ok_or_else(|| format!("AV-Wiki 未找到标题【{number}】"))?;
+    let cover_url = extract_meta("og:image").and_then(|u| valid_image_url("https://av-wiki.net", &u))
+        .ok_or_else(|| format!("AV-Wiki 未找到封面【{number}】"))?;
+
+    let mut actors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for seg in html.split("/av-actress/").skip(1) {
+        if let Some(gt) = seg.find('>') {
+            if let Some(end) = seg[gt + 1..].find("</a>") {
+                let raw = &seg[gt + 1..gt + 1 + end];
+                let clean: String = raw.chars().filter(|&c| c != '\n' && c != '\r').collect::<String>().trim().to_string();
+                if !clean.is_empty() && !clean.contains('<') && clean.chars().count() <= 24 && seen.insert(clean.clone()) {
+                    actors.push(clean);
+                    if actors.len() >= 10 { break; }
+                }
+            }
+        }
+    }
+
+    Ok(MovieMetadata {
+        number: number.to_string(),
+        asset_id: None,
+        title,
+        original_title: None,
+        actors,
+        maker: None,
+        label: None,
+        series: None,
+        director: None,
+        release_date: None,
+        duration_minutes: None,
+        cover_url: Some(cover_url),
+        sample_images: Vec::new(),
+        tags: vec!["AV-Wiki".to_string()],
+        source: "avwiki".to_string(),
+        updated_at: chrono::Utc::now().timestamp(),
+    })
+}
+
+/// Query ALL applicable sources concurrently for a given movie number so the user can compare and choose.
+pub async fn query_movie_multi_source(raw: &str) -> Result<Vec<MovieMetadata>, String> {
+    let number = normalize_jav_number(raw).ok_or_else(|| "无效或有歧义的番号".to_string())?;
+    let mut results: Vec<MovieMetadata> = Vec::new();
+    let is_date = number.as_bytes().first().is_some_and(u8::is_ascii_digit);
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(18), async {
+        if is_date {
+            if number.contains('_') {
+                let (r1, r2) = tokio::join!(scrape_from_1pondo(&number), scrape_from_javdb(&number));
+                if let Ok(m) = r1 { results.push(m); }
+                if let Ok(m) = r2 { results.push(m); }
+            } else {
+                let (r1, r2) = tokio::join!(scrape_from_caribbeancom(&number), scrape_from_javdb(&number));
+                if let Ok(m) = r1 { results.push(m); }
+                if let Ok(m) = r2 { results.push(m); }
+            }
+        } else if number.starts_with("FC2-") {
+            let (r1, r2) = tokio::join!(scrape_from_fc2(&number), scrape_from_javdb(&number));
+            if let Ok(m) = r1 { results.push(m); }
+            if let Ok(m) = r2 { results.push(m); }
+        } else {
+            let (r_db, r_bus, r_321, r_wiki) = tokio::join!(
+                scrape_from_javdb(&number),
+                scrape_from_javbus(&number),
+                scrape_from_jav321(&number),
+                scrape_from_avwiki(&number),
+            );
+            if let Ok(m) = r_db { results.push(m); }
+            if let Ok(m) = r_bus { results.push(m); }
+            if let Ok(m) = r_321 { results.push(m); }
+            if let Ok(m) = r_wiki { results.push(m); }
+        }
+    }).await;
+
+    Ok(results)
 }
 
 fn valid_image_url(base: &str, value: &str) -> Option<String> {
@@ -2764,6 +3086,282 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SyncDiffFileItem {
+    pub asset_id: String,
+    pub file_name: String,
+    pub remote_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieSyncDiffSummary {
+    pub run_id: Option<String>,
+    pub mode: String,
+    pub ran_at: Option<i64>,
+    pub scanned_dirs: usize,
+    pub added_count: usize,
+    pub removed_count: usize,
+    pub added: Vec<SyncDiffFileItem>,
+    pub removed: Vec<SyncDiffFileItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieExtractSummary {
+    pub scope: String,
+    pub scanned_videos: usize,
+    pub extracted_numbers: usize,
+    pub already_in_library: usize,
+    pub pending_queue_count: usize,
+    pub unrecognized_count: usize,
+    pub pending_numbers_preview: Vec<String>,
+}
+
+pub fn snapshot_whitelisted_videos(conn: &Connection) -> Result<std::collections::HashMap<String, (String, String)>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let whitelist = get_scrape_whitelist(conn)?;
+    let mut map = std::collections::HashMap::new();
+    let mut stmt = conn.prepare("SELECT id, file_name, remote_path FROM assets WHERE missing = 0 AND media_type = 'video'")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+    for row in rows.flatten() {
+        let (id, fname, rpath) = row;
+        if whitelist.is_empty() || whitelist.iter().any(|w| rpath.starts_with(w)) {
+            map.insert(id, (fname, rpath));
+        }
+    }
+    Ok(map)
+}
+
+pub fn record_movie_sync_diff(
+    conn: &Connection,
+    mode: &str,
+    scanned_dirs: usize,
+    before: &std::collections::HashMap<String, (String, String)>,
+    after: &std::collections::HashMap<String, (String, String)>,
+) -> Result<MovieSyncDiffSummary, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let now = chrono::Utc::now().timestamp();
+    let run_id = format!("sync-{now}");
+    let mut added: Vec<SyncDiffFileItem> = Vec::new();
+    let mut removed: Vec<SyncDiffFileItem> = Vec::new();
+
+    for (id, (fname, rpath)) in after {
+        if !before.contains_key(id) {
+            added.push(SyncDiffFileItem { asset_id: id.clone(), file_name: fname.clone(), remote_path: rpath.clone() });
+        }
+    }
+    for (id, (fname, rpath)) in before {
+        if !after.contains_key(id) {
+            removed.push(SyncDiffFileItem { asset_id: id.clone(), file_name: fname.clone(), remote_path: rpath.clone() });
+        }
+    }
+    added.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    removed.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+
+    // Keep only latest run in diff log so table stays tiny
+    conn.execute("DELETE FROM movie_sync_diff_log", [])?;
+    for item in &added {
+        conn.execute(
+            "INSERT INTO movie_sync_diff_log (run_id, mode, change_type, asset_id, file_name, remote_path, created_at)
+             VALUES (?1, ?2, 'added', ?3, ?4, ?5, ?6)",
+            params![run_id, mode, item.asset_id, item.file_name, item.remote_path, now],
+        )?;
+    }
+    for item in &removed {
+        conn.execute(
+            "INSERT INTO movie_sync_diff_log (run_id, mode, change_type, asset_id, file_name, remote_path, created_at)
+             VALUES (?1, ?2, 'removed', ?3, ?4, ?5, ?6)",
+            params![run_id, mode, item.asset_id, item.file_name, item.remote_path, now],
+        )?;
+    }
+    if added.is_empty() && removed.is_empty() {
+        conn.execute(
+            "INSERT INTO movie_sync_diff_log (run_id, mode, change_type, asset_id, file_name, remote_path, created_at)
+             VALUES (?1, ?2, 'meta', '', '', '', ?3)",
+            params![run_id, mode, now],
+        )?;
+    }
+
+    let added_count = added.len();
+    let removed_count = removed.len();
+    added.truncate(120);
+    removed.truncate(120);
+
+    Ok(MovieSyncDiffSummary {
+        run_id: Some(run_id),
+        mode: mode.to_string(),
+        ran_at: Some(now),
+        scanned_dirs,
+        added_count,
+        removed_count,
+        added,
+        removed,
+    })
+}
+
+pub fn get_latest_movie_sync_diff(conn: &Connection) -> Result<MovieSyncDiffSummary, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let header: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT run_id, mode, created_at FROM movie_sync_diff_log ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((run_id, mode, ran_at)) = header else {
+        return Ok(MovieSyncDiffSummary {
+            run_id: None,
+            mode: "incremental".to_string(),
+            ran_at: None,
+            scanned_dirs: 0,
+            added_count: 0,
+            removed_count: 0,
+            added: Vec::new(),
+            removed: Vec::new(),
+        });
+    };
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT change_type, asset_id, file_name, remote_path FROM movie_sync_diff_log WHERE run_id = ?1 ORDER BY id ASC"
+    )?;
+    let rows = stmt.query_map(params![run_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+    })?;
+    for row in rows.flatten() {
+        let (ct, aid, fname, rpath) = row;
+        if ct == "added" {
+            added.push(SyncDiffFileItem { asset_id: aid, file_name: fname, remote_path: rpath });
+        } else if ct == "removed" {
+            removed.push(SyncDiffFileItem { asset_id: aid, file_name: fname, remote_path: rpath });
+        }
+    }
+    let added_count = added.len();
+    let removed_count = removed.len();
+    added.truncate(120);
+    removed.truncate(120);
+    Ok(MovieSyncDiffSummary {
+        run_id: Some(run_id),
+        mode,
+        ran_at: Some(ran_at),
+        scanned_dirs: 0,
+        added_count,
+        removed_count,
+        added,
+        removed,
+    })
+}
+
+pub fn extract_movie_numbers_summary(conn: &Connection, scope: &str) -> Result<MovieExtractSummary, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let whitelist = get_scrape_whitelist(conn)?;
+    let mut ignored = std::collections::HashSet::<String>::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT asset_id FROM scrape_ignored_assets") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for r in rows.flatten() { ignored.insert(r); }
+        }
+    }
+    let mut existing_meta = std::collections::HashSet::<String>::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT number FROM movie_metadata") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for r in rows.flatten() { existing_meta.insert(r); }
+        }
+    }
+    let mut failed_set = std::collections::HashSet::<String>::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT number FROM scrape_failures") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for r in rows.flatten() { failed_set.insert(r); }
+        }
+    }
+
+    let mut target_videos: Vec<(String, String, String, i64)> = Vec::new();
+    if scope == "new" {
+        let mut stmt = conn.prepare(
+            "SELECT l.asset_id, l.file_name, l.remote_path, COALESCE(a.size_bytes, 0)
+             FROM movie_sync_diff_log l
+             LEFT JOIN assets a ON a.id = l.asset_id
+             WHERE l.change_type = 'added'"
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        for r in rows.flatten() { target_videos.push(r); }
+    }
+    if target_videos.is_empty() {
+        let mut stmt = conn.prepare("SELECT id, file_name, remote_path, COALESCE(size_bytes, 0) FROM assets WHERE missing = 0 AND media_type = 'video'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))?;
+        for (id, fname, rpath, sz) in rows.flatten() {
+            if whitelist.is_empty() || whitelist.iter().any(|w| rpath.starts_with(w)) {
+                target_videos.push((id, fname, rpath, sz));
+            }
+        }
+    }
+
+    let mut existing_bindings = std::collections::HashSet::<(String, String)>::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT number, asset_id FROM movie_asset_bindings") {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+            for r in rows.flatten() { existing_bindings.insert(r); }
+        }
+    }
+
+    let mut scanned_videos = 0usize;
+    let mut unrecognized_count = 0usize;
+    let mut extracted_set = std::collections::BTreeSet::<String>::new();
+    let mut already_in_library = 0usize;
+    let mut pending_queue = std::collections::BTreeSet::<String>::new();
+    let mut new_bindings: Vec<(String, String)> = Vec::new();
+
+    for (id, fname, rpath, sz) in target_videos {
+        if ignored.contains(&id) || is_ad_or_promo_asset(&fname, &rpath, sz) { continue; }
+        scanned_videos += 1;
+        if let Some(num) = extract_jav_number_with_path(&fname, &rpath) {
+            if extracted_set.insert(num.clone()) {
+                if existing_meta.contains(&num) {
+                    already_in_library += 1;
+                    if !existing_bindings.contains(&(num.clone(), id.clone())) {
+                        new_bindings.push((num, id));
+                    }
+                } else if scope != "new" || !failed_set.contains(&num) {
+                    pending_queue.insert(num);
+                }
+            } else if existing_meta.contains(&num) && !existing_bindings.contains(&(num.clone(), id.clone())) {
+                new_bindings.push((num, id));
+            }
+        } else {
+            unrecognized_count += 1;
+        }
+    }
+
+    if !new_bindings.is_empty() {
+        let _ = conn.execute_batch("SAVEPOINT extract_bind_sp");
+        for (num, id) in new_bindings {
+            let _ = conn.execute(
+                "INSERT INTO movie_asset_bindings(asset_id, number) VALUES (?1, ?2)
+                 ON CONFLICT(asset_id) DO UPDATE SET number = excluded.number",
+                params![id, num],
+            );
+            let _ = conn.execute(
+                "UPDATE movie_metadata SET asset_id = COALESCE(asset_id, ?2) WHERE number = ?1",
+                params![num, id],
+            );
+        }
+        let _ = conn.execute_batch("RELEASE SAVEPOINT extract_bind_sp");
+    }
+
+    let pending_queue_count = pending_queue.len();
+    let pending_numbers_preview = pending_queue.into_iter().take(30).collect();
+
+    Ok(MovieExtractSummary {
+        scope: scope.to_string(),
+        scanned_videos,
+        extracted_numbers: extracted_set.len(),
+        already_in_library,
+        pending_queue_count,
+        unrecognized_count,
+        pending_numbers_preview,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BatchScrapeProgress {
     pub running: bool,
     pub paused: bool,
@@ -2772,6 +3370,7 @@ pub struct BatchScrapeProgress {
     pub succeeded: usize,
     pub failed: usize,
     pub current_number: Option<String>,
+    pub current_actor_status: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -2798,6 +3397,7 @@ fn batch_progress_cell() -> &'static Mutex<BatchScrapeProgress> {
             succeeded: 0,
             failed: 0,
             current_number: None,
+            current_actor_status: None,
             last_error: None,
         })
     })
@@ -2822,6 +3422,7 @@ pub fn get_batch_scrape_progress() -> BatchScrapeProgress {
         succeeded: 0,
         failed: 0,
         current_number: None,
+        current_actor_status: None,
         last_error: None,
     })
 }
@@ -3013,6 +3614,8 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
             g.total = queue.len();
         }
 
+        let mut attempted_actors = std::collections::HashSet::<String>::new();
+
         for number in queue {
             if stop_batch_flag().load(Ordering::SeqCst) {
                 break;
@@ -3031,10 +3634,13 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
 
             if let Ok(mut g) = batch_progress_cell().lock() {
                 g.current_number = Some(number.clone());
+                g.current_actor_status = Some("正在刮削作品元数据…".to_string());
             }
 
+            let scraped_actors: Vec<String>;
             let result = match scrape_movie_metadata(&number).await {
                 Ok(mut meta) => {
+                    scraped_actors = meta.actors.clone();
                     meta.asset_id = number_assets.get(&number).and_then(|ids| ids.first()).cloned();
                     save_movie_metadata(&conn, &meta).and_then(|_| {
                         if let Some(ids) = number_assets.get(&number) {
@@ -3043,7 +3649,10 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
                         Ok(())
                     }).map_err(|e| format!("保存元数据失败：{e}"))
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    scraped_actors = Vec::new();
+                    Err(e)
+                }
             };
             let persistence = match &result {
                 Ok(()) => conn.execute("DELETE FROM scrape_failures WHERE number=?1", params![number]),
@@ -3052,6 +3661,45 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
             if let Err(e) = persistence {
                 if let Ok(mut g) = batch_progress_cell().lock() { g.last_error = Some(format!("记录重试状态失败：{e}")); }
             }
+
+            // Auto-enrich missing/new performers for the scraped movie
+            if result.is_ok() {
+                if scraped_actors.is_empty() {
+                    if let Ok(mut g) = batch_progress_cell().lock() {
+                        g.current_actor_status = Some("该作品无主演信息".to_string());
+                    }
+                } else {
+                    let candidates = crate::performers::find_actors_needing_enrichment(&conn, &scraped_actors);
+                    if candidates.is_empty() {
+                        if let Ok(mut g) = batch_progress_cell().lock() {
+                            g.current_actor_status = Some(format!("演员资料已完整：{}", scraped_actors.join("、")));
+                        }
+                    } else {
+                        for (pid, pname, profile_url) in candidates {
+                            if stop_batch_flag().load(Ordering::SeqCst) { break; }
+                            if !attempted_actors.insert(pid.clone()) { continue; }
+                            if let Ok(mut g) = batch_progress_cell().lock() {
+                                g.current_actor_status = Some(format!("新/缺资料演员，正在补全：{pname}"));
+                            }
+                            match crate::performers::fetch_performer_enrichment(&pname, profile_url.as_deref()).await {
+                                Ok(info) => {
+                                    let _ = crate::performers::apply_performer_enrichment(&conn, &pid, &info, false);
+                                    if let Ok(mut g) = batch_progress_cell().lock() {
+                                        g.current_actor_status = Some(format!("已自动补全演员：{pname}"));
+                                    }
+                                }
+                                Err(_) => {
+                                    if let Ok(mut g) = batch_progress_cell().lock() {
+                                        g.current_actor_status = Some(format!("演员暂未匹配到资料：{pname}"));
+                                    }
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                        }
+                    }
+                }
+            }
+
             if let Ok(mut g) = batch_progress_cell().lock() {
                 g.completed += 1;
                 match result {
@@ -3069,6 +3717,7 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
             g.running = false;
             g.paused = false;
             g.current_number = None;
+            g.current_actor_status = None;
         }
     });
 

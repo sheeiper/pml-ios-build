@@ -49,7 +49,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.personalmedialibrary.native
         MARKETING_VERSION: "2.2.0"
-        CURRENT_PROJECT_VERSION: "2026112501"
+        CURRENT_PROJECT_VERSION: "2026112601"
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_OBJC_BRIDGING_HEADER: PMLNative/PMLNative-Bridging-Header.h

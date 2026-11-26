@@ -40,6 +40,7 @@ struct MoviePerformerDetailSheet: View {
 
     @State private var detailTab: PerformerWorkTab = .library
     @State private var showEditor = false
+    @State private var showMultiSourceSheet = false
     @State private var fullScreenModal: FullScreenModal?
     @State private var pendingPlayback: PendingPlayback?
     @State private var selectedMovie: MovieMetadata?
@@ -71,6 +72,13 @@ struct MoviePerformerDetailSheet: View {
             .sheet(isPresented: $showEditor) {
                 MoviePerformerEditor(person: detail?.person ?? performer) { await save($0) }
                     .environmentObject(model)
+            }
+            .sheet(isPresented: $showMultiSourceSheet) {
+                PerformerMultiSourceSheet(performerId: detail?.person.id ?? performer.id, performerName: detail?.person.name ?? performer.name) { updated in
+                    detail = MoviePerformerDetail(person: updated, movies: detail?.movies ?? [], total: detail?.total ?? updated.movieCount)
+                    showMultiSourceSheet = false
+                }
+                .environmentObject(model)
             }
             .sheet(item: $selectedReleaseForMagnets) { rel in
                 OnlineMovieDetailSheet(
@@ -177,6 +185,14 @@ struct MoviePerformerDetailSheet: View {
             }
 
             Spacer()
+
+            Button {
+                showMultiSourceSheet = true
+            } label: {
+                Label("多源", systemImage: "square.stack.3d.up")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
 
             Button {
                 showEditor = true

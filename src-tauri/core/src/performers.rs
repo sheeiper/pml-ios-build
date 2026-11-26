@@ -1406,6 +1406,57 @@ pub async fn fetch_performer_enrichment(name: &str, existing_profile_url: Option
     Ok(result)
 }
 
+/// Sync performers from movie_metadata and return any actors in `actor_names`
+/// that are missing avatar or core profile info (birth_date / height / bio).
+pub fn find_actors_needing_enrichment(
+    conn: &Connection,
+    actor_names: &[String],
+) -> Vec<(String, String, Option<String>)> {
+    if actor_names.is_empty() {
+        return Vec::new();
+    }
+    let _ = sync_performers(conn);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, name, profile_url, avatar_url, birth_date, height_cm, bio
+         FROM performers
+         WHERE name = ?1 OR aliases_json LIKE ?2
+         LIMIT 1"
+    ) else {
+        return out;
+    };
+    for raw in actor_names {
+        let name = raw.trim();
+        if name.is_empty() { continue; }
+        let alias_pat = format!("%\"{}\"%", name.replace('"', ""));
+        if let Ok(Some((id, pname, profile_url, avatar_url, birth_date, height_cm, bio))) = stmt
+            .query_row(params![name, alias_pat], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i32>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .optional()
+        {
+            if !seen.insert(id.clone()) { continue; }
+            let missing_avatar = avatar_url.as_deref().unwrap_or("").trim().is_empty();
+            let missing_profile = birth_date.as_deref().unwrap_or("").trim().is_empty()
+                && height_cm.is_none()
+                && bio.as_deref().unwrap_or("").trim().is_empty();
+            if missing_avatar || missing_profile {
+                out.push((id, pname, profile_url));
+            }
+        }
+    }
+    out
+}
+
 pub fn apply_performer_enrichment(
     conn: &Connection,
     id: &str,
@@ -2252,6 +2303,53 @@ fn online_movie_search_cache() -> &'static std::sync::Mutex<std::collections::Ha
     CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn parse_javbus_search_results(html: &str) -> Vec<PerformerRecentRelease> {
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for seg in html.split("class=\"movie-box\"").skip(1) {
+        let block = &seg[..seg.len().min(1800)];
+        let Some(href_pos) = block.find("href=\"") else { continue; };
+        let href_rest = &block[href_pos + 6..];
+        let Some(href_end) = href_rest.find('"') else { continue; };
+        let detail_url = href_rest[..href_end].trim().to_string();
+        if !detail_url.starts_with("http") { continue; }
+
+        let cover_url = block.find("<img ").and_then(|ip| {
+            let tag_end = block[ip..].find('>')?;
+            let tag = &block[ip..ip + tag_end];
+            let src = extract_html_attr(tag, "src")?;
+            if src.starts_with("http") { Some(src.to_string()) } else { Some(format!("https://www.javbus.com{src}")) }
+        });
+        let title = block.find("<img ").and_then(|ip| {
+            let tag_end = block[ip..].find('>')?;
+            extract_html_attr(&block[ip..ip + tag_end], "title").map(decode_basic_entities)
+        }).unwrap_or_default();
+
+        let mut dates: Vec<String> = Vec::new();
+        for dseg in block.split("<date>").skip(1) {
+            if let Some(dend) = dseg.find("</date>") {
+                dates.push(strip_html_tags(&dseg[..dend]));
+            }
+        }
+        let raw_num = dates.first().cloned().unwrap_or_default();
+        let number = crate::jav_scraper::normalize_jav_number(&raw_num).unwrap_or_else(|| raw_num.to_uppercase());
+        if number.is_empty() || !seen.insert(number.clone()) { continue; }
+        let release_date = dates.get(1).cloned().filter(|s| !s.is_empty());
+
+        items.push(PerformerRecentRelease {
+            number,
+            title,
+            release_date,
+            cover_url,
+            detail_url,
+            in_library: false,
+            source: "JavBus".to_string(),
+        });
+        if items.len() >= 20 { break; }
+    }
+    items
+}
+
 pub async fn search_online_movies(
     query: &str,
     force_refresh: bool,
@@ -2262,7 +2360,7 @@ pub async fn search_online_movies(
     }
     let normalized = crate::jav_scraper::normalize_jav_number(raw);
     let search_term = normalized.as_deref().unwrap_or(raw).to_string();
-    let cache_key = search_term.to_uppercase();
+    let cache_key = format!("v2:{}", search_term.to_uppercase());
     let now = chrono::Utc::now().timestamp();
     if !force_refresh {
         if let Ok(guard) = online_movie_search_cache().lock() {
@@ -2276,31 +2374,88 @@ pub async fn search_online_movies(
 
     let client = javdb_public_client()?;
     let encoded = percent_encoding::utf8_percent_encode(&search_term, percent_encoding::NON_ALPHANUMERIC).to_string();
-    let search_url = format!("https://javdb.com/search?q={encoded}&f=all");
+    let javdb_url = format!("https://javdb.com/search?q={encoded}&f=all");
+    let javbus_url = format!("https://www.javbus.com/search/{encoded}");
 
-    let mut items: Vec<PerformerRecentRelease> = Vec::new();
-    if let Ok(resp) = client.get(&search_url).header("Cookie", "over18=1").send().await {
-        if resp.status().is_success() {
-            if let Ok(html) = resp.text().await {
-                items = parse_javdb_actor_releases(&html);
+    let javdb_fut = async {
+        if let Ok(resp) = client.get(&javdb_url)
+            .header("Cookie", "over18=1; locale=zh;")
+            .header("Accept-Language", "zh-CN,zh;q=0.9")
+            .send().await
+        {
+            if resp.status().is_success() {
+                if let Ok(html) = resp.text().await {
+                    return parse_javdb_actor_releases(&html);
+                }
             }
         }
-    }
+        Vec::new()
+    };
 
-    // Prioritize exact number match at top if user searched a specific code
-    if let Some(ref norm) = normalized {
-        items.sort_by_key(|item| {
-            if item.number.eq_ignore_ascii_case(norm) {
-                0u8
-            } else if item.number.to_uppercase().contains(&norm.to_uppercase()) {
-                1u8
-            } else {
-                2u8
+    let javbus_fut = async {
+        if let Ok(resp) = client.get(&javbus_url)
+            .header("Cookie", "existmag=all; age=verified; dv=1")
+            .header("Accept-Language", "zh-CN,zh;q=0.9")
+            .send().await
+        {
+            if resp.status().is_success() {
+                if let Ok(html) = resp.text().await {
+                    return parse_javbus_search_results(&html);
+                }
             }
-        });
+        }
+        Vec::new()
+    };
+
+    let extra_fut = async {
+        let mut extra = Vec::new();
+        if let Some(ref norm) = normalized {
+            let (r321, rwiki) = tokio::join!(
+                crate::jav_scraper::scrape_from_jav321(norm),
+                crate::jav_scraper::scrape_from_avwiki(norm)
+            );
+            if let Ok(m) = r321 {
+                extra.push(PerformerRecentRelease {
+                    number: m.number,
+                    title: m.title,
+                    release_date: m.release_date,
+                    cover_url: m.cover_url,
+                    detail_url: String::new(),
+                    in_library: false,
+                    source: "Jav321".to_string(),
+                });
+            }
+            if let Ok(m) = rwiki {
+                extra.push(PerformerRecentRelease {
+                    number: m.number,
+                    title: m.title,
+                    release_date: m.release_date,
+                    cover_url: m.cover_url,
+                    detail_url: String::new(),
+                    in_library: false,
+                    source: "AV-Wiki".to_string(),
+                });
+            }
+        }
+        extra
+    };
+
+    let (mut db_items, mut bus_items, extra_items) = tokio::join!(javdb_fut, javbus_fut, extra_fut);
+    if let Some(ref norm) = normalized {
+        let key_fn = |item: &PerformerRecentRelease| -> u8 {
+            if item.number.eq_ignore_ascii_case(norm) { 0 }
+            else if item.number.to_uppercase().contains(&norm.to_uppercase()) { 1 }
+            else { 2 }
+        };
+        db_items.sort_by_key(key_fn);
+        bus_items.sort_by_key(key_fn);
     }
 
-    // Fallback to direct scraper (JavBus / FC2 / JavDB detail) if JavDB search returned empty
+    let mut items: Vec<PerformerRecentRelease> = Vec::new();
+    items.extend(db_items.into_iter().take(20));
+    items.extend(bus_items.into_iter().take(20));
+    items.extend(extra_items);
+
     if items.is_empty() {
         if let Ok(meta) = crate::jav_scraper::scrape_movie_metadata(&search_term).await {
             items.push(PerformerRecentRelease {
@@ -2315,13 +2470,273 @@ pub async fn search_online_movies(
         }
     }
 
-    items.truncate(30);
     if !items.is_empty() {
         if let Ok(mut guard) = online_movie_search_cache().lock() {
             guard.insert(cache_key, (now, items.clone()));
         }
     }
     Ok(items)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformerSourceCandidate {
+    pub source: String,
+    pub source_label: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub avatar_url: Option<String>,
+    pub profile_url: Option<String>,
+    pub birth_date: Option<String>,
+    pub height_cm: Option<i64>,
+    pub measurements: Option<String>,
+    pub hometown: Option<String>,
+    pub hobby: Option<String>,
+    pub blood_type: Option<String>,
+    pub debut_year: Option<String>,
+    pub agency: Option<String>,
+    pub bio: Option<String>,
+}
+
+async fn fetch_javdb_performer_candidate(client: &reqwest::Client, name: &str) -> Option<PerformerSourceCandidate> {
+    let encoded = percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC).to_string();
+    let url = format!("https://javdb.com/search?q={encoded}&f=actor");
+    let resp = client
+        .get(&url)
+        .header("Cookie", "over18=1; locale=zh;")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() { return None; }
+    let html = resp.text().await.ok()?;
+    for seg in html.split("class=\"box actor-box\"").skip(1) {
+        let block = &seg[..seg.len().min(1200)];
+        let href = block.find("href=\"/actors/").and_then(|p| {
+            let rest = &block[p + 6..];
+            let end = rest.find('"')?;
+            Some(format!("https://javdb.com{}", &rest[..end]))
+        });
+        let title = block.find("title=\"").and_then(|p| {
+            let rest = &block[p + 7..];
+            let end = rest.find('"')?;
+            Some(decode_basic_entities(&rest[..end]))
+        }).unwrap_or_else(|| name.to_string());
+        let avatar = block.find("background-image:url(").and_then(|p| {
+            let rest = &block[p + 21..];
+            let end = rest.find(')')?;
+            let raw = rest[..end].trim().trim_matches('\'').trim_matches('"');
+            if raw.starts_with("http") { Some(raw.to_string()) } else { None }
+        });
+        let mut aliases: Vec<String> = title
+            .split(|c| c == ',' || c == '、' || c == '/')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != name)
+            .collect();
+        aliases.truncate(8);
+        return Some(PerformerSourceCandidate {
+            source: "javdb".to_string(),
+            source_label: "JavDB 演员页".to_string(),
+            name: name.to_string(),
+            aliases,
+            avatar_url: avatar,
+            profile_url: href,
+            birth_date: None,
+            height_cm: None,
+            measurements: None,
+            hometown: None,
+            hobby: None,
+            blood_type: None,
+            debut_year: None,
+            agency: None,
+            bio: None,
+        });
+    }
+    None
+}
+
+/// Query all performer sources separately (Wikipedia, gfriends, JavBus, JavDB) so user can pick.
+pub async fn query_performer_multi_source(
+    name: &str,
+    existing_profile_url: Option<&str>,
+) -> Result<Vec<PerformerSourceCandidate>, String> {
+    let clean_name = name.trim();
+    if clean_name.is_empty() { return Err("演员姓名为空".into()); }
+    let wiki_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .user_agent(WIKI_USER_AGENT)
+        .build()
+        .map_err(|_| "初始化客户端失败".to_string())?;
+    let web_client = javdb_public_client()?;
+
+    // 1. Wikipedia (ja infobox + zh/ja summary)
+    let wiki_fut = async {
+        let mut info = EnrichedPerformerInfo::default();
+        fetch_ja_wikipedia_infobox(&wiki_client, clean_name, &mut info).await;
+        for lang in ["zh", "ja"] {
+            if let Some((w_avatar, w_bio, w_page)) = fetch_wikipedia_summary(&wiki_client, lang, clean_name).await {
+                if info.avatar_url.is_none() { info.avatar_url = w_avatar; }
+                if info.bio.is_none() { info.bio = w_bio; }
+                if info.profile_url.is_none() { info.profile_url = Some(w_page); }
+                if info.bio.is_some() && info.avatar_url.is_some() { break; }
+            }
+        }
+        let has_any = info.avatar_url.is_some() || info.birth_date.is_some() || info.height_cm.is_some() || info.bio.is_some();
+        if has_any {
+            Some(PerformerSourceCandidate {
+                source: "wikipedia".to_string(),
+                source_label: "维基百科（中/日）".to_string(),
+                name: clean_name.to_string(),
+                aliases: info.aliases,
+                avatar_url: info.avatar_url,
+                profile_url: info.profile_url,
+                birth_date: info.birth_date,
+                height_cm: info.height_cm,
+                measurements: info.measurements,
+                hometown: info.hometown,
+                hobby: info.hobby,
+                blood_type: info.blood_type,
+                debut_year: info.debut_year,
+                agency: info.agency,
+                bio: info.bio,
+            })
+        } else { None }
+    };
+
+    // 2. gfriends CDN avatar
+    let gfriends_fut = async {
+        let names = vec![clean_name.to_string()];
+        lookup_gfriends_avatar(&wiki_client, &names).await.map(|avatar| PerformerSourceCandidate {
+            source: "gfriends".to_string(),
+            source_label: "gfriends 头像库".to_string(),
+            name: clean_name.to_string(),
+            aliases: Vec::new(),
+            avatar_url: Some(avatar),
+            profile_url: None,
+            birth_date: None,
+            height_cm: None,
+            measurements: None,
+            hometown: None,
+            hobby: None,
+            blood_type: None,
+            debut_year: None,
+            agency: None,
+            bio: None,
+        })
+    };
+
+    // 3. JavBus star page
+    let javbus_fut = async {
+        let mut info = EnrichedPerformerInfo::default();
+        let mut star_url: Option<String> = existing_profile_url
+            .map(str::trim)
+            .filter(|u| u.contains("javbus.com/star/"))
+            .map(str::to_string);
+        if star_url.is_none() {
+            if let Ok(mut search_url) = url::Url::parse("https://www.javbus.com/searchstar/") {
+                if let Ok(mut segs) = search_url.path_segments_mut() { segs.push(clean_name); }
+                if let Ok(resp) = web_client.get(search_url.clone())
+                    .header(reqwest::header::COOKIE, "existmag=all; age=verified; dv=1")
+                    .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,ja;q=0.8")
+                    .send().await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(html) = resp.text().await {
+                            if let Some((found_url, thumb)) = find_javbus_star_url(&search_url, &html, clean_name) {
+                                star_url = Some(found_url);
+                                if thumb.is_some() { info.avatar_url = thumb; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ref target_url) = star_url {
+            if let Ok(parsed_url) = url::Url::parse(target_url) {
+                if let Ok(resp) = web_client.get(parsed_url.clone())
+                    .header(reqwest::header::COOKIE, "existmag=all; age=verified; dv=1")
+                    .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,ja;q=0.8")
+                    .send().await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(html) = resp.text().await {
+                            let parsed = parse_javbus_star_page(&parsed_url, &html);
+                            if parsed.avatar_url.is_some() { info.avatar_url = parsed.avatar_url; }
+                            if parsed.birth_date.is_some() { info.birth_date = parsed.birth_date; }
+                            if parsed.height_cm.is_some() { info.height_cm = parsed.height_cm; }
+                            if parsed.measurements.is_some() { info.measurements = parsed.measurements; }
+                            if parsed.hometown.is_some() { info.hometown = parsed.hometown; }
+                            if parsed.hobby.is_some() { info.hobby = parsed.hobby; }
+                            if parsed.blood_type.is_some() { info.blood_type = parsed.blood_type; }
+                            if !parsed.aliases.is_empty() { info.aliases = parsed.aliases; }
+                        }
+                    }
+                }
+            }
+            info.profile_url = Some(target_url.clone());
+        }
+        let has_any = info.avatar_url.is_some() || info.birth_date.is_some() || info.height_cm.is_some() || info.measurements.is_some();
+        if has_any {
+            Some(PerformerSourceCandidate {
+                source: "javbus".to_string(),
+                source_label: "JavBus 演员页".to_string(),
+                name: clean_name.to_string(),
+                aliases: info.aliases,
+                avatar_url: info.avatar_url,
+                profile_url: info.profile_url,
+                birth_date: info.birth_date,
+                height_cm: info.height_cm,
+                measurements: info.measurements,
+                hometown: info.hometown,
+                hobby: info.hobby,
+                blood_type: info.blood_type,
+                debut_year: info.debut_year,
+                agency: info.agency,
+                bio: info.bio,
+            })
+        } else { None }
+    };
+
+    // 4. JavDB actor search
+    let javdb_fut = fetch_javdb_performer_candidate(&web_client, clean_name);
+
+    let (w, g, b, d) = tokio::join!(wiki_fut, gfriends_fut, javbus_fut, javdb_fut);
+    let mut list = Vec::new();
+    if let Some(c) = w { list.push(c); }
+    if let Some(c) = g { list.push(c); }
+    if let Some(c) = b { list.push(c); }
+    if let Some(c) = d { list.push(c); }
+    Ok(list)
+}
+
+pub fn apply_performer_source_candidate(
+    conn: &Connection,
+    id: &str,
+    candidate: &PerformerSourceCandidate,
+    avatar_only: bool,
+) -> Result<Performer, PerformerError> {
+    if avatar_only {
+        let info = EnrichedPerformerInfo {
+            avatar_url: candidate.avatar_url.clone(),
+            ..Default::default()
+        };
+        return apply_performer_enrichment(conn, id, &info, true);
+    }
+    let info = EnrichedPerformerInfo {
+        avatar_url: candidate.avatar_url.clone(),
+        profile_url: candidate.profile_url.clone(),
+        birth_date: candidate.birth_date.clone(),
+        height_cm: candidate.height_cm,
+        measurements: candidate.measurements.clone(),
+        hometown: candidate.hometown.clone(),
+        hobby: candidate.hobby.clone(),
+        blood_type: candidate.blood_type.clone(),
+        debut_year: candidate.debut_year.clone(),
+        agency: candidate.agency.clone(),
+        bio: candidate.bio.clone(),
+        aliases: candidate.aliases.clone(),
+    };
+    apply_performer_enrichment(conn, id, &info, true)
 }
 
 #[cfg(test)]

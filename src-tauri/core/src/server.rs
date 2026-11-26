@@ -1270,6 +1270,70 @@ async fn dispatch_command(
                 result_response(crate::jav_scraper::scrape_movie_metadata(&number).await)
             }
         }
+        "query_movie_multi_source" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+            if number.is_empty() {
+                return error_response("缺少番号参数");
+            }
+            result_response(crate::jav_scraper::query_movie_multi_source(&number).await)
+        }
+        "apply_movie_metadata_source" => {
+            let Some(meta_val) = payload.get("metadata").cloned() else {
+                return error_response("缺少 metadata 参数");
+            };
+            let mut meta: crate::jav_scraper::MovieMetadata = match serde_json::from_value(meta_val) {
+                Ok(v) => v,
+                Err(e) => return error_response(&format!("元数据格式错误：{e}")),
+            };
+            let app_save = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app_save)?;
+                if meta.asset_id.is_none() {
+                    if let Ok(Some(existing)) = crate::jav_scraper::get_movie_metadata(&conn, &meta.number) {
+                        meta.asset_id = existing.asset_id;
+                    }
+                }
+                meta.updated_at = chrono::Utc::now().timestamp();
+                crate::jav_scraper::save_movie_metadata(&conn, &meta).map_err(|e| e.to_string())?;
+                crate::jav_scraper::invalidate_metadata_cache(&meta.number);
+                let _ = crate::performers::sync_performers(&conn);
+                Ok(meta)
+            }).await
+        }
+        "query_performer_multi_source" => {
+            let id = payload.get("id").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+            let app_lookup = app.clone();
+            let identity = tokio::task::spawn_blocking(move || -> Result<(String, Option<String>), String> {
+                let conn = four_domains::open_v2(&app_lookup)?;
+                let detail = crate::performers::get_performer(&conn, &id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("演员不存在")?;
+                Ok((detail.person.name, detail.person.profile_url))
+            }).await;
+            let (name, profile_url) = match identity {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return error_response(&e),
+                Err(e) => return error_response(&e.to_string()),
+            };
+            result_response(crate::performers::query_performer_multi_source(&name, profile_url.as_deref()).await)
+        }
+        "apply_performer_source_candidate" => {
+            let id = payload.get("id").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+            let avatar_only = payload.get("avatarOnly").and_then(Value::as_bool).unwrap_or(false);
+            let Some(cand_val) = payload.get("candidate").cloned() else {
+                return error_response("缺少 candidate 参数");
+            };
+            let candidate: crate::performers::PerformerSourceCandidate = match serde_json::from_value(cand_val) {
+                Ok(v) => v,
+                Err(e) => return error_response(&format!("候选资料格式错误：{e}")),
+            };
+            let app_save = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app_save)?;
+                crate::performers::apply_performer_source_candidate(&conn, &id, &candidate, avatar_only)
+                    .map_err(|e| e.to_string())
+            }).await
+        }
         "preview_movie_performer_profile" => {
             let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
             let profile_url = payload.get("profileUrl").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -1492,6 +1556,68 @@ async fn dispatch_command(
                 let conn = four_domains::open_v2(&app)?;
                 crate::jav_scraper::ignore_unrecognized_video(&conn, &asset_id)
                     .map_err(|e| format!("忽略视频失败：{e}"))
+            }).await
+        }
+        "run_movie_db_sync" => {
+            if SYNC_RECONCILE_RUNNING.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
+                return error_response("已有同步扫描任务正在进行中，请等待完成后再试");
+            }
+            struct SyncGuard;
+            impl Drop for SyncGuard {
+                fn drop(&mut self) {
+                    SYNC_RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _sync_guard = SyncGuard;
+
+            let mode = payload.get("mode").and_then(Value::as_str).unwrap_or("incremental").to_ascii_lowercase();
+            let incremental = mode != "full";
+            let app_pre = app.clone();
+            let pre_res = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, std::collections::HashMap<String, (String, String)>), String> {
+                let conn = four_domains::open_v2(&app_pre)?;
+                let paths = crate::jav_scraper::get_scrape_whitelist(&conn).map_err(|e| e.to_string())?;
+                let snap = crate::jav_scraper::snapshot_whitelisted_videos(&conn).map_err(|e| e.to_string())?;
+                Ok((paths, snap))
+            }).await;
+            let (paths, before_snap) = match pre_res {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return error_response(&e),
+                Err(e) => return error_response(&e.to_string()),
+            };
+            let (scanned_dirs, added, updated, removed) = match four_domains::sync_whitelisted_paths(
+                app.clone(),
+                app.state::<MediaLibraryState>(),
+                &paths,
+                true,
+                incremental,
+            ).await {
+                Ok(counts) => counts,
+                Err(e) => return error_response(&e),
+            };
+            let app_post = app.clone();
+            let mode_label = if incremental { "incremental" } else { "full" }.to_string();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app_post)?;
+                let after_snap = crate::jav_scraper::snapshot_whitelisted_videos(&conn).map_err(|e| e.to_string())?;
+                let diff = crate::jav_scraper::record_movie_sync_diff(&conn, &mode_label, scanned_dirs, &before_snap, &after_snap)
+                    .map_err(|e| format!("记录同步变动失败：{e}"))?;
+                let _ = crate::jav_scraper::reconcile_movie_library_changes(&conn, scanned_dirs, added, updated, removed);
+                Ok(diff)
+            }).await
+        }
+        "get_movie_sync_diff" => {
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::get_latest_movie_sync_diff(&conn).map_err(|e| e.to_string())
+            }).await
+        }
+        "extract_movie_numbers" => {
+            let scope = payload.get("scope").and_then(Value::as_str).unwrap_or("new").to_ascii_lowercase();
+            let app = app.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app)?;
+                crate::jav_scraper::extract_movie_numbers_summary(&conn, &scope).map_err(|e| e.to_string())
             }).await
         }
         "sync_remote_and_reconcile" => {
