@@ -757,8 +757,8 @@ fn valid_number_tail(upper: &str, pos: usize) -> bool {
     if bytes[pos].is_ascii_digit() {
         return false;
     }
-    // Allow common directly-attached release suffixes (C, CH, UC, U, A, B, K, R, Z, X)
-    for suffix in ["CH", "UC", "C", "U", "A", "B", "K", "R", "Z", "X"] {
+    // Allow common directly-attached release suffixes (C, CH, UC, U, A, B, K, R, Z, X, HHB, FHD, HD, 4K)
+    for suffix in ["HHB", "FHD", "CH", "UC", "HD", "4K", "C", "U", "A", "B", "K", "R", "Z", "X"] {
         if upper[pos..].starts_with(suffix) {
             let after = pos + suffix.len();
             if after == bytes.len() || !bytes[after].is_ascii_alphanumeric() {
@@ -817,34 +817,132 @@ pub fn extract_jav_number(raw_name: &str) -> Option<String> {
             }
             continue;
         }
-        if bytes[start].is_ascii_digit() {
-            // 1) Date-style IDs (6 digits + '-'/'_' + 3 digits, e.g. 010126-123 / 010126_123)
-            let end = start + 10;
-            if end <= bytes.len() && bytes[start..start + 6].iter().all(u8::is_ascii_digit)
-                && matches!(bytes[start + 6], b'-' | b'_')
-                && bytes[start + 7..end].iter().all(u8::is_ascii_digit)
-                && valid_number_tail(&upper, end) {
-                candidates.insert(upper[start..end].to_string());
+        // Short FC2 naming missing '2' (e.g. fc4776818_6.mp4, fc1854766.mp4)
+        if upper[start..].starts_with("FC") && !upper[start..].starts_with("FC2") {
+            let mut i = start + 2;
+            while i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ') { i += 1; }
+            let n = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+            if (6..=7).contains(&(i - n)) && valid_number_tail(&upper, i) {
+                candidates.insert(format!("FC2-{}", &upper[n..i]));
                 continue;
             }
-            // 2) Digit-prefixed studio IDs (e.g. 300MIUM-123, 259LUXU-1234, 200GANA-1234, 420STH-123)
+        }
+        // HEYZO variants: heyzo_hd_0420_full, (Heyzo)(0474), HEYZO-943 -> HEYZO-0943 (always 4 digits)
+        if upper[start..].starts_with("HEYZO") {
+            let mut i = start + 5;
+            while i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ' | b')' | b'(' | b']' | b'[') { i += 1; }
+            for tag in ["FHD", "HD", "SD"] {
+                if upper[i..].starts_with(tag) {
+                    let after = i + tag.len();
+                    if after < bytes.len() && matches!(bytes[after], b'-' | b'_' | b' ') {
+                        i = after;
+                        while i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ') { i += 1; }
+                    }
+                }
+            }
+            let n = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+            if (3..=4).contains(&(i - n)) && valid_number_tail(&upper, i) {
+                candidates.insert(format!("HEYZO-{:0>4}", &upper[n..i]));
+                continue;
+            }
+        }
+        // DMM h_NNN prefix (e.g. h_720zex00201hhb.restored.mp4 -> ZEX-201)
+        if upper[start..].starts_with("H_") {
+            let mut i = start + 2;
+            let d0 = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+            if (3..=4).contains(&(i - d0)) && i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                let l0 = i;
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() { i += 1; }
+                let letters_only = &upper[l0..i];
+                if (2..=6).contains(&letters_only.len()) && !NOISE_PREFIXES.contains(&letters_only) {
+                    let n = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                    if (3..=5).contains(&(i - n)) && valid_number_tail(&upper, i) {
+                        candidates.insert(format!("{}-{}", letters_only, normalize_digits(&upper[n..i])));
+                        continue;
+                    }
+                }
+            }
+        }
+        // Special alphanumeric uncensored prefixes (SM3D2DBD-11, MCB3DBD-24, MKBD-S98, T-28390 -> T28-390)
+        let mut matched_special = false;
+        for sp in ["SM3D2DBD", "MCB3DBD", "CWPBD"] {
+            if upper[start..].starts_with(sp) {
+                let mut i = start + sp.len();
+                if i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ') { i += 1; }
+                let n = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                if (2..=4).contains(&(i - n)) && valid_number_tail(&upper, i) {
+                    candidates.insert(format!("{}-{}", sp, &upper[n..i]));
+                    matched_special = true;
+                    break;
+                }
+            }
+        }
+        if matched_special { continue; }
+        if upper[start..].starts_with("MKBD") {
+            let mut i = start + 4;
+            if i < bytes.len() && matches!(bytes[i], b'-' | b'_') { i += 1; }
+            if i < bytes.len() && bytes[i] == b'S' {
+                let n = i + 1;
+                let mut k = n;
+                while k < bytes.len() && bytes[k].is_ascii_digit() { k += 1; }
+                if (2..=3).contains(&(k - n)) && valid_number_tail(&upper, k) {
+                    candidates.insert(format!("MKBD-S{}", &upper[n..k]));
+                    continue;
+                }
+            }
+        }
+        if upper[start..].starts_with("T-28") {
+            let n = start + 4;
+            let mut k = n;
+            while k < bytes.len() && bytes[k].is_ascii_digit() { k += 1; }
+            if (3..=4).contains(&(k - n)) && valid_number_tail(&upper, k) {
+                candidates.insert(format!("T28-{}", normalize_digits(&upper[n..k])));
+                continue;
+            }
+        }
+        if bytes[start].is_ascii_digit() {
+            // 1) Date-style IDs (6 digits + '-'/'_' + 2..=3 digits, e.g. 010126-123 / 010126_123 / 020726_01)
+            if start + 9 <= bytes.len() && bytes[start..start + 6].iter().all(u8::is_ascii_digit)
+                && matches!(bytes[start + 6], b'-' | b'_') {
+                let mut end = start + 7;
+                while end < bytes.len() && bytes[end].is_ascii_digit() { end += 1; }
+                let tail_digits = end - (start + 7);
+                if (tail_digits == 3 || (tail_digits == 2 && bytes[start + 6] == b'_')) && valid_number_tail(&upper, end) {
+                    candidates.insert(upper[start..end].to_string());
+                    continue;
+                }
+            }
+            // 2) Digit-prefixed studio IDs (300MIUM-123, 259LUXU-1234) & DMM raw names (1star00754hhb, 0925star623FHD)
             let mut d = start;
             while d < bytes.len() && bytes[d].is_ascii_digit() { d += 1; }
             let d_len = d - start;
-            if (2..=3).contains(&d_len) && d < bytes.len() && bytes[d].is_ascii_alphabetic() {
+            if (1..=4).contains(&d_len) && d < bytes.len() && bytes[d].is_ascii_alphabetic() {
                 let mut l = d;
                 while l < bytes.len() && bytes[l].is_ascii_alphabetic() { l += 1; }
                 let l_len = l - d;
                 if (2..=6).contains(&l_len) {
-                    let prefix = &upper[start..l];
                     let letters_only = &upper[d..l];
                     if !NOISE_PREFIXES.contains(&letters_only) {
                         let mut i = l;
-                        if i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ') { i += 1; }
+                        let had_sep = i < bytes.len() && matches!(bytes[i], b'-' | b'_' | b' ');
+                        if had_sep { i += 1; }
                         let n = i;
                         while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
-                        if (2..=5).contains(&(i - n)) && valid_number_tail(&upper, i) {
-                            candidates.insert(format!("{}-{}", prefix, normalize_digits(&upper[n..i])));
+                        let n_len = i - n;
+                        if (2..=5).contains(&n_len) && valid_number_tail(&upper, i) {
+                            if (2..=3).contains(&d_len) && had_sep {
+                                candidates.insert(format!("{}-{}", &upper[start..l], normalize_digits(&upper[n..i])));
+                            } else if (d_len == 1 || d_len == 4) && n_len >= 3 {
+                                // DMM raw format: 1star00754hhb -> STAR-754, 0925star623FHD -> STAR-623
+                                candidates.insert(format!("{}-{}", letters_only, normalize_digits(&upper[n..i])));
+                            } else if (2..=3).contains(&d_len) {
+                                candidates.insert(format!("{}-{}", &upper[start..l], normalize_digits(&upper[n..i])));
+                            }
                         }
                     }
                 }
@@ -895,7 +993,10 @@ pub fn normalize_jav_number(raw: &str) -> Option<String> {
     let number = extract_jav_number(&upper)?;
     let compact = upper.replace(['-', '_', ' '], "");
     let expected = number.replace(['-', '_'], "");
-    if compact == expected || (number.starts_with("FC2-") && compact == expected.replacen("FC2", "FC2PPV", 1)) {
+    if compact == expected
+        || (number.starts_with("FC2-") && compact == expected.replacen("FC2", "FC2PPV", 1))
+        || (number.starts_with("HEYZO-") && compact.starts_with("HEYZO") && compact[5..].trim_start_matches('0') == expected[5..].trim_start_matches('0'))
+    {
         Some(number)
     } else { None }
 }
@@ -2118,32 +2219,52 @@ pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
     // Bound concurrent source requests across single and batch callers.
     static GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
     let _permit = GATE.get_or_init(|| tokio::sync::Semaphore::new(3)).acquire().await.map_err(|e| e.to_string())?;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(22), async {
-        let is_date = number.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let nb = number.as_bytes();
+        let is_date = (nb.len() == 9 || nb.len() == 10)
+            && nb[..6].iter().all(u8::is_ascii_digit)
+            && matches!(nb[6], b'-' | b'_')
+            && nb[7..].iter().all(u8::is_ascii_digit);
         if is_date {
-            // The same date + sequence can identify unrelated movies at different studios.
-            // Never cross-fallback between these providers or JavDB's ambiguous date search.
-            if number.contains('_') { scrape_from_1pondo(&number).await }
-            else { scrape_from_caribbeancom(&number).await }
+            // Try official studio page first; fall back to validated JavBus/JavDB detail pages when studio site fails.
+            let primary = if number.contains('_') {
+                scrape_from_1pondo(&number).await
+            } else {
+                scrape_from_caribbeancom(&number).await
+            };
+            match primary {
+                Ok(meta) => Ok(meta),
+                Err(p_err) => match scrape_from_javbus(&number).await {
+                    Ok(meta) => Ok(meta),
+                    Err(bus_err) => scrape_from_javdb(&number)
+                        .await
+                        .map_err(|db_err| format!("{p_err}; JavBus: {bus_err}; JavDB: {db_err}")),
+                },
+            }
         } else if number.starts_with("FC2-") {
-            // Prefer FC2 official page; automatically fall back to JavDB when the seller
-            // delisted the item on FC2 (404 / soft-404) so archived FC2 titles still scrape.
+            // Prefer FC2 official page; fall back across JavDB -> AV-Wiki -> Jav321 for delisted FC2 titles.
             match scrape_from_fc2(&number).await {
                 Ok(meta) => Ok(meta),
-                Err(fc2_err) => scrape_from_javdb(&number)
-                    .await
-                    .map_err(|db_err| format!("{fc2_err}; JavDB: {db_err}")),
+                Err(fc2_err) => match scrape_from_javdb(&number).await {
+                    Ok(meta) => Ok(meta),
+                    Err(db_err) => match scrape_from_avwiki(&number).await {
+                        Ok(meta) => Ok(meta),
+                        Err(avw_err) => scrape_from_jav321(&number)
+                            .await
+                            .map_err(|j321_err| format!("{fc2_err}; JavDB: {db_err}; AV-Wiki: {avw_err}; Jav321: {j321_err}")),
+                    },
+                },
             }
         } else {
             // Direct detail source is faster. Start the second source after a short hedge,
-            // returning the first *validated* success, not the first HTTP 200.
+            // then fall back to Jav321 and AV-Wiki if both JavBus & JavDB fail.
             let bus = scrape_from_javbus(&number);
             let db = async {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 scrape_from_javdb(&number).await
             };
             tokio::pin!(bus, db);
-            tokio::select! {
+            let primary_res = tokio::select! {
                 first = &mut bus => match first {
                     Ok(meta) => Ok(meta),
                     Err(e) => db.await.map_err(|other| format!("JavBus: {e}; JavDB: {other}")),
@@ -2152,6 +2273,15 @@ pub async fn scrape_movie_metadata(raw: &str) -> Result<MovieMetadata, String> {
                     Ok(meta) => Ok(meta),
                     Err(e) => bus.await.map_err(|other| format!("JavDB: {e}; JavBus: {other}")),
                 }
+            };
+            match primary_res {
+                Ok(meta) => Ok(meta),
+                Err(p_err) => match scrape_from_jav321(&number).await {
+                    Ok(meta) => Ok(meta),
+                    Err(j321_err) => scrape_from_avwiki(&number)
+                        .await
+                        .map_err(|avw_err| format!("{p_err}; Jav321: {j321_err}; AV-Wiki: {avw_err}")),
+                },
             }
         }
     }).await.map_err(|_| format!("刮削超时【{number}】"))?;
@@ -3585,6 +3715,15 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
             }
         }
 
+        let mut existing_bindings = std::collections::HashSet::<(String, String)>::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT number, asset_id FROM movie_asset_bindings") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+                for r in rows.flatten() { existing_bindings.insert(r); }
+            }
+        }
+
+        let mut stale_failures = Vec::<String>::new();
+        let mut missing_bindings = Vec::<(String, String)>::new();
         for (number, assets) in &number_assets {
             match mode {
                 BatchScrapeMode::FailedOnly => {
@@ -3596,16 +3735,36 @@ fn start_batch_scrape_with_mode(db_path: String, mode: BatchScrapeMode) -> Resul
                 BatchScrapeMode::AllUnscraped => {}
             }
             if existing_meta_set.contains(number) {
-                // Repair cached entries too: no network is necessary to bind each duplicate file.
-                let _ = conn.execute("DELETE FROM scrape_failures WHERE number=?1", params![number]);
+                if failed_set.contains(number) {
+                    stale_failures.push(number.clone());
+                }
                 for asset in assets {
-                    if let Err(e) = bind_movie_asset(&conn, number, asset) {
-                        if let Ok(mut g) = batch_progress_cell().lock() { g.last_error = Some(e.to_string()); }
+                    if !existing_bindings.contains(&(number.clone(), asset.clone())) {
+                        missing_bindings.push((number.clone(), asset.clone()));
                     }
                 }
             } else {
                 queue.push(number.clone());
             }
+        }
+
+        if !stale_failures.is_empty() || !missing_bindings.is_empty() {
+            let _ = conn.execute_batch("SAVEPOINT batch_prebind_sp");
+            for num in stale_failures {
+                let _ = conn.execute("DELETE FROM scrape_failures WHERE number=?1", params![num]);
+            }
+            for (num, asset) in missing_bindings {
+                let _ = conn.execute(
+                    "INSERT INTO movie_asset_bindings(asset_id, number) VALUES (?1, ?2)
+                     ON CONFLICT(asset_id) DO UPDATE SET number = excluded.number",
+                    params![asset, num],
+                );
+                let _ = conn.execute(
+                    "UPDATE movie_metadata SET asset_id = COALESCE(asset_id, ?2) WHERE number = ?1",
+                    params![num, asset],
+                );
+            }
+            let _ = conn.execute_batch("RELEASE SAVEPOINT batch_prebind_sp");
         }
 
         queue.sort();

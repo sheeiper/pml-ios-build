@@ -1412,58 +1412,113 @@ fn has_directory_snapshot(connection: &Connection, domain: &str, root_id: &str, 
         .optional().map(|value| value.unwrap_or(false)).map_err(|error| error.to_string())
 }
 
+fn prefix_range_bounds(parent: &str) -> (String, String) {
+    // '/' is ASCII 47, '0' is ASCII 48, so [parent + "/", parent + "0") matches
+    // every descendant path while allowing SQLite to use B-Tree index range seeks.
+    (format!("{parent}/"), format!("{parent}0"))
+}
+
 // Called only with a successful, complete direct listing, inside the asset transaction.
 fn reconcile_directory_snapshot(
     tx: &rusqlite::Transaction, domain: &str, root_id: &str, parent: &str,
     entries: &[media_library::ProviderEntry],
 ) -> Result<(i64, i64), String> {
     validate_provider_listing(parent, entries)?;
-    let prefix = format!("{parent}/");
+    let (prefix, prefix_end) = prefix_range_bounds(parent);
     let mut candidates = HashSet::new();
+    let mut old_dirs = HashSet::new();
     // Include inferred old children as well: databases predating snapshots still
     // need to reconcile removed folders, without assuming present folders empty.
-    let mut statement = tx.prepare(
-        "SELECT remote_path FROM assets WHERE domain=?1 AND substr(remote_path,1,length(?2))=?2
-         UNION SELECT remote_path FROM provider_directory_entries
-         WHERE domain=?1 AND root_id=?3 AND parent_path=?4")
-        .map_err(|error| error.to_string())?;
-    let rows = statement.query_map(params![domain, prefix, root_id, parent], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?;
-    for row in rows {
-        let path = row.map_err(|error| error.to_string())?;
-        if let Some(relative) = path.strip_prefix(&prefix) {
-            candidates.insert(format!("{prefix}{}", relative.split('/').next().unwrap_or("")));
+    {
+        let mut stmt_assets = tx.prepare_cached(
+            "SELECT remote_path FROM assets WHERE domain=?1 AND remote_path>=?2 AND remote_path<?3"
+        ).map_err(|error| error.to_string())?;
+        let rows = stmt_assets.query_map(params![domain, &prefix, &prefix_end], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let path = row.map_err(|error| error.to_string())?;
+            if let Some(relative) = path.strip_prefix(&prefix) {
+                let mut parts = relative.splitn(2, '/');
+                let child = parts.next().unwrap_or("");
+                if !child.is_empty() {
+                    let child_path = format!("{prefix}{child}");
+                    if parts.next().is_some() {
+                        old_dirs.insert(child_path.clone());
+                    }
+                    candidates.insert(child_path);
+                }
+            }
         }
     }
-    drop(statement);
+    {
+        let mut stmt_entries = tx.prepare_cached(
+            "SELECT remote_path, is_directory FROM provider_directory_entries
+             WHERE domain=?1 AND root_id=?2 AND parent_path=?3"
+        ).map_err(|error| error.to_string())?;
+        let rows = stmt_entries.query_map(params![domain, root_id, parent], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        }).map_err(|error| error.to_string())?;
+        for row in rows {
+            let (path, is_dir) = row.map_err(|error| error.to_string())?;
+            if is_dir {
+                old_dirs.insert(path.clone());
+            }
+            candidates.insert(path);
+        }
+    }
+
     let present: HashMap<&str, bool> = entries.iter().map(|entry| (entry.path.as_str(), entry.is_directory)).collect();
     let mut missing = 0;
     let mut deleted = 0;
+    let ts = now();
+    let stale_cutoff = ts - 86400;
     for path in candidates {
         let kind = present.get(path.as_str()).copied();
-        let subtree = format!("{path}/");
-        // A file replacing a directory also invalidates its former descendants;
-        // a directory replacing a file invalidates only the former file asset.
-        let absent = kind.is_none();
-        missing += tx.execute(
-            "UPDATE assets SET missing=1,missing_since=COALESCE(missing_since,?1),missing_scan_count=missing_scan_count+1
-             WHERE domain=?2 AND ((remote_path=?3 AND ?5) OR
-                (substr(remote_path,1,length(?4))=?4 AND ?6))",
-            params![now(), domain, path, subtree, absent || kind == Some(true), kind != Some(true)])
-            .map_err(|error| error.to_string())? as i64;
-        deleted += tx.execute(
-            "DELETE FROM assets WHERE domain=?1 AND missing=1 AND
-                ((remote_path=?2 AND ?4) OR (substr(remote_path,1,length(?3))=?3 AND ?5))
-                AND (?1!='vault' OR missing_scan_count>=2 OR missing_since<=?6)",
-            params![domain, path, subtree, absent || kind == Some(true), kind != Some(true), now()-86400])
-            .map_err(|error| error.to_string())? as i64;
-        if kind != Some(true) {
-            for table in ["provider_directory_snapshots", "provider_directory_entries"] {
-                tx.execute(&format!("DELETE FROM {table} WHERE domain=?1 AND root_id=?2 AND
-                    (parent_path=?3 OR substr(parent_path,1,length(?4))=?4)"),
-                    params![domain, root_id, path, subtree]).map_err(|error| error.to_string())?;
-            }
+        // Fast path: unchanged directory, or unchanged file that was never a directory.
+        // Skip all invalidation SQL so full-library writes stay O(N) instead of O(N^2).
+        if kind == Some(true) || (kind == Some(false) && !old_dirs.contains(&path)) {
+            continue;
         }
+        let (sub_start, sub_end) = prefix_range_bounds(&path);
+        let absent = kind.is_none();
+        // A file replacing a directory also invalidates its former descendants;
+        // an absent entry invalidates both the exact file and any descendants.
+        if absent {
+            missing += tx.execute(
+                "UPDATE assets SET missing=1,missing_since=COALESCE(missing_since,?1),missing_scan_count=missing_scan_count+1
+                 WHERE domain=?2 AND (remote_path=?3 OR (remote_path>=?4 AND remote_path<?5))",
+                params![ts, domain, &path, &sub_start, &sub_end],
+            ).map_err(|error| error.to_string())? as i64;
+            deleted += tx.execute(
+                "DELETE FROM assets WHERE domain=?1 AND missing=1
+                 AND (remote_path=?2 OR (remote_path>=?3 AND remote_path<?4))
+                 AND (?1!='vault' OR missing_scan_count>=2 OR missing_since<=?5)",
+                params![domain, &path, &sub_start, &sub_end, stale_cutoff],
+            ).map_err(|error| error.to_string())? as i64;
+        } else {
+            // File replaced a former directory: invalidate descendants only.
+            missing += tx.execute(
+                "UPDATE assets SET missing=1,missing_since=COALESCE(missing_since,?1),missing_scan_count=missing_scan_count+1
+                 WHERE domain=?2 AND remote_path>=?3 AND remote_path<?4",
+                params![ts, domain, &sub_start, &sub_end],
+            ).map_err(|error| error.to_string())? as i64;
+            deleted += tx.execute(
+                "DELETE FROM assets WHERE domain=?1 AND missing=1
+                 AND remote_path>=?2 AND remote_path<?3
+                 AND (?1!='vault' OR missing_scan_count>=2 OR missing_since<=?4)",
+                params![domain, &sub_start, &sub_end, stale_cutoff],
+            ).map_err(|error| error.to_string())? as i64;
+        }
+        tx.execute(
+            "DELETE FROM provider_directory_snapshots WHERE domain=?1 AND root_id=?2
+             AND (parent_path=?3 OR (parent_path>=?4 AND parent_path<?5))",
+            params![domain, root_id, &path, &sub_start, &sub_end],
+        ).map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM provider_directory_entries WHERE domain=?1 AND root_id=?2
+             AND (parent_path=?3 OR (parent_path>=?4 AND parent_path<?5))",
+            params![domain, root_id, &path, &sub_start, &sub_end],
+        ).map_err(|error| error.to_string())?;
     }
     tx.execute("DELETE FROM provider_directory_entries WHERE domain=?1 AND root_id=?2 AND parent_path=?3",
         params![domain, root_id, parent]).map_err(|error| error.to_string())?;
@@ -1476,7 +1531,7 @@ fn reconcile_directory_snapshot(
     }
     tx.execute("INSERT INTO provider_directory_snapshots(domain,root_id,parent_path,completed_at)
         VALUES(?1,?2,?3,?4) ON CONFLICT(domain,root_id,parent_path) DO UPDATE SET completed_at=excluded.completed_at",
-        params![domain, root_id, parent, now()]).map_err(|error| error.to_string())?;
+        params![domain, root_id, parent, ts]).map_err(|error| error.to_string())?;
     Ok((missing, deleted))
 }
 
