@@ -223,7 +223,7 @@ extension PMLAPIClient {
     func onlineComicImageURL(relativePath: String) -> URL? {
         guard !relativePath.isEmpty else { return nil }
         if relativePath.hasPrefix("http") { return URL(string: relativePath) }
-        return URL(string: baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + relativePath)
+        return URL(string: configuration.baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + relativePath)
     }
 
     func searchComicOnlineSources(workId: String? = nil, query: String? = nil, useCoverHash: Bool = true) async throws -> [ComicExternalCandidate] {
