@@ -935,10 +935,18 @@ struct HomeView: View {
             }
             let images = assets.filter(\.isImage)
             if !images.isEmpty {
-                let sources: [ReaderPageSource] = images.compactMap { img in
-                    let fallback = model.alistDirectURL(remotePath: img.remotePath) ?? client.mediaSourceURL(assetId: img.id)
-                    guard let fallback else { return nil }
-                    return .remoteAsset(assetId: img.id, remotePath: img.remotePath, fallbackURL: fallback)
+                var sources: [ReaderPageSource] = []
+                sources.reserveCapacity(images.count)
+                for img in images {
+                    let fallback: URL
+                    if let direct = model.alistDirectURL(remotePath: img.remotePath) {
+                        fallback = direct
+                    } else if let remote = try? await client.mediaSourceURL(assetId: img.id) {
+                        fallback = remote
+                    } else {
+                        continue
+                    }
+                    sources.append(.remoteAsset(assetId: img.id, remotePath: img.remotePath, fallbackURL: fallback))
                 }
                 if !sources.isEmpty {
                     galleryReaderTarget = HomeGalleryReaderTarget(title: item.albumName, sources: sources)
