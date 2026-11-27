@@ -229,6 +229,106 @@ extension PMLAPIClient {
         try await command("inspect_magnet_files", arguments: ["infoHash": infoHash])
     }
 
+    func getOfflineDownloadConfig() async throws -> OfflineDownloadConfig {
+        try await command("get_offline_download_config")
+    }
+
+    func saveOfflineDownloadConfig(inboxPath: String) async throws -> OfflineDownloadConfig {
+        try await command("save_offline_download_config", arguments: ["inboxPath": inboxPath])
+    }
+
+    func submitOfflineMagnet(magnet: String, title: String? = nil, targetDir: String? = nil) async throws -> OfflineDownloadTask {
+        var args: [String: Any] = ["magnet": magnet]
+        if let title, !title.isEmpty { args["title"] = title }
+        if let targetDir, !targetDir.isEmpty { args["targetDir"] = targetDir }
+        return try await command("submit_offline_magnet", arguments: args)
+    }
+
+    func listOfflineDownloadTasks(limit: Int = 30) async throws -> [OfflineDownloadTask] {
+        try await command("list_offline_download_tasks", arguments: ["limit": limit])
+    }
+
+    func deleteOfflineDownloadTask(id: String) async throws {
+        let _: EmptyResponse? = try? await command("delete_offline_download_task", arguments: ["id": id])
+    }
+
+    func getOfflineCloudStatus(page: Int = 1) async throws -> OfflineCloudStatusResponse {
+        try await command("get_offline_cloud_status", arguments: ["page": page])
+    }
+
+    func submitOfflineMagnetsBatch(urlsText: String, targetDir: String? = nil) async throws -> BatchOfflineSubmitResponse {
+        var args: [String: Any] = ["urlsText": urlsText]
+        if let targetDir, !targetDir.isEmpty { args["targetDir"] = targetDir }
+        return try await command("submit_offline_magnets_batch", arguments: args)
+    }
+
+    func saveOfflineDownloadConfig(
+        inboxPath: String,
+        movieDir: String? = nil,
+        comicDir: String? = nil,
+        galleryDir: String? = nil,
+        creatorPendingDir: String? = nil,
+        galleryPendingDir: String? = nil,
+        comicPendingDir: String? = nil,
+        collectionPendingDir: String? = nil
+    ) async throws -> OfflineDownloadConfig {
+        var args: [String: Any] = ["inboxPath": inboxPath]
+        if let movieDir { args["movieDir"] = movieDir }
+        if let comicDir { args["comicDir"] = comicDir }
+        if let galleryDir { args["galleryDir"] = galleryDir }
+        if let creatorPendingDir { args["creatorPendingDir"] = creatorPendingDir }
+        if let galleryPendingDir { args["galleryPendingDir"] = galleryPendingDir }
+        if let comicPendingDir { args["comicPendingDir"] = comicPendingDir }
+        if let collectionPendingDir { args["collectionPendingDir"] = collectionPendingDir }
+        return try await command("save_offline_download_config", arguments: args)
+    }
+
+    func scanOfflineInbox() async throws -> InboxScanResponse {
+        try await command("scan_offline_inbox")
+    }
+
+    func executeInboxClean(
+        itemPath: String,
+        trashPaths: [String],
+        fileRenames: [InboxFileRename]? = nil,
+        flattenSourceDir: String? = nil,
+        flattenWrapperDir: String? = nil,
+        newName: String?
+    ) async throws -> CleanInboxItemResponse {
+        var args: [String: Any] = ["itemPath": itemPath, "trashPaths": trashPaths]
+        if let fileRenames, !fileRenames.isEmpty {
+            args["fileRenames"] = fileRenames.map { ["fullPath": $0.fullPath, "oldName": $0.oldName, "newName": $0.newName] }
+        }
+        if let flattenSourceDir, !flattenSourceDir.isEmpty { args["flattenSourceDir"] = flattenSourceDir }
+        if let flattenWrapperDir, !flattenWrapperDir.isEmpty { args["flattenWrapperDir"] = flattenWrapperDir }
+        if let newName, !newName.isEmpty { args["newName"] = newName }
+        return try await command("execute_inbox_clean", arguments: args)
+    }
+
+    func archiveInboxItem(itemPath: String, category: String, targetDir: String? = nil) async throws -> ArchiveInboxItemResponse {
+        var args: [String: Any] = ["itemPath": itemPath, "category": category]
+        if let targetDir, !targetDir.isEmpty { args["targetDir"] = targetDir }
+        return try await command("archive_inbox_item", arguments: args)
+    }
+
+    func listInboxTrash() async throws -> InboxTrashResponse {
+        try await command("list_inbox_trash")
+    }
+
+    func restoreInboxTrash(paths: [String], targetDir: String) async throws -> RestoreInboxTrashResponse {
+        try await command("restore_inbox_trash", arguments: ["paths": paths, "targetDir": targetDir])
+    }
+
+    func listCd2Folders(path: String? = nil) async throws -> Cd2FoldersResponse {
+        var args: [String: Any] = [:]
+        if let path, !path.isEmpty { args["path"] = path }
+        return try await command("list_cd2_folders", arguments: args)
+    }
+
+    func createCd2Folder(parentPath: String, name: String) async throws -> Cd2FolderEntry {
+        try await command("create_cd2_folder", arguments: ["parentPath": parentPath, "name": name])
+    }
+
     func getOnlineComicDetail(source: String, comicId: String) async throws -> OnlineComicDetail {
         try await command("get_online_comic_detail", arguments: ["source": source, "comicId": comicId])
     }

@@ -157,7 +157,7 @@ struct AppCenterView: View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 12) {
                 tile("漫画与图集", "book.closed.fill", .comics)
-                tile("磁力搜索", "link.circle.fill", .magnets)
+                tile("离线下载", "icloud.and.arrow.down.fill", .magnets)
                 tile("专题合集", "square.stack.3d.up.fill", .collections)
                 tile("文件浏览", "folder.fill", .browse)
                 tile("Telegram 订阅", "paperplane.fill", .telegram)
@@ -361,6 +361,42 @@ struct MagnetSearchView: View {
     @State private var javMagnets: [MovieMagnetItem] = []
     @State private var copiedHash = ""
     @State private var filesTarget: MagnetFilesSheetTarget?
+    @State private var mainTab = 0 // 0 = 搜索, 1 = 下载, 2 = 整理
+    @State private var cloudStatus: OfflineCloudStatusResponse?
+    @State private var cloudLoading = false
+    @State private var cloudError = ""
+    @State private var cloudPage = 1
+    @State private var dlSubTab = 0 // 0 = 正在下载, 1 = 失败, 2 = 完成记录
+    @State private var batchResult: BatchOfflineSubmitResponse?
+    @State private var inboxScanning = false
+    @State private var inboxHasScanned = false
+    @State private var inboxError = ""
+    @State private var inboxItems: [InboxPlanItem] = []
+    @State private var orgBusyPath = ""
+    @State private var offlineMovieDir = ""
+    @State private var offlineCreatorPendingDir = ""
+    @State private var offlineComicDir = ""
+    @State private var offlineGalleryDir = ""
+    @State private var offlineCollectionPendingDir = ""
+    @State private var cleanPreviewTarget: InboxPlanItem?
+    @State private var cleanPreviewNewName = ""
+    @State private var uncheckedJunkPaths: Set<String> = []
+    @State private var showTrashSheet = false
+    @State private var trashLoading = false
+    @State private var trashError = ""
+    @State private var trashData: InboxTrashResponse?
+    @State private var trashRestoreDirs: [String: String] = [:]
+    @State private var trashBusyKey = ""
+    @State private var folderPickerTarget: CloudFolderPickerTarget?
+    @State private var showOfflineSheet = false
+    @State private var offlineInboxPath = "/115open/PML_Inbox"
+    @State private var offlineManualMagnet = ""
+    @State private var offlineManualTitle = ""
+    @State private var offlineTasks: [OfflineDownloadTask] = []
+    @State private var offlinedHashes: Set<String> = []
+    @State private var offlineBusyKey = ""
+    @State private var offlineMessage = ""
+    @State private var offlineError = ""
 
     private let activeSources: [(id: String, label: String)] = [
         ("bt4g", "BT4G 中文"),
@@ -396,6 +432,26 @@ struct MagnetSearchView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            Picker("功能", selection: $mainTab) {
+                Text("搜索").tag(0)
+                Text("下载").tag(1)
+                Text("整理").tag(2)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .onChange(of: mainTab) { _, newVal in
+                if newVal == 1 && cloudStatus == nil && !cloudLoading {
+                    Task { await loadCloudStatus(page: 1) }
+                }
+            }
+
+            if mainTab == 1 {
+                cloudDownloadTabView
+            } else if mainTab == 2 {
+                inboxOrganizeTabView
+            } else {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 // 简洁搜索框 + 排序菜单
@@ -580,19 +636,37 @@ struct MagnetSearchView: View {
 
                                     HStack(spacing: 10) {
                                         Button {
+                                            Task { await submitOffline(magnet: item.magnet, title: item.title, key: item.infoHash) }
+                                        } label: {
+                                            if offlineBusyKey == item.infoHash {
+                                                ProgressView().controlSize(.mini)
+                                            } else {
+                                                Label(
+                                                    offlinedHashes.contains(item.infoHash.lowercased()) ? "已离线" : "离线",
+                                                    systemImage: offlinedHashes.contains(item.infoHash.lowercased()) ? "checkmark.icloud.fill" : "icloud.and.arrow.down"
+                                                )
+                                                .font(.caption.bold())
+                                            }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.small)
+                                        .tint(offlinedHashes.contains(item.infoHash.lowercased()) ? .green : .blue)
+                                        .disabled(!offlineBusyKey.isEmpty)
+
+                                        Button {
                                             UIPasteboard.general.string = item.magnet
                                             copiedHash = item.infoHash
                                             copiedStore.markCopied(item.infoHash)
                                         } label: {
                                             Label(
-                                                copiedStore.isCopied(item.infoHash) ? "已复制" : "复制磁力",
+                                                copiedStore.isCopied(item.infoHash) ? "已复制" : "复制",
                                                 systemImage: copiedStore.isCopied(item.infoHash) ? "checkmark" : "doc.on.doc"
                                             )
                                             .font(.caption.bold())
                                         }
-                                        .buttonStyle(.borderedProminent)
+                                        .buttonStyle(.bordered)
                                         .controlSize(.small)
-                                        .tint(copiedStore.isCopied(item.infoHash) ? .green : .blue)
+                                        .tint(copiedStore.isCopied(item.infoHash) ? .green : .secondary)
 
                                         Button {
                                             filesTarget = MagnetFilesSheetTarget(infoHash: item.infoHash, title: item.title)
@@ -634,10 +708,763 @@ struct MagnetSearchView: View {
             }
             .padding(.vertical, 10)
         }
-        .navigationTitle("磁力搜索")
+            }
+        }
+        .navigationTitle("离线下载")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    batchResult = nil
+                    showOfflineSheet = true
+                    Task { await loadOfflineState() }
+                } label: {
+                    Label("手动添加", systemImage: "plus.circle")
+                }
+            }
+        }
+        .task { await loadOfflineState() }
         .sheet(item: $filesTarget) { t in
             MagnetFilesSheetView(target: t).environmentObject(model)
+        }
+        .sheet(isPresented: $showOfflineSheet) {
+            NavigationStack {
+                Form {
+                    if !offlineError.isEmpty {
+                        Section { Text(offlineError).font(.caption).foregroundStyle(.red) }
+                    }
+                    if !offlineMessage.isEmpty {
+                        Section { Text(offlineMessage).font(.caption).foregroundStyle(.green) }
+                    }
+                    Section("手动粘贴多行链接（每行一条，最多 20 条）") {
+                        TextField("magnet:?xt=urn:btih:...\n支持多行批量粘贴", text: $offlineManualMagnet, axis: .vertical)
+                            .lineLimit(4...8)
+                        Button {
+                            Task { await submitManualBatch() }
+                        } label: {
+                            HStack {
+                                if offlineBusyKey == "manual" { ProgressView() }
+                                Text("提交到 115 离线队列")
+                            }
+                        }
+                        .disabled(offlineManualMagnet.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !offlineBusyKey.isEmpty)
+                    }
+                    if let res = batchResult {
+                        Section("提交结果（成功 \(res.succeeded) / 失败 \(res.failed)）") {
+                            ForEach(res.results) { r in
+                                Label(r.message, systemImage: r.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(r.ok ? .green : .red)
+                            }
+                        }
+                    }
+                    Section("目录路径配置") {
+                        dirPickerRow(label: "收件箱", text: $offlineInboxPath, field: .inbox)
+                        dirPickerRow(label: "影视库直达", text: $offlineMovieDir, field: .movie)
+                        dirPickerRow(label: "待整理 · 创作者", text: $offlineCreatorPendingDir, field: .creator)
+                        dirPickerRow(label: "待整理 · 图集", text: $offlineGalleryDir, field: .gallery)
+                        dirPickerRow(label: "待整理 · 漫画", text: $offlineComicDir, field: .comic)
+                        dirPickerRow(label: "待整理 · 合集", text: $offlineCollectionPendingDir, field: .collection)
+                        Button("保存全部目录") { Task { await saveInboxPath() } }
+                    }
+                }
+                .navigationTitle("手动添加离线链接")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) { Button("完成") { showOfflineSheet = false } }
+                }
+                .sheet(item: $folderPickerTarget) { target in
+                    CloudFolderPickerSheet(
+                        title: target.title,
+                        initialPath: target.initialPath
+                    ) { picked in
+                        switch target.field {
+                        case .inbox: offlineInboxPath = picked
+                        case .movie: offlineMovieDir = picked
+                        case .creator: offlineCreatorPendingDir = picked
+                        case .gallery: offlineGalleryDir = picked
+                        case .comic: offlineComicDir = picked
+                        case .collection: offlineCollectionPendingDir = picked
+                        }
+                    }
+                    .environmentObject(model)
+                }
+            }
+        }
+        .sheet(item: $cleanPreviewTarget) { target in
+            NavigationStack {
+                List {
+                    Section("主文件夹命名对比") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("清洗前").font(.caption2).foregroundStyle(.secondary)
+                            Text(target.name).font(.caption).foregroundStyle(.secondary)
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("清洗后（可手动编辑）").font(.caption2).foregroundStyle(.green)
+                            TextField("规范名称", text: $cleanPreviewNewName)
+                                .font(.subheadline)
+                        }
+                    }
+
+                    Section("清洗前 · 原文件列表（点选可取消误删）") {
+                        ForEach(target.keptFiles) { kf in
+                            HStack {
+                                Image(systemName: "doc").foregroundStyle(.secondary)
+                                Text(relativePath(kf.fullPath, root: target.fullPath))
+                                    .font(.caption)
+                                Spacer()
+                                Text(kf.sizeText).font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        ForEach(target.junkFiles) { jf in
+                            let rescued = uncheckedJunkPaths.contains(jf.fullPath)
+                            Button {
+                                if rescued { uncheckedJunkPaths.remove(jf.fullPath) }
+                                else { uncheckedJunkPaths.insert(jf.fullPath) }
+                            } label: {
+                                HStack {
+                                    Image(systemName: rescued ? "square" : "checkmark.square.fill")
+                                        .foregroundStyle(rescued ? .yellow : .red)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(relativePath(jf.fullPath, root: target.fullPath))
+                                            .font(.caption)
+                                            .strikethrough(!rescued)
+                                            .foregroundStyle(rescued ? .primary : .red)
+                                        Text(rescued ? "已取消（保留）" : "\(jf.sizeText) · \(jf.reason)")
+                                            .font(.caption2)
+                                            .foregroundStyle(rescued ? .yellow : .secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Section("清洗后 · 最终目录预览") {
+                        let finalTitle = cleanPreviewNewName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? target.suggestedName : cleanPreviewNewName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        Label("\(finalTitle)/", systemImage: "folder.fill")
+                            .font(.caption.bold())
+                            .foregroundStyle(.green)
+                        let afterList = computeCleanAfterRows(target)
+                        ForEach(afterList, id: \.fullPath) { row in
+                            HStack {
+                                Image(systemName: row.renamed ? "pencil.circle.fill" : "checkmark.circle.fill")
+                                    .foregroundStyle(row.renamed ? .blue : .green)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(row.rel).font(.caption)
+                                    if row.renamed {
+                                        Text("已去除网站水印").font(.caption2).foregroundStyle(.blue)
+                                    } else if row.rescued {
+                                        Text("手动保留").font(.caption2).foregroundStyle(.yellow)
+                                    }
+                                }
+                                Spacer()
+                                Text(row.sizeText).font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("清洗前后整体对比")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("取消") { cleanPreviewTarget = nil }
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            Task {
+                                await runCleanItem(
+                                    target,
+                                    customName: cleanPreviewNewName,
+                                    excludedTrash: uncheckedJunkPaths
+                                )
+                                cleanPreviewTarget = nil
+                            }
+                        } label: {
+                            if orgBusyPath == target.fullPath {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Text("确认清洗").bold()
+                            }
+                        }
+                        .disabled(!orgBusyPath.isEmpty)
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showTrashSheet) {
+            NavigationStack {
+                List {
+                    if !trashError.isEmpty {
+                        Section { Text(trashError).font(.caption).foregroundStyle(.red) }
+                    }
+                    if trashLoading && trashData == nil {
+                        Section {
+                            HStack {
+                                Spacer()
+                                ProgressView("正在读取 _Trash 垃圾箱…")
+                                Spacer()
+                            }
+                        }
+                    } else if let td = trashData, td.groups.isEmpty && td.looseItems.isEmpty {
+                        Section {
+                            ContentUnavailableView("垃圾箱为空", systemImage: "checkmark.circle")
+                        }
+                    } else if let td = trashData {
+                        ForEach(td.groups) { g in
+                            Section {
+                                TextField(
+                                    "还原目标路径",
+                                    text: Binding(
+                                        get: { trashRestoreDirs[g.groupPath] ?? g.suggestedRestoreDir },
+                                        set: { trashRestoreDirs[g.groupPath] = $0 }
+                                    )
+                                )
+                                .font(.caption)
+                                ForEach(g.items) { item in
+                                    HStack {
+                                        Image(systemName: item.isDir ? "folder" : "doc")
+                                            .foregroundStyle(.secondary)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(item.name).font(.caption).lineLimit(2)
+                                            Text(item.sizeText).font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Button("还原") {
+                                            let dest = trashRestoreDirs[g.groupPath] ?? g.suggestedRestoreDir
+                                            Task { await runRestoreTrash(paths: [item.fullPath], targetDir: dest, busyKey: item.fullPath) }
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.mini)
+                                        .disabled(!trashBusyKey.isEmpty)
+                                    }
+                                }
+                                Button {
+                                    let dest = trashRestoreDirs[g.groupPath] ?? g.suggestedRestoreDir
+                                    Task { await runRestoreTrash(paths: g.items.map { $0.fullPath }, targetDir: dest, busyKey: g.groupPath) }
+                                } label: {
+                                    HStack {
+                                        if trashBusyKey == g.groupPath { ProgressView().controlSize(.mini) }
+                                        Label("一键还原整组 (\(g.items.count) 项)", systemImage: "arrow.uturn.backward.circle")
+                                    }
+                                }
+                                .disabled(!trashBusyKey.isEmpty)
+                            } header: {
+                                Text("\(g.groupName) · \(g.restoreDirExists ? "原目录存在" : "自动新建")")
+                            }
+                        }
+                        if !td.looseItems.isEmpty {
+                            Section("零散文件") {
+                                ForEach(td.looseItems) { item in
+                                    HStack {
+                                        Text(item.name).font(.caption)
+                                        Spacer()
+                                        Button("还原") {
+                                            Task { await runRestoreTrash(paths: [item.fullPath], targetDir: td.inboxPath, busyKey: item.fullPath) }
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.mini)
+                                        .disabled(!trashBusyKey.isEmpty)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("回收站 (_Trash)")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("刷新") { Task { await loadTrash() } }
+                            .disabled(trashLoading)
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("完成") { showTrashSheet = false }
+                    }
+                }
+            }
+        }
+    }
+
+    private var cloudDownloadTabView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                // 配额卡片
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("云下载配额").font(.subheadline.bold())
+                        Spacer()
+                        Button {
+                            Task { await loadCloudStatus(page: cloudPage) }
+                        } label: {
+                            if cloudLoading {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                    let used = cloudStatus?.quota.used ?? 0
+                    let total = max(1, cloudStatus?.quota.total ?? 1)
+                    ProgressView(value: Double(min(used, total)), total: Double(total))
+                        .tint(.blue)
+                    HStack {
+                        if let st = cloudStatus {
+                            Text("已使用 \(st.quota.used) / 总配额 \(st.quota.total)")
+                                .font(.caption2).foregroundStyle(.secondary)
+                            Spacer()
+                            Text("任务总数: \(st.totalCount)")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        } else {
+                            Text("点击刷新读取 115 云下载配额…")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(12)
+                .pmlGlassCard(cornerRadius: 14)
+
+                if !cloudError.isEmpty {
+                    Text(cloudError).font(.caption).foregroundStyle(.red)
+                }
+
+                let allItems = cloudStatus?.items ?? []
+                let dlItems = allItems.filter { $0.statusCategory == "downloading" }
+                let failItems = allItems.filter { $0.statusCategory == "failed" }
+                let doneItems = allItems.filter { $0.statusCategory == "completed" }
+                let shown = dlSubTab == 0 ? dlItems : (dlSubTab == 1 ? failItems : doneItems)
+
+                Picker("状态", selection: $dlSubTab) {
+                    Text("正在下载 (\(dlItems.count))").tag(0)
+                    Text("失败 (\(failItems.count))").tag(1)
+                    Text("完成 (\(cloudStatus?.totalCount ?? Int64(doneItems.count)))").tag(2)
+                }
+                .pickerStyle(.segmented)
+
+                if cloudLoading && cloudStatus == nil {
+                    ProgressView("加载 115 云下载任务…")
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 36)
+                } else if shown.isEmpty {
+                    ContentUnavailableView("暂无离线任务", systemImage: "tray")
+                        .padding(.top, 24)
+                } else {
+                    LazyVStack(spacing: 8) {
+                        ForEach(shown) { it in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(alignment: .top) {
+                                    Text(it.name)
+                                        .font(.caption.weight(.semibold))
+                                        .lineLimit(2)
+                                    Spacer()
+                                    Text(it.statusCategory == "completed" ? "已完成" : (it.statusCategory == "downloading" ? "\(Int(it.percentDone))%" : "失败"))
+                                        .font(.caption2.bold())
+                                        .foregroundStyle(it.statusCategory == "completed" ? .green : (it.statusCategory == "downloading" ? .blue : .red))
+                                }
+                                ProgressView(value: it.percentDone, total: 100)
+                                    .tint(it.statusCategory == "completed" ? .green : (it.statusCategory == "downloading" ? .blue : .red))
+                                Text(it.sizeText)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(10)
+                            .pmlGlassCard(cornerRadius: 12)
+                        }
+                    }
+                }
+
+                if let st = cloudStatus, st.pageCount > 1 {
+                    HStack {
+                        Button("上一页") { Task { await loadCloudStatus(page: max(1, cloudPage - 1)) } }
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(cloudPage <= 1 || cloudLoading)
+                        Spacer()
+                        Text("第 \(cloudPage) / \(st.pageCount) 页").font(.caption2).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("下一页") { Task { await loadCloudStatus(page: min(st.pageCount, cloudPage + 1)) } }
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(cloudPage >= st.pageCount || cloudLoading)
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+    }
+
+    private var inboxOrganizeTabView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("收件箱整理").font(.subheadline.bold())
+                        Text(offlineInboxPath).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        showTrashSheet = true
+                        Task { await loadTrash() }
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button {
+                        Task { await runScanInbox() }
+                    } label: {
+                        if inboxScanning {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Label("扫描收件箱", systemImage: "magnifyingglass")
+                                .font(.caption.bold())
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(inboxScanning)
+                }
+                .padding(12)
+                .pmlGlassCard(cornerRadius: 14)
+
+                if !inboxError.isEmpty {
+                    Text(inboxError).font(.caption).foregroundStyle(.red)
+                }
+
+                if !inboxHasScanned && !inboxScanning {
+                    ContentUnavailableView("手动扫描收件箱", systemImage: "folder.badge.gearshape", description: Text("点击上方「扫描收件箱」安全预览待清洗与待归档项目"))
+                        .padding(.top, 24)
+                } else if inboxItems.isEmpty && !inboxScanning {
+                    ContentUnavailableView("收件箱已整理干净", systemImage: "checkmark.circle")
+                        .padding(.top, 24)
+                } else {
+                    let pending = inboxItems.filter { $0.needsClean }
+                    let ready = inboxItems.filter { !$0.needsClean }
+
+                    if !pending.isEmpty {
+                        Text("① 待清洗 (\(pending.count))").font(.caption.bold()).foregroundStyle(.secondary)
+                        ForEach(pending) { it in
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(it.name).font(.subheadline.weight(.semibold)).lineLimit(2)
+                                Text("规范名称 → \(it.suggestedName)").font(.caption).foregroundStyle(.blue)
+                                Text("保留 \(it.keptFiles.count) 项（\(it.totalSizeText)） · 移入 _Trash \(it.junkFiles.count) 项")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                Button {
+                                    cleanPreviewNewName = it.suggestedName
+                                    uncheckedJunkPaths = []
+                                    cleanPreviewTarget = it
+                                } label: {
+                                    if orgBusyPath == it.fullPath {
+                                        ProgressView().controlSize(.mini)
+                                    } else {
+                                        Label("对比并清洗", systemImage: "sparkles")
+                                            .font(.caption.bold())
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(!orgBusyPath.isEmpty)
+                            }
+                            .padding(12)
+                            .pmlGlassCard(cornerRadius: 12)
+                        }
+                    }
+
+                    if !ready.isEmpty {
+                        Text("② 已清洗 · 待归档 (\(ready.count))").font(.caption.bold()).foregroundStyle(.secondary)
+                        ForEach(ready) { it in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text(it.name).font(.subheadline.weight(.semibold)).lineLimit(2)
+                                    Spacer()
+                                    Text("已清洗").font(.caption2.bold()).foregroundStyle(.green)
+                                }
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 6) {
+                                        Button("影视库") { Task { await runArchiveItem(it, cat: "movie") } }
+                                            .buttonStyle(.bordered).controlSize(.small)
+                                        Button("创作者") { Task { await runArchiveItem(it, cat: "creator") } }
+                                            .buttonStyle(.bordered).controlSize(.small)
+                                        Button("图集") { Task { await runArchiveItem(it, cat: "gallery") } }
+                                            .buttonStyle(.bordered).controlSize(.small)
+                                        Button("漫画") { Task { await runArchiveItem(it, cat: "comic") } }
+                                            .buttonStyle(.bordered).controlSize(.small)
+                                        Button("合集") { Task { await runArchiveItem(it, cat: "collection") } }
+                                            .buttonStyle(.bordered).controlSize(.small)
+                                    }
+                                }
+                                .disabled(!orgBusyPath.isEmpty)
+                            }
+                            .padding(12)
+                            .pmlGlassCard(cornerRadius: 12)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+    }
+
+    private func dirPickerRow(label: String, text: Binding<String>, field: CloudFolderPickerField) -> some View {
+        HStack(spacing: 8) {
+            TextField(label, text: text)
+                .font(.caption)
+            Button("选择") {
+                folderPickerTarget = CloudFolderPickerTarget(
+                    field: field,
+                    title: "选择\(label)目录",
+                    initialPath: text.wrappedValue.isEmpty ? "/115open" : text.wrappedValue
+                )
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+        }
+    }
+
+    private func relativePath(_ fullPath: String, root: String) -> String {
+        let prefix = root.hasSuffix("/") ? root : "\(root)/"
+        if fullPath.hasPrefix(prefix) {
+            return String(fullPath.dropFirst(prefix.count))
+        }
+        return fullPath.split(separator: "/").last.map(String.init) ?? fullPath
+    }
+
+    private func computeCleanAfterRows(_ it: InboxPlanItem) -> [(fullPath: String, rel: String, sizeText: String, renamed: Bool, rescued: Bool)] {
+        var renameMap: [String: String] = [:]
+        for r in (it.fileRenames ?? []) {
+            renameMap[r.fullPath] = r.newName
+        }
+        let flatPrefix: String
+        if let src = it.flattenSourceDir, !src.isEmpty {
+            flatPrefix = src.hasSuffix("/") ? src : "\(src)/"
+        } else {
+            flatPrefix = ""
+        }
+
+        func mapPath(_ fp: String) -> (String, Bool) {
+            var rel = (!flatPrefix.isEmpty && fp.hasPrefix(flatPrefix))
+                ? String(fp.dropFirst(flatPrefix.count))
+                : relativePath(fp, root: it.fullPath)
+            if let nn = renameMap[fp] {
+                if let idx = rel.lastIndex(of: "/") {
+                    rel = String(rel[...idx]) + nn
+                } else {
+                    rel = nn
+                }
+                return (rel, true)
+            }
+            return (rel, false)
+        }
+
+        var rows: [(String, String, String, Bool, Bool)] = []
+        for f in it.keptFiles {
+            let (rel, renamed) = mapPath(f.fullPath)
+            rows.append((f.fullPath, rel, f.sizeText, renamed, false))
+        }
+        for f in it.junkFiles where uncheckedJunkPaths.contains(f.fullPath) {
+            let (rel, renamed) = mapPath(f.fullPath)
+            rows.append((f.fullPath, rel, f.sizeText, renamed, true))
+        }
+        return rows
+    }
+
+    private func loadTrash() async {
+        guard let client = model.apiClient else { return }
+        trashLoading = true
+        trashError = ""
+        defer { trashLoading = false }
+        do {
+            let res = try await client.listInboxTrash()
+            trashData = res
+            var dirs: [String: String] = [:]
+            for g in res.groups { dirs[g.groupPath] = g.suggestedRestoreDir }
+            trashRestoreDirs = dirs
+        } catch {
+            trashError = error.localizedDescription
+        }
+    }
+
+    private func runRestoreTrash(paths: [String], targetDir: String, busyKey: String) async {
+        guard let client = model.apiClient, !paths.isEmpty else { return }
+        trashBusyKey = busyKey
+        trashError = ""
+        defer { trashBusyKey = "" }
+        do {
+            let res = try await client.restoreInboxTrash(paths: paths, targetDir: targetDir)
+            offlineMessage = res.message
+            await loadTrash()
+            if inboxHasScanned {
+                await runScanInbox()
+            }
+        } catch {
+            trashError = error.localizedDescription
+        }
+    }
+
+    private func runScanInbox() async {
+        guard let client = model.apiClient else { return }
+        inboxScanning = true
+        inboxError = ""
+        defer { inboxScanning = false }
+        do {
+            let res = try await client.scanOfflineInbox()
+            inboxItems = res.items
+            inboxHasScanned = true
+            offlineInboxPath = res.config.inboxPath
+            offlineMovieDir = res.config.movieDir
+            offlineCreatorPendingDir = res.config.creatorPendingDir ?? ""
+            offlineComicDir = res.config.comicPendingDir ?? res.config.comicDir
+            offlineGalleryDir = res.config.galleryPendingDir ?? res.config.galleryDir
+            offlineCollectionPendingDir = res.config.collectionPendingDir ?? ""
+        } catch {
+            inboxError = error.localizedDescription
+        }
+    }
+
+    private func runCleanItem(
+        _ it: InboxPlanItem,
+        customName: String? = nil,
+        excludedTrash: Set<String> = []
+    ) async {
+        guard let client = model.apiClient else { return }
+        orgBusyPath = it.fullPath
+        inboxError = ""
+        defer { orgBusyPath = "" }
+        let selectedTrash = it.junkFiles
+            .map { $0.fullPath }
+            .filter { !excludedTrash.contains($0) }
+        let targetName = (customName ?? it.suggestedName).trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let res = try await client.executeInboxClean(
+                itemPath: it.fullPath,
+                trashPaths: selectedTrash,
+                fileRenames: it.fileRenames,
+                flattenSourceDir: it.flattenSourceDir,
+                flattenWrapperDir: it.flattenWrapperDir,
+                newName: (!targetName.isEmpty && targetName != it.name) ? targetName : nil
+            )
+            if let idx = inboxItems.firstIndex(where: { $0.fullPath == it.fullPath }) {
+                inboxItems[idx].fullPath = res.newPath
+                if !targetName.isEmpty { inboxItems[idx].name = targetName }
+                inboxItems[idx].junkFiles = it.junkFiles.filter { !selectedTrash.contains($0.fullPath) }
+                inboxItems[idx].fileRenames = []
+                inboxItems[idx].needsClean = false
+            }
+        } catch {
+            inboxError = error.localizedDescription
+        }
+    }
+
+    private func runArchiveItem(_ it: InboxPlanItem, cat: String) async {
+        guard let client = model.apiClient else { return }
+        orgBusyPath = it.fullPath
+        inboxError = ""
+        defer { orgBusyPath = "" }
+        do {
+            _ = try await client.archiveInboxItem(itemPath: it.fullPath, category: cat)
+            inboxItems.removeAll { $0.fullPath == it.fullPath }
+        } catch {
+            inboxError = error.localizedDescription
+        }
+    }
+
+    private func loadCloudStatus(page: Int) async {
+        guard let client = model.apiClient else { return }
+        cloudLoading = true
+        cloudError = ""
+        defer { cloudLoading = false }
+        do {
+            let res = try await client.getOfflineCloudStatus(page: page)
+            cloudStatus = res
+            cloudPage = res.page
+        } catch {
+            cloudError = error.localizedDescription
+        }
+    }
+
+    private func submitManualBatch() async {
+        guard let client = model.apiClient else { return }
+        offlineBusyKey = "manual"
+        offlineError = ""
+        offlineMessage = ""
+        defer { offlineBusyKey = "" }
+        do {
+            let res = try await client.submitOfflineMagnetsBatch(urlsText: offlineManualMagnet, targetDir: offlineInboxPath)
+            batchResult = res
+            offlineMessage = "批量提交完成：成功 \(res.succeeded) 条，失败 \(res.failed) 条"
+            if res.failed == 0 { offlineManualMagnet = "" }
+            await loadCloudStatus(page: 1)
+        } catch {
+            offlineError = error.localizedDescription
+        }
+    }
+
+    private func loadOfflineState() async {
+        guard let client = model.apiClient else { return }
+        if let cfg = try? await client.getOfflineDownloadConfig() {
+            offlineInboxPath = cfg.inboxPath
+            offlineMovieDir = cfg.movieDir
+            offlineCreatorPendingDir = cfg.creatorPendingDir ?? ""
+            offlineComicDir = cfg.comicPendingDir ?? cfg.comicDir
+            offlineGalleryDir = cfg.galleryPendingDir ?? cfg.galleryDir
+            offlineCollectionPendingDir = cfg.collectionPendingDir ?? ""
+        }
+        if let list = try? await client.listOfflineDownloadTasks(limit: 30) {
+            offlineTasks = list
+            offlinedHashes = Set(list.flatMap { [$0.infoHash.lowercased(), $0.magnet.lowercased()] }.filter { !$0.isEmpty })
+        }
+    }
+
+    private func saveInboxPath() async {
+        guard let client = model.apiClient else { return }
+        offlineError = ""
+        do {
+            let cfg = try await client.saveOfflineDownloadConfig(
+                inboxPath: offlineInboxPath,
+                movieDir: offlineMovieDir,
+                comicDir: offlineComicDir,
+                galleryDir: offlineGalleryDir,
+                creatorPendingDir: offlineCreatorPendingDir,
+                galleryPendingDir: offlineGalleryDir,
+                comicPendingDir: offlineComicDir,
+                collectionPendingDir: offlineCollectionPendingDir
+            )
+            offlineInboxPath = cfg.inboxPath
+            offlineMovieDir = cfg.movieDir
+            offlineCreatorPendingDir = cfg.creatorPendingDir ?? ""
+            offlineComicDir = cfg.comicPendingDir ?? cfg.comicDir
+            offlineGalleryDir = cfg.galleryPendingDir ?? cfg.galleryDir
+            offlineCollectionPendingDir = cfg.collectionPendingDir ?? ""
+            offlineMessage = "目录已保存"
+        } catch {
+            offlineError = error.localizedDescription
+        }
+    }
+
+    private func submitOffline(magnet: String, title: String?, key: String) async {
+        guard let client = model.apiClient else { return }
+        let clean = magnet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        offlineBusyKey = key
+        offlineError = ""
+        offlineMessage = ""
+        defer { offlineBusyKey = "" }
+        do {
+            let task = try await client.submitOfflineMagnet(magnet: clean, title: title, targetDir: offlineInboxPath)
+            offlineTasks.insert(task, at: 0)
+            if !task.infoHash.isEmpty { offlinedHashes.insert(task.infoHash.lowercased()) }
+            offlinedHashes.insert(clean.lowercased())
+            offlineMessage = "已离线到 \(task.targetDir)"
+            if key == "manual" {
+                offlineManualMagnet = ""
+                offlineManualTitle = ""
+            }
+        } catch {
+            offlineError = error.localizedDescription
+            showOfflineSheet = true
         }
     }
 
@@ -713,6 +1540,168 @@ struct MagnetSearchView: View {
                     }
                 }
             }
+        }
+    }
+}
+
+
+private enum CloudFolderPickerField: String {
+    case inbox, movie, creator, gallery, comic, collection
+}
+
+private struct CloudFolderPickerTarget: Identifiable {
+    let field: CloudFolderPickerField
+    let title: String
+    let initialPath: String
+    var id: String { field.rawValue }
+}
+
+private struct CloudFolderPickerSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    let title: String
+    let initialPath: String
+    let onSelect: (String) -> Void
+
+    @State private var currentPath = "/115open"
+    @State private var parentPath: String?
+    @State private var folders: [Cd2FolderEntry] = []
+    @State private var loading = false
+    @State private var error = ""
+    @State private var showNewAlert = false
+    @State private var newFolderName = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    HStack {
+                        Text(currentPath)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                        Spacer()
+                        if let parent = parentPath {
+                            Button {
+                                Task { await loadDir(parent) }
+                            } label: {
+                                Label("上一级", systemImage: "arrow.up")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                            .disabled(loading)
+                        }
+                    }
+                }
+
+                if !error.isEmpty {
+                    Section { Text(error).font(.caption).foregroundStyle(.red) }
+                }
+
+                Section("子文件夹") {
+                    if loading {
+                        HStack {
+                            Spacer()
+                            ProgressView("正在读取目录…")
+                            Spacer()
+                        }
+                    } else if folders.isEmpty {
+                        Text("当前目录下没有子文件夹")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(folders) { f in
+                            Button {
+                                Task { await loadDir(f.fullPath) }
+                            } label: {
+                                HStack {
+                                    Image(systemName: "folder.fill")
+                                        .foregroundStyle(.yellow)
+                                    Text(f.name)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.primary)
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        newFolderName = ""
+                        showNewAlert = true
+                    } label: {
+                        Image(systemName: "folder.badge.plus")
+                    }
+                    .disabled(loading)
+
+                    Button("选择") {
+                        onSelect(currentPath)
+                        dismiss()
+                    }
+                    .bold()
+                    .disabled(loading || currentPath == "/")
+                }
+            }
+            .alert("新建文件夹", isPresented: $showNewAlert) {
+                TextField("文件夹名称", text: $newFolderName)
+                Button("取消", role: .cancel) {}
+                Button("创建") {
+                    Task { await createSubfolder() }
+                }
+            }
+            .task {
+                await loadDir(initialPath.isEmpty ? "/115open" : initialPath)
+            }
+        }
+    }
+
+    private func loadDir(_ path: String) async {
+        guard let client = model.apiClient else { return }
+        loading = true
+        error = ""
+        defer { loading = false }
+        do {
+            let res = try await client.listCd2Folders(path: path)
+            currentPath = res.currentPath
+            parentPath = res.parentPath
+            folders = res.folders
+        } catch {
+            if path != "/115open" && path != "/" {
+                if let fallback = try? await client.listCd2Folders(path: "/115open") {
+                    currentPath = fallback.currentPath
+                    parentPath = fallback.parentPath
+                    folders = fallback.folders
+                    return
+                }
+            }
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func createSubfolder() async {
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, let client = model.apiClient else { return }
+        loading = true
+        error = ""
+        defer { loading = false }
+        do {
+            let created = try await client.createCd2Folder(parentPath: currentPath, name: name)
+            await loadDir(created.fullPath)
+        } catch {
+            self.error = error.localizedDescription
         }
     }
 }

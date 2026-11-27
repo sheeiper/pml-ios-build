@@ -619,3 +619,170 @@ struct MagnetFilesResponse: Decodable {
     let files: [MagnetFileEntry]
     let source: String
 }
+
+struct OfflineDownloadConfig: Decodable {
+    let inboxPath: String
+    let trashPath: String
+    let movieDir: String
+    let comicDir: String
+    let galleryDir: String
+    let creatorPendingDir: String?
+    let galleryPendingDir: String?
+    let comicPendingDir: String?
+    let collectionPendingDir: String?
+}
+
+struct OfflineDownloadTask: Decodable, Identifiable, Hashable {
+    let id: String
+    let infoHash: String
+    let title: String
+    let magnet: String
+    let targetDir: String
+    let category: String
+    let status: String
+    let message: String?
+    let createdAt: Int64
+}
+
+struct OfflineQuotaInfo: Decodable {
+    let total: Int64
+    let used: Int64
+    let left: Int64
+}
+
+struct CloudOfflineFile: Decodable, Identifiable, Hashable {
+    var id: String { "\(infoHash)-\(fileId)-\(addTime)" }
+    let name: String
+    let sizeBytes: UInt64
+    let sizeText: String
+    let url: String
+    let status: Int
+    let statusCategory: String
+    let infoHash: String
+    let fileId: String
+    let addTime: Int64
+    let percentDone: Double
+}
+
+struct OfflineCloudStatusResponse: Decodable {
+    let cloudName: String
+    let quota: OfflineQuotaInfo
+    let page: Int
+    let pageSize: Int
+    let pageCount: Int
+    let totalCount: Int64
+    let items: [CloudOfflineFile]
+}
+
+struct BatchOfflineSubmitItemResult: Decodable, Identifiable {
+    var id: String { "\(input)-\(ok)" }
+    let input: String
+    let ok: Bool
+    let message: String
+}
+
+struct BatchOfflineSubmitResponse: Decodable {
+    let total: Int
+    let succeeded: Int
+    let failed: Int
+    let targetDir: String
+    let results: [BatchOfflineSubmitItemResult]
+}
+
+struct InboxFileEntry: Decodable, Identifiable, Hashable {
+    var id: String { fullPath }
+    let name: String
+    let fullPath: String
+    let sizeBytes: UInt64
+    let sizeText: String
+    let reason: String
+}
+
+struct InboxFileRename: Codable, Identifiable, Hashable {
+    var id: String { fullPath }
+    let fullPath: String
+    let oldName: String
+    let newName: String
+}
+
+struct InboxPlanItem: Decodable, Identifiable, Hashable {
+    var id: String { fullPath }
+    var name: String
+    var fullPath: String
+    let isDir: Bool
+    let totalSizeBytes: UInt64
+    let totalSizeText: String
+    let suggestedName: String
+    let suggestedCategory: String
+    var needsClean: Bool
+    let flattenSourceDir: String?
+    let flattenWrapperDir: String?
+    let flattenLevels: Int?
+    let keptFiles: [InboxFileEntry]
+    var junkFiles: [InboxFileEntry]
+    var fileRenames: [InboxFileRename]?
+}
+
+struct InboxScanResponse: Decodable {
+    let inboxPath: String
+    let trashPath: String
+    let config: OfflineDownloadConfig
+    let items: [InboxPlanItem]
+}
+
+struct CleanInboxItemResponse: Decodable {
+    let ok: Bool
+    let movedTrashCount: Int
+    let newPath: String
+    let message: String
+}
+
+struct ArchiveInboxItemResponse: Decodable {
+    let ok: Bool
+    let destDir: String
+    let message: String
+}
+
+struct InboxTrashItem: Decodable, Identifiable, Hashable {
+    var id: String { fullPath }
+    let name: String
+    let fullPath: String
+    let isDir: Bool
+    let sizeBytes: UInt64
+    let sizeText: String
+}
+
+struct InboxTrashGroup: Decodable, Identifiable, Hashable {
+    var id: String { groupPath }
+    let groupName: String
+    let groupPath: String
+    let suggestedRestoreDir: String
+    let restoreDirExists: Bool
+    let items: [InboxTrashItem]
+}
+
+struct InboxTrashResponse: Decodable {
+    let trashPath: String
+    let inboxPath: String
+    let groups: [InboxTrashGroup]
+    let looseItems: [InboxTrashItem]
+}
+
+struct RestoreInboxTrashResponse: Decodable {
+    let ok: Bool
+    let restoredCount: Int
+    let targetDir: String
+    let message: String
+}
+
+struct Cd2FolderEntry: Decodable, Identifiable, Hashable {
+    var id: String { fullPath }
+    let name: String
+    let fullPath: String
+}
+
+struct Cd2FoldersResponse: Decodable {
+    let currentPath: String
+    let parentPath: String?
+    let folders: [Cd2FolderEntry]
+}

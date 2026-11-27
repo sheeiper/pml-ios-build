@@ -19,6 +19,16 @@ where
     runtime().spawn(future)
 }
 
+#[cfg(feature = "tauri")]
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    tauri::async_runtime::block_on(future)
+}
+
+#[cfg(not(feature = "tauri"))]
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    runtime().block_on(future)
+}
+
 #[cfg(not(feature = "tauri"))]
 pub fn runtime() -> &'static tokio::runtime::Runtime {
     use std::sync::OnceLock;

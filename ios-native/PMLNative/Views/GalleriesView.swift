@@ -1,18 +1,18 @@
 import SwiftUI
 
 private enum GallerySortV2: String, CaseIterable, Identifiable {
+    case latest = "最新入库"
     case count = "页数最多"
     case size = "体积最大"
     case name = "名称 A-Z"
-    case recent = "最近更新"
 
     var id: String { rawValue }
     var apiValue: String {
         switch self {
+        case .latest: return "latest"
         case .count: return "count"
         case .size: return "size"
         case .name: return "name"
-        case .recent: return "recent"
         }
     }
 }
@@ -28,7 +28,8 @@ struct GalleriesView: View {
     @State private var sets: [GallerySetV2] = []
     @State private var totalSets: Int64 = 0
     @State private var searchText = ""
-    @State private var sortMode: GallerySortV2 = .count
+    @State private var sortMode: GallerySortV2 = .latest
+    @State private var showFilterSheet = false
     @State private var loading = false
     @State private var loadingMore = false
     @State private var syncing = false
@@ -47,8 +48,6 @@ struct GalleriesView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 14) {
-                modelPillBar
-
                 if !noticeText.isEmpty {
                     HStack(spacing: 8) {
                         Image(systemName: "checkmark.circle.fill")
@@ -134,35 +133,74 @@ struct GalleriesView: View {
         .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索图集或模特名称")
         .refreshable { await loadAll() }
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Menu {
-                    Picker("排序", selection: $sortMode) {
-                        ForEach(GallerySortV2.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showFilterSheet = true
+                } label: {
+                    Image(systemName: (selectedModel != nil || sortMode != .latest) ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                }
+                .accessibilityLabel("图集筛选与排序")
+            }
+        }
+        .sheet(isPresented: $showFilterSheet) {
+            NavigationStack {
+                Form {
+                    Section("排序方式") {
+                        Picker("排序", selection: $sortMode) {
+                            ForEach(GallerySortV2.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                    Section("按模特筛选") {
+                        Button {
+                            selectedModel = nil
+                            showFilterSheet = false
+                        } label: {
+                            HStack {
+                                Text("全部模特")
+                                Spacer()
+                                if selectedModel == nil { Image(systemName: "checkmark").foregroundStyle(.blue) }
+                            }
+                        }
+                        ForEach(models) { m in
+                            Button {
+                                selectedModel = m.modelName
+                                showFilterSheet = false
+                            } label: {
+                                HStack {
+                                    Text(m.modelName)
+                                    Spacer()
+                                    Text("\(m.setCount) 套").font(.caption).foregroundStyle(.secondary)
+                                    if selectedModel == m.modelName { Image(systemName: "checkmark").foregroundStyle(.blue) }
+                                }
+                            }
                         }
                     }
-                } label: {
-                    Image(systemName: "arrow.up.arrow.down")
-                }
-
-                Button {
-                    Task { await syncGalleriesModule() }
-                } label: {
-                    if syncing {
-                        ProgressView()
-                    } else {
-                        Image(systemName: "arrow.clockwise")
+                    Section {
+                        Button {
+                            showFilterSheet = false
+                            Task { await syncGalleriesModule() }
+                        } label: {
+                            Label(syncing ? "同步中…" : "同步写真图集", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(syncing)
                     }
                 }
-                .disabled(syncing)
-                .accessibilityLabel("同步写真图集模块")
+                .navigationTitle("图集筛选")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) { Button("完成") { showFilterSheet = false } }
+                }
             }
+            .presentationDetents([.medium, .large])
         }
         .fullScreenCover(item: $imageViewerContext) { ctx in
             ImageViewer(context: ctx)
         }
         .fullScreenCover(item: $comicTarget) { target in
-            ComicReaderView(target: target)
+            ComicReaderView(target: target, kind: .gallery)
         }
         .task { await loadAll() }
         .onChange(of: selectedModel) { _, _ in

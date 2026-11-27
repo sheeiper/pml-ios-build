@@ -418,13 +418,15 @@ public struct MovieDetailSheet: View {
                                 .disabled(subtitleSearching)
                             }
 
-                            HStack(spacing: 8) {
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
                                 let isMovieFav = favs.isMovieFav(meta.number)
                                 Button {
                                     Task { await favs.toggle(client: appModel.apiClient, type: .movie, id: meta.number) }
                                 } label: {
                                     Label(isMovieFav ? "已收藏" : "收藏", systemImage: isMovieFav ? "heart.fill" : "heart")
                                         .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
                                         .foregroundStyle(isMovieFav ? .pink : .primary)
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 6)
@@ -436,6 +438,8 @@ public struct MovieDetailSheet: View {
                                 } label: {
                                     Label("更多版本", systemImage: "link")
                                         .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 6)
                                 }
@@ -447,6 +451,8 @@ public struct MovieDetailSheet: View {
                                 } label: {
                                     Label("多源资料", systemImage: "square.stack.3d.up")
                                         .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 6)
                                 }
@@ -457,6 +463,8 @@ public struct MovieDetailSheet: View {
                                 } label: {
                                     Label("刷新", systemImage: "arrow.clockwise")
                                         .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 6)
                                 }

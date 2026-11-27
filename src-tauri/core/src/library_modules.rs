@@ -2608,10 +2608,11 @@ pub fn list_gallery_sets(
             .map_err(|e| e.to_string())?
     };
 
-    let order_sql = match sort.unwrap_or("name") {
-        "size" => "total_bytes DESC, album_name COLLATE NOCASE ASC",
-        "count" => "item_count DESC, total_bytes DESC",
-        _ => "model_name COLLATE NOCASE ASC, album_name COLLATE NOCASE ASC",
+    let order_sql = match sort.unwrap_or("latest") {
+        "name" => "g.model_name COLLATE NOCASE ASC, g.album_name COLLATE NOCASE ASC",
+        "size" => "g.total_bytes DESC, g.album_name COLLATE NOCASE ASC",
+        "count" => "effective_count DESC, g.total_bytes DESC",
+        _ => "g.updated_at DESC, g.rowid DESC",
     };
 
     let lim = limit.clamp(1, 200);

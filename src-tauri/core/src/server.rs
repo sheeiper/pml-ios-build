@@ -774,6 +774,99 @@ async fn dispatch_command(
                 .to_owned();
             blocking_result_response(move || crate::magnet_search::inspect_magnet_files(&info_hash)).await
         }
+        "get_offline_download_config" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::get_offline_download_config(&app)).await
+        }
+        "save_offline_download_config" => {
+            let inbox_path = payload.get("inboxPath").and_then(Value::as_str).unwrap_or("").to_owned();
+            let movie_dir = payload.get("movieDir").and_then(Value::as_str).map(str::to_owned);
+            let comic_dir = payload.get("comicDir").and_then(Value::as_str).map(str::to_owned);
+            let gallery_dir = payload.get("galleryDir").and_then(Value::as_str).map(str::to_owned);
+            let creator_pending_dir = payload.get("creatorPendingDir").and_then(Value::as_str).map(str::to_owned);
+            let gallery_pending_dir = payload.get("galleryPendingDir").and_then(Value::as_str).map(str::to_owned);
+            let comic_pending_dir = payload.get("comicPendingDir").and_then(Value::as_str).map(str::to_owned);
+            let collection_pending_dir = payload.get("collectionPendingDir").and_then(Value::as_str).map(str::to_owned);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::offline_download::save_offline_download_config(
+                    &app,
+                    &inbox_path,
+                    movie_dir.as_deref(),
+                    comic_dir.as_deref(),
+                    gallery_dir.as_deref(),
+                    creator_pending_dir.as_deref(),
+                    gallery_pending_dir.as_deref(),
+                    comic_pending_dir.as_deref(),
+                    collection_pending_dir.as_deref(),
+                )
+            })
+            .await
+        }
+        "submit_offline_magnet" => {
+            let req: crate::offline_download::SubmitOfflineMagnetRequest =
+                serde_json::from_value(payload).map_err(|e| format!("参数格式错误：{e}")).unwrap_or(
+                    crate::offline_download::SubmitOfflineMagnetRequest {
+                        magnet: String::new(),
+                        title: None,
+                        target_dir: None,
+                        category: None,
+                    },
+                );
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::submit_offline_magnet(&app, req)).await
+        }
+        "list_offline_download_tasks" => {
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(40);
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::list_offline_download_tasks(&app, limit)).await
+        }
+        "delete_offline_download_task" => {
+            let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::delete_offline_download_task(&app, &id)).await
+        }
+        "get_offline_cloud_status" => {
+            let page = payload.get("page").and_then(Value::as_i64).unwrap_or(1) as i32;
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::get_offline_cloud_status(&app, page)).await
+        }
+        "submit_offline_magnets_batch" => {
+            let urls_text = payload.get("urlsText").and_then(Value::as_str).unwrap_or("").to_owned();
+            let target_dir = payload.get("targetDir").and_then(Value::as_str).map(str::to_owned);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::offline_download::submit_offline_magnets_batch(&app, &urls_text, target_dir.as_deref())
+            })
+            .await
+        }
+        "scan_offline_inbox" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::scan_offline_inbox(&app)).await
+        }
+        "execute_inbox_clean" => {
+            let req: crate::offline_download::CleanInboxItemRequest =
+                serde_json::from_value(payload).unwrap_or(crate::offline_download::CleanInboxItemRequest {
+                    item_path: String::new(),
+                    trash_paths: Vec::new(),
+                    file_renames: None,
+                    flatten_source_dir: None,
+                    flatten_wrapper_dir: None,
+                    new_name: None,
+                });
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::execute_inbox_clean(&app, req)).await
+        }
+        "archive_inbox_item" => {
+            let req: crate::offline_download::ArchiveInboxItemRequest =
+                serde_json::from_value(payload).unwrap_or(crate::offline_download::ArchiveInboxItemRequest {
+                    item_path: String::new(),
+                    category: String::new(),
+                    target_dir: None,
+                });
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::archive_inbox_item(&app, req)).await
+        }
         "start_online_comic_cbz" => {
             let source = payload.get("source").and_then(Value::as_str).unwrap_or("jm").to_owned();
             let comic_id = payload.get("comicId").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -2951,6 +3044,40 @@ async fn dispatch_command(
         }
         "telegram_user_read_acknowledge" => {
             forward_to_tg_streamer(reqwest::Method::POST, "/user/read_acknowledge", Some(payload)).await
+        }
+        "list_inbox_trash" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::list_inbox_trash(&app)).await
+        }
+        "restore_inbox_trash" => {
+            let args: crate::offline_download::RestoreInboxTrashRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::restore_inbox_trash(&app, args)).await
+        }
+        "list_cd2_folders" => {
+            let path = payload
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|s| s.to_owned());
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::list_cd2_folders(&app, path)).await
+        }
+        "create_cd2_folder" => {
+            let parent_path = payload
+                .get("parentPath")
+                .and_then(Value::as_str)
+                .unwrap_or("/115open")
+                .to_owned();
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::create_cd2_folder(&app, parent_path, name)).await
         }
         _ => error_response(format!("不支持的 API：{command}")),
     }

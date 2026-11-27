@@ -1988,9 +1988,9 @@ pub fn query_comic_library(app: &AppHandle, req: QueryComicLibraryRequest) -> Re
 
     let order_sql = match req.sort.as_deref() {
         Some("title_asc") => "ORDER BY title COLLATE NOCASE ASC",
-        Some("volumes_desc") => "ORDER BY volume_count DESC, title COLLATE NOCASE ASC",
+        Some("volumes_desc") => "ORDER BY volume_count DESC, updated_at DESC, title COLLATE NOCASE ASC",
         Some("size_desc") => "ORDER BY total_bytes DESC",
-        _ => "ORDER BY volume_count DESC, updated_at DESC, title COLLATE NOCASE ASC",
+        _ => "ORDER BY updated_at DESC, volume_count DESC, title COLLATE NOCASE ASC",
     };
 
     let prog_map = load_work_progress_map(&conn);

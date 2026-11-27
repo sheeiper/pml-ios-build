@@ -6,7 +6,7 @@ struct ComicLibraryView: View {
     @ObservedObject private var favs = EntityFavoritesStore.shared
 
     private enum ComicTab: String, CaseIterable, Identifiable {
-        case shelf = "书架", categories = "分类", galleries = "图集", online = "在线", data = "数据"
+        case shelf = "书架", galleries = "图集", online = "在线", data = "数据"
         var id: String { rawValue }
     }
 
@@ -98,9 +98,7 @@ struct ComicLibraryView: View {
                 Task {
                     if newTab == .shelf {
                         await loadShelf(reset: true)
-                    } else if newTab == .categories {
-                        await loadFilterOptions()
-                    } else {
+                    } else if newTab == .data {
                         await loadStats()
                     }
                 }
@@ -109,8 +107,6 @@ struct ComicLibraryView: View {
             switch tab {
             case .shelf:
                 shelfView
-            case .categories:
-                categoriesView
             case .galleries:
                 GalleriesView()
             case .online:
@@ -121,6 +117,18 @@ struct ComicLibraryView: View {
         }
         .navigationTitle("漫画库 (\(stats?.totalWorks ?? total))")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if tab == .shelf {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showFilterSheet = true
+                    } label: {
+                        Image(systemName: activeFilterCount > 0 ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                    }
+                    .accessibilityLabel("筛选与排序")
+                }
+            }
+        }
         .searchable(text: $searchQuery, prompt: "搜索书名、作者、社团、原作 IP")
         .task(id: searchQuery) {
             try? await Task.sleep(for: .milliseconds(320))
@@ -625,40 +633,51 @@ struct ComicLibraryView: View {
                                     .font(.caption2.bold())
                                     .foregroundStyle(.orange)
                             }
-                            HStack(spacing: 8) {
-                                if let targetVol = resumeVol {
-                                    Button {
-                                        openVolume(targetVol, workId: work.id)
-                                    } label: {
-                                        Label(workDetail?.work.lastReadVolumeLabel != nil ? "继续阅读" : "开始阅读", systemImage: "book.fill")
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .controlSize(.small)
-                                    .tint(.purple)
-                                }
-                                Button {
-                                    sourceQuery = work.title
-                                    sourceCandidates = []
-                                    showSourceSheet = true
-                                    Task { await runManualSourceSearch(workId: work.id, useCoverHash: true) }
-                                } label: {
-                                    Label("搜源", systemImage: "globe")
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                                Button {
-                                    Task { await favs.toggle(.comic, id: work.id, client: model.apiClient) }
-                                } label: {
-                                    Image(systemName: favs.isComicFav(work.id) ? "heart.fill" : "heart")
-                                        .foregroundStyle(.pink)
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                            }
-                            .padding(.top, 4)
                         }
                     }
                     .padding(.vertical, 4)
+
+                    // 独立整行操作栏（彻底避免在封面右侧窄列里挤压换行）
+                    HStack(spacing: 8) {
+                        if let targetVol = resumeVol {
+                            Button {
+                                openVolume(targetVol, workId: work.id)
+                            } label: {
+                                Label(workDetail?.work.lastReadVolumeLabel != nil ? "继续阅读" : "开始阅读", systemImage: "book.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.85)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 4)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.purple)
+                        }
+                        Button {
+                            sourceQuery = work.title
+                            sourceCandidates = []
+                            showSourceSheet = true
+                            Task { await runManualSourceSearch(workId: work.id, useCoverHash: true) }
+                        } label: {
+                            Label("搜源", systemImage: "globe")
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
+                                .padding(.vertical, 4)
+                                .padding(.horizontal, 6)
+                        }
+                        .buttonStyle(.bordered)
+                        Button {
+                            Task { await favs.toggle(.comic, id: work.id, client: model.apiClient) }
+                        } label: {
+                            Image(systemName: favs.isComicFav(work.id) ? "heart.fill" : "heart")
+                                .foregroundStyle(.pink)
+                                .padding(.vertical, 4)
+                                .padding(.horizontal, 4)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .padding(.vertical, 2)
                     if let summary = workDetail?.work.summary ?? work.summary, !summary.isEmpty {
                         Text(summary)
                             .font(.caption)
