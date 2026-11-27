@@ -645,10 +645,10 @@ struct MagnetSearchView: View {
                     Text(relativePath(jf.fullPath, root: root))
                         .font(.caption)
                         .strikethrough(!rescued)
-                        .foregroundStyle(rescued ? .primary : .red)
+                        .foregroundStyle(rescued ? Color.primary : Color.red)
                     Text(rescued ? "已取消（保留）" : "\(jf.sizeText) · \(jf.reason)")
                         .font(.caption2)
-                        .foregroundStyle(rescued ? .yellow : .secondary)
+                        .foregroundStyle(rescued ? Color.yellow : Color.secondary)
                 }
             }
         }
