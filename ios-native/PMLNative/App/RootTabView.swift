@@ -564,7 +564,7 @@ struct MagnetSearchView: View {
                     }
 
                     Section("清洗前 · 原文件列表（点选可取消误删）") {
-                        ForEach(target.keptFiles) { kf in
+                        ForEach(target.keptFiles, id: \.fullPath) { kf in
                             HStack {
                                 Image(systemName: "doc").foregroundStyle(.secondary)
                                 Text(relativePath(kf.fullPath, root: target.fullPath))
@@ -573,26 +573,8 @@ struct MagnetSearchView: View {
                                 Text(kf.sizeText).font(.caption2).foregroundStyle(.secondary)
                             }
                         }
-                        ForEach(target.junkFiles) { jf in
-                            let rescued = uncheckedJunkPaths.contains(jf.fullPath)
-                            Button {
-                                if rescued { uncheckedJunkPaths.remove(jf.fullPath) }
-                                else { uncheckedJunkPaths.insert(jf.fullPath) }
-                            } label: {
-                                HStack {
-                                    Image(systemName: rescued ? "square" : "checkmark.square.fill")
-                                        .foregroundStyle(rescued ? .yellow : .red)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(relativePath(jf.fullPath, root: target.fullPath))
-                                            .font(.caption)
-                                            .strikethrough(!rescued)
-                                            .foregroundStyle(rescued ? .primary : .red)
-                                        Text(rescued ? "已取消（保留）" : "\(jf.sizeText) · \(jf.reason)")
-                                            .font(.caption2)
-                                            .foregroundStyle(rescued ? .yellow : .secondary)
-                                    }
-                                }
-                            }
+                        ForEach(target.junkFiles, id: \.fullPath) { jf in
+                            junkFileRow(jf, root: target.fullPath)
                         }
                     }
 
@@ -648,6 +630,28 @@ struct MagnetSearchView: View {
                     }
                 }
             }
+    }
+
+    private func junkFileRow(_ jf: InboxFileEntry, root: String) -> some View {
+        let rescued = uncheckedJunkPaths.contains(jf.fullPath)
+        return Button {
+            if rescued { uncheckedJunkPaths.remove(jf.fullPath) }
+            else { uncheckedJunkPaths.insert(jf.fullPath) }
+        } label: {
+            HStack {
+                Image(systemName: rescued ? "square" : "checkmark.square.fill")
+                    .foregroundStyle(rescued ? .yellow : .red)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(relativePath(jf.fullPath, root: root))
+                        .font(.caption)
+                        .strikethrough(!rescued)
+                        .foregroundStyle(rescued ? .primary : .red)
+                    Text(rescued ? "已取消（保留）" : "\(jf.sizeText) · \(jf.reason)")
+                        .font(.caption2)
+                        .foregroundStyle(rescued ? .yellow : .secondary)
+                }
+            }
+        }
     }
 
     private var trashSheetView: some View {
