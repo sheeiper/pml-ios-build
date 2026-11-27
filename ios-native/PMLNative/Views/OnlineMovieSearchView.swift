@@ -782,7 +782,7 @@ struct OnlineMovieDetailSheet: View {
                                 .font(.caption.weight(.semibold))
                                 .lineLimit(3)
                             HStack(spacing: 6) {
-                                Text(item.sourceLabel)
+                                Text(item.source)
                                     .font(.system(size: 10, weight: .bold))
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
@@ -791,8 +791,8 @@ struct OnlineMovieDetailSheet: View {
                                 Text(item.sizeText).font(.caption2).foregroundStyle(.secondary)
                                 Text("做种 \(item.seeders)").font(.caption2).foregroundStyle(.green)
                                 Spacer()
-                                if let dt = item.dateText, !dt.isEmpty {
-                                    Text(dt).font(.caption2).foregroundStyle(.tertiary)
+                                if !item.pubDate.isEmpty {
+                                    Text(item.pubDate).font(.caption2).foregroundStyle(.tertiary)
                                 }
                             }
                             HStack(spacing: 8) {

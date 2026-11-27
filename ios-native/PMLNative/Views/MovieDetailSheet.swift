@@ -171,9 +171,9 @@ public struct MovieDetailSheet: View {
                     title: metadata?.title ?? targetNum,
                     releaseDate: metadata?.releaseDate,
                     coverUrl: metadata?.coverUrl,
-                    detailUrl: nil,
-                    source: metadata?.source ?? "local",
-                    inLibrary: true
+                    detailUrl: metadata?.detailUrl ?? "",
+                    inLibrary: true,
+                    source: metadata?.source ?? "local"
                 ),
                 onPlayAsset: { _, _ in showMoreVersionsSheet = false },
                 onFilterActor: { _ in showMoreVersionsSheet = false }
@@ -214,7 +214,7 @@ public struct MovieDetailSheet: View {
     }
 
     @ViewBuilder
-    private func fullScreenModal(_ modal: DetailFullScreenModal) -> some View {
+    private func fullScreenModal(_ modal: DetailFullScreen) -> some View {
         switch modal {
         case .sample(let idx):
             SampleGalleryPagerView(
