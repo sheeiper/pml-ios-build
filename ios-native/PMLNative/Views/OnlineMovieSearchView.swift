@@ -329,6 +329,16 @@ struct OnlineMovieDetailSheet: View {
     @State private var activeFullScreen: OnlineDetailFullScreen?
     @State private var resolvingPlayback = false
     @State private var playbackErrorText: String?
+    @State private var previewModeSheet: OnlinePreviewMode?
+    @State private var commentsOpen = false
+    @State private var commentsLoading = false
+    @State private var commentsData: MovieCommentsResult?
+    @State private var commentsError: String?
+    @State private var translatingTitle = false
+    @State private var editingTranslation = false
+    @State private var draftTranslatedTitle = ""
+    @State private var offlineBusyKey = ""
+    @State private var offlinedMagnets: Set<String> = []
 
     private enum OnlineDetailFullScreen: Identifiable {
         case sample(Int)
@@ -364,6 +374,7 @@ struct OnlineMovieDetailSheet: View {
                         actorsAndGenresSection
                         samplesSection
                         magnetsSection
+                        commentsSection
                     }
                     .padding(16)
                 }
@@ -422,6 +433,15 @@ struct OnlineMovieDetailSheet: View {
             .sheet(item: $filesTarget) { target in
                 MagnetFilesSheetView(target: target).environmentObject(model)
             }
+            .sheet(item: $previewModeSheet) { mode in
+                OnlinePreviewPlayerSheet(
+                    mode: mode,
+                    number: displayNumber,
+                    title: detail?.translatedTitle ?? displayTitle,
+                    coverUrl: displayCover
+                )
+                .environmentObject(model)
+            }
         }
     }
 
@@ -479,9 +499,34 @@ struct OnlineMovieDetailSheet: View {
                 }
             }
 
-            Text(displayTitle)
+            Text(detail?.translatedTitle?.isEmpty == false ? detail!.translatedTitle! : displayTitle)
                 .font(.headline)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let tr = detail?.translatedTitle, !tr.isEmpty, tr != displayTitle {
+                Text(displayTitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if editingTranslation {
+                HStack(spacing: 6) {
+                    TextField("输入自定义中文译名…", text: $draftTranslatedTitle)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                    Button("保存") {
+                        Task { await translateCurrentTitle(manual: draftTranslatedTitle) }
+                    }
+                    .font(.caption.bold())
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .disabled(translatingTitle)
+                    Button("取消") { editingTranslation = false }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                }
+            }
 
             if detailLoading {
                 HStack(spacing: 6) {
@@ -500,25 +545,70 @@ struct OnlineMovieDetailSheet: View {
 
     @ViewBuilder
     private var actionButtonsSection: some View {
-        if let assetId = detail?.assetId, !assetId.isEmpty {
-            Button {
-                Task { await playLocally(assetId: assetId, title: displayTitle) }
-            } label: {
-                HStack(spacing: 6) {
-                    if resolvingPlayback {
-                        ProgressView().tint(.white)
-                    } else {
-                        Image(systemName: "play.fill")
+        VStack(spacing: 8) {
+            if let assetId = detail?.assetId, !assetId.isEmpty {
+                Button {
+                    Task { await playLocally(assetId: assetId, title: detail?.translatedTitle ?? displayTitle) }
+                } label: {
+                    HStack(spacing: 6) {
+                        if resolvingPlayback {
+                            ProgressView().tint(.white)
+                        } else {
+                            Image(systemName: "play.fill")
+                        }
+                        Text(resolvingPlayback ? "正在解析播放地址…" : "立即播放本地视频")
                     }
-                    Text(resolvingPlayback ? "正在解析播放地址…" : "立即播放本地视频")
+                    .font(.subheadline.bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
                 }
-                .font(.subheadline.bold())
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
+                .disabled(resolvingPlayback)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.purple)
-            .disabled(resolvingPlayback)
+
+            HStack(spacing: 8) {
+                Button {
+                    previewModeSheet = .trailer
+                } label: {
+                    Label("预告片", systemImage: "film")
+                        .font(.caption.bold())
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+
+                Button {
+                    previewModeSheet = .stream
+                } label: {
+                    Label("在线预览", systemImage: "play.tv")
+                        .font(.caption.bold())
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.green)
+
+                Button {
+                    Task { await translateCurrentTitle(manual: nil) }
+                } label: {
+                    HStack(spacing: 4) {
+                        if translatingTitle { ProgressView().scaleEffect(0.7) }
+                        else { Image(systemName: "character.book.closed") }
+                        Text("翻译")
+                    }
+                    .font(.caption.bold())
+                }
+                .buttonStyle(.bordered)
+                .disabled(translatingTitle)
+
+                Button {
+                    draftTranslatedTitle = detail?.translatedTitle ?? displayTitle
+                    editingTranslation.toggle()
+                } label: {
+                    Image(systemName: "pencil")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.bordered)
+            }
         }
     }
 
@@ -725,6 +815,21 @@ struct OnlineMovieDetailSheet: View {
                             }
                             HStack(spacing: 8) {
                                 Button {
+                                    Task { await submitOffline(magnet: item.magnet, title: item.title) }
+                                } label: {
+                                    if offlineBusyKey == item.magnet {
+                                        ProgressView().scaleEffect(0.75)
+                                    } else {
+                                        Label(offlinedMagnets.contains(item.magnet) ? "已离线" : "离线", systemImage: offlinedMagnets.contains(item.magnet) ? "checkmark" : "icloud.and.arrow.down")
+                                            .font(.caption.bold())
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(offlinedMagnets.contains(item.magnet) ? .green : .blue)
+                                .controlSize(.small)
+                                .disabled(!offlineBusyKey.isEmpty)
+
+                                Button {
                                     filesTarget = MagnetFilesSheetTarget(infoHash: extractMagnetHash(item.magnet), title: item.title)
                                 } label: {
                                     Label("文件", systemImage: "folder")
@@ -739,7 +844,7 @@ struct OnlineMovieDetailSheet: View {
                                     copiedStore.markCopied(item.magnet)
                                     showToast("已复制磁力链接")
                                 } label: {
-                                    Label(copiedStore.isCopied(item.magnet) ? "已复制磁力" : "复制磁力链接", systemImage: copiedStore.isCopied(item.magnet) ? "checkmark" : "doc.on.doc")
+                                    Label(copiedStore.isCopied(item.magnet) ? "已复制" : "复制", systemImage: copiedStore.isCopied(item.magnet) ? "checkmark" : "doc.on.doc")
                                         .font(.caption.bold())
                                         .frame(maxWidth: .infinity)
                                 }
@@ -797,6 +902,21 @@ struct OnlineMovieDetailSheet: View {
                             }
                             HStack(spacing: 8) {
                                 Button {
+                                    Task { await submitOffline(magnet: item.magnet, title: item.title) }
+                                } label: {
+                                    if offlineBusyKey == item.magnet {
+                                        ProgressView().scaleEffect(0.75)
+                                    } else {
+                                        Label(offlinedMagnets.contains(item.magnet) ? "已离线" : "离线", systemImage: offlinedMagnets.contains(item.magnet) ? "checkmark" : "icloud.and.arrow.down")
+                                            .font(.caption.bold())
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(offlinedMagnets.contains(item.magnet) ? .green : .blue)
+                                .controlSize(.small)
+                                .disabled(!offlineBusyKey.isEmpty)
+
+                                Button {
                                     filesTarget = MagnetFilesSheetTarget(infoHash: item.infoHash, title: item.title)
                                 } label: {
                                     Label("文件", systemImage: "folder")
@@ -811,7 +931,7 @@ struct OnlineMovieDetailSheet: View {
                                     copiedStore.markCopied(item.magnet)
                                     showToast("已复制磁力链接")
                                 } label: {
-                                    Label(copiedStore.isCopied(item.magnet) ? "已复制磁力" : "复制磁力链接", systemImage: copiedStore.isCopied(item.magnet) ? "checkmark" : "doc.on.doc")
+                                    Label(copiedStore.isCopied(item.magnet) ? "已复制" : "复制", systemImage: copiedStore.isCopied(item.magnet) ? "checkmark" : "doc.on.doc")
                                         .font(.caption.bold())
                                         .frame(maxWidth: .infinity)
                                 }
@@ -881,6 +1001,131 @@ struct OnlineMovieDetailSheet: View {
             magnetsError = error.localizedDescription
         }
         magnetsLoading = false
+    }
+
+    private var commentsSection: some View {
+        DisclosureGroup(isExpanded: Binding(
+            get: { commentsOpen },
+            set: { next in
+                commentsOpen = next
+                if next && commentsData == nil && !commentsLoading {
+                    Task { await loadComments(forceRefresh: false) }
+                }
+            }
+        )) {
+            VStack(alignment: .leading, spacing: 8) {
+                if commentsLoading {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.8)
+                        Text("正在按需拉取 JavDB 短评…").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 6)
+                } else if let err = commentsError {
+                    Text(err).font(.caption).foregroundStyle(.orange)
+                } else if commentsData?.geoBlocked == true {
+                    Text("当前网络被 JavDB 风控拦截，暂无法读取评论。").font(.caption).foregroundStyle(.orange)
+                } else if commentsData?.items.isEmpty ?? true {
+                    Text("暂未找到该番号的公开短评。").font(.caption).foregroundStyle(.secondary)
+                } else if let items = commentsData?.items {
+                    ForEach(items) { c in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Text(c.author.isEmpty ? "匿名用户" : c.author).font(.caption.bold())
+                                if let s = c.score, !s.isEmpty {
+                                    Text("★ \(s)").font(.caption2.bold()).foregroundStyle(.orange)
+                                }
+                                Spacer()
+                                if let d = c.date, !d.isEmpty {
+                                    Text(d).font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            Text(c.text).font(.caption).foregroundStyle(.primary)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack {
+                Label("JavDB 评论区", systemImage: "text.bubble")
+                    .font(.subheadline.bold())
+                if let total = commentsData?.total {
+                    Text("(\(total))").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func loadComments(forceRefresh: Bool) async {
+        guard let client = model.apiClient else { return }
+        commentsLoading = true
+        commentsError = nil
+        do {
+            let res = try await client.getMovieComments(number: displayNumber, forceRefresh: forceRefresh)
+            commentsData = res
+            commentsError = res.error
+        } catch {
+            commentsError = error.localizedDescription
+        }
+        commentsLoading = false
+    }
+
+    private func submitOffline(magnet: String, title: String?) async {
+        guard let client = model.apiClient, offlineBusyKey.isEmpty else { return }
+        offlineBusyKey = magnet
+        defer { offlineBusyKey = "" }
+        do {
+            let task = try await client.submitOfflineMagnet(magnet: magnet, title: title, targetDir: nil)
+            offlinedMagnets.insert(magnet)
+            showToast("已加入离线下载：\(task.targetDir)")
+        } catch {
+            showToast("离线失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func translateCurrentTitle(manual: String?) async {
+        guard let client = model.apiClient, !translatingTitle else { return }
+        translatingTitle = true
+        defer { translatingTitle = false }
+        do {
+            let save = detail?.assetId != nil
+            let res = try await client.translateMovieTitle(number: displayNumber, title: displayTitle, manualTitle: manual, saveToDb: save)
+            if let d = detail {
+                detail = MovieMetadata(
+                    number: d.number,
+                    assetId: d.assetId,
+                    title: d.title,
+                    originalTitle: d.originalTitle,
+                    actors: d.actors,
+                    maker: d.maker,
+                    label: d.label,
+                    series: d.series,
+                    director: d.director,
+                    releaseDate: d.releaseDate,
+                    durationMinutes: d.durationMinutes,
+                    coverUrl: d.coverUrl,
+                    sampleImages: d.sampleImages,
+                    tags: d.tags,
+                    source: d.source,
+                    updatedAt: d.updatedAt,
+                    translatedTitle: res.translatedTitle
+                )
+            } else {
+                detail = MovieMetadata(
+                    number: displayNumber,
+                    title: displayTitle,
+                    translatedTitle: res.translatedTitle
+                )
+            }
+            editingTranslation = false
+        } catch {
+            showToast("翻译失败：\(error.localizedDescription)")
+        }
     }
 }
 

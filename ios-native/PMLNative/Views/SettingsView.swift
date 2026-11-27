@@ -13,6 +13,8 @@ struct SettingsView: View {
         alistPrefix: "/115"
     )
     @State private var accelMessage = ""
+    @State private var translateConfig = MovieTranslateConfig(endpoint: "", apiKey: "", model: "")
+    @State private var translateMessage = ""
     @State private var cacheMessage = ""
     @State private var historyMessage = ""
     @State private var selfCheckMessage = ""
@@ -62,6 +64,7 @@ struct SettingsView: View {
             }
 
             accelSection
+            translateSection
             cleanupSection
             cacheSection
             historySection
@@ -153,6 +156,27 @@ struct SettingsView: View {
         }
     }
 
+    private var translateSection: some View {
+        Section {
+            TextField("API 地址（留空默认智谱 GLM-4-Flash）", text: $translateConfig.endpoint)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            TextField("模型（如 glm-4-flash / gpt-4o-mini）", text: $translateConfig.model)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            SecureField("API Key（留空自动走免费翻译兜底）", text: $translateConfig.apiKey)
+            Button("保存标题翻译配置") { Task { await saveTranslateConfig() } }
+            if !translateMessage.isEmpty {
+                Text(translateMessage).font(.caption).foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("影片标题日译中引擎（可选）")
+        } footer: {
+            Text("可填写 GLM / OpenAI 兼容接口密钥，留空则自动使用 Google → MyMemory 免费翻译。")
+        }
+    }
+
     private var cacheSection: some View {
         Section("服务端缓存") {
             if let cache {
@@ -208,6 +232,19 @@ struct SettingsView: View {
         cache = try? await client.cacheStats()
         if let value = try? await client.alistAccelConfig() {
             accel = value
+        }
+        if let tcfg = try? await client.getMovieTranslateConfig() {
+            translateConfig = tcfg
+        }
+    }
+
+    private func saveTranslateConfig() async {
+        guard let client = model.apiClient else { return }
+        do {
+            try await client.saveMovieTranslateConfig(translateConfig)
+            translateMessage = "标题翻译引擎配置已保存"
+        } catch {
+            translateMessage = error.localizedDescription
         }
     }
 

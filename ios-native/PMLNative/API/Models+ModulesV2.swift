@@ -585,6 +585,8 @@ struct UniversalMagnetItem: Decodable, Identifiable, Hashable {
     let tracker: String
     let pubDate: String
     let timestamp: Int64
+    let cnSub: Bool?
+    let hd: Bool?
 }
 
 struct MagnetSourceStat: Decodable, Identifiable, Hashable {

@@ -18,6 +18,7 @@ public struct MovieMetadata: Codable, Identifiable, Hashable {
     public let tags: [String]
     public let source: String
     public let updatedAt: Int64
+    public let translatedTitle: String?
 
     public init(
         number: String,
@@ -35,7 +36,8 @@ public struct MovieMetadata: Codable, Identifiable, Hashable {
         sampleImages: [String] = [],
         tags: [String] = [],
         source: String = "javdb",
-        updatedAt: Int64 = 0
+        updatedAt: Int64 = 0,
+        translatedTitle: String? = nil
     ) {
         self.number = number
         self.assetId = assetId
@@ -53,6 +55,7 @@ public struct MovieMetadata: Codable, Identifiable, Hashable {
         self.tags = tags
         self.source = source
         self.updatedAt = updatedAt
+        self.translatedTitle = translatedTitle
     }
 }
 
@@ -140,6 +143,8 @@ public struct PerformerSourceCandidate: Codable, Identifiable {
     public let debutYear: String?
     public let agency: String?
     public let bio: String?
+    public let twitterUrl: String?
+    public let instagramUrl: String?
 }
 
 public struct SyncDiffFileItem: Codable, Identifiable {

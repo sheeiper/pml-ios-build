@@ -85,6 +85,10 @@ pub struct Performer {
     pub latest_release_date: Option<String>,
     #[serde(default)]
     pub latest_added_at: Option<i64>,
+    #[serde(default)]
+    pub twitter_url: Option<String>,
+    #[serde(default)]
+    pub instagram_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +143,8 @@ pub fn ensure_performer_schema(conn: &Connection) -> Result<(), PerformerError> 
         "ALTER TABLE performers ADD COLUMN blood_type TEXT",
         "ALTER TABLE performers ADD COLUMN debut_year TEXT",
         "ALTER TABLE performers ADD COLUMN agency TEXT",
+        "ALTER TABLE performers ADD COLUMN twitter_url TEXT",
+        "ALTER TABLE performers ADD COLUMN instagram_url TEXT",
     ] {
         let _ = conn.execute(col, []);
     }
@@ -276,7 +282,8 @@ fn person_select() -> String {
         (SELECT MAX(replace(m.release_date, '/', '-')) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number
          WHERE c.person_id=p.id AND {VERIFIED} AND m.release_date IS NOT NULL AND trim(m.release_date) != '') AS latest_release_date,
         (SELECT MAX(m.updated_at) FROM movie_cast c JOIN movie_metadata m ON m.number=c.number
-         WHERE c.person_id=p.id AND {VERIFIED}) AS latest_added_at
+         WHERE c.person_id=p.id AND {VERIFIED}) AS latest_added_at,
+        p.twitter_url,p.instagram_url
         FROM performers p")
 }
 
@@ -291,6 +298,7 @@ fn person_from_row(row: &Row<'_>) -> rusqlite::Result<Performer> {
         hometown: row.get(12)?, hobby: row.get(13)?, bio: row.get(14)?,
         blood_type: row.get(15)?, debut_year: row.get(16)?, agency: row.get(17)?,
         latest_release_date: row.get(18)?, latest_added_at: row.get(19)?,
+        twitter_url: row.get(20).ok().flatten(), instagram_url: row.get(21).ok().flatten(),
     })
 }
 
@@ -442,23 +450,12 @@ pub fn get_performer(conn: &Connection, id: &str) -> Result<Option<PerformerDeta
     let mut stmt = conn.prepare(&format!(
         "SELECT m.number,m.asset_id,m.title,m.original_title,m.actors_json,m.maker,m.label,m.series,
                 m.director,m.release_date,m.duration_minutes,m.cover_url,m.sample_images_json,
-                m.tags_json,m.source,m.updated_at
+                m.tags_json,m.source,m.updated_at,m.translated_title
          FROM movie_metadata m WHERE {VERIFIED}
            AND EXISTS(SELECT 1 FROM movie_cast c WHERE c.number=m.number AND c.person_id=?1)
          ORDER BY CASE WHEN m.release_date IS NULL OR trim(m.release_date) = '' THEN 1 ELSE 0 END ASC, replace(m.release_date, '/', '-') DESC, m.updated_at DESC, m.number ASC LIMIT 100"
     ))?;
-    let movies = stmt.query_map([id], |row| {
-        let actors: String = row.get(4)?;
-        let samples: String = row.get(12)?;
-        let tags: String = row.get(13)?;
-        Ok(MovieMetadata {
-            number: row.get(0)?, asset_id: row.get(1)?, title: row.get(2)?, original_title: row.get(3)?,
-            actors: serde_json::from_str(&actors).unwrap_or_default(), maker: row.get(5)?, label: row.get(6)?,
-            series: row.get(7)?, director: row.get(8)?, release_date: row.get(9)?, duration_minutes: row.get(10)?,
-            cover_url: row.get(11)?, sample_images: serde_json::from_str(&samples).unwrap_or_default(),
-            tags: serde_json::from_str(&tags).unwrap_or_default(), source: row.get(14)?, updated_at: row.get(15)?,
-        })
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let movies = stmt.query_map([id], crate::jav_scraper::metadata_from_row)?.collect::<Result<Vec<_>, _>>()?;
     let total = person.movie_count;
     Ok(Some(PerformerDetail { person, movies, total }))
 }
@@ -884,6 +881,10 @@ pub struct EnrichedPerformerInfo {
     pub debut_year: Option<String>,
     pub agency: Option<String>,
     pub aliases: Vec<String>,
+    #[serde(default)]
+    pub twitter_url: Option<String>,
+    #[serde(default)]
+    pub instagram_url: Option<String>,
 }
 
 fn clean_html_text(input: &str) -> String {
@@ -1302,8 +1303,117 @@ async fn fetch_ja_wikipedia_infobox(client: &reqwest::Client, name: &str, info: 
     }
 }
 
+async fn fetch_sexy_profile_info(client: &reqwest::Client, name: &str) -> EnrichedPerformerInfo {
+    let mut info = EnrichedPerformerInfo::default();
+    let encoded = percent_encoding::utf8_percent_encode(name.trim(), percent_encoding::NON_ALPHANUMERIC).to_string();
+    let search_url = format!("https://sexy-profile.com/?s={encoded}");
+    let Ok(resp) = client
+        .get(&search_url)
+        .header("Accept-Language", "ja,en;q=0.7")
+        .send()
+        .await else { return info; };
+    if !resp.status().is_success() {
+        return info;
+    }
+    let Ok(html) = resp.text().await else { return info; };
+    let mut slug: Option<String> = None;
+    for seg in html.split("https://sexy-profile.com/").skip(1) {
+        let Some((cand, after)) = seg.split_once('/') else { continue; };
+        if cand.is_empty()
+            || cand.contains('?')
+            || cand.contains('#')
+            || ["cupsize", "birthdayyear", "birthplace", "tag", "category", "page", "feed"]
+                .iter()
+                .any(|x| cand.contains(x))
+        {
+            continue;
+        }
+        let anchor = after
+            .split_once('>')
+            .and_then(|(_, r)| r.split_once("</a>"))
+            .map(|(txt, _)| clean_html_text(txt))
+            .unwrap_or_default();
+        if anchor.starts_with(name.trim()) {
+            slug = Some(cand.to_string());
+            break;
+        }
+    }
+    let Some(slug) = slug else { return info; };
+    let detail_url = format!("https://sexy-profile.com/{slug}/");
+    let Ok(dresp) = client
+        .get(&detail_url)
+        .header("Accept-Language", "ja,en;q=0.7")
+        .header("Referer", "https://sexy-profile.com/")
+        .send()
+        .await else { return info; };
+    if !dresp.status().is_success() {
+        return info;
+    }
+    let Ok(page) = dresp.text().await else { return info; };
+    info.profile_url = Some(detail_url);
+    for row in page.split("<tr").skip(1) {
+        let row_body = row.split("</tr>").next().unwrap_or("");
+        let mut cells = Vec::new();
+        for td in row_body.split("<td").skip(1) {
+            if let Some((_, inside)) = td.split_once('>') {
+                let raw_cell = inside.split("</td>").next().unwrap_or("");
+                cells.push(clean_html_text(raw_cell));
+            }
+        }
+        if cells.len() < 2 {
+            continue;
+        }
+        let key = cells[0].trim();
+        let val = cells[1].trim();
+        if key.is_empty() || val.is_empty() || val == "-" {
+            continue;
+        }
+        if key.contains("誕生日") || key.contains("年齢") {
+            // e.g. "1998/03/18 (26歳)"
+            for tok in val.split(|c: char| !c.is_ascii_digit() && c != '/') {
+                if tok.len() >= 8 && tok.matches('/').count() == 2 {
+                    info.birth_date = crate::jav_scraper::normalize_release_date(Some(tok));
+                    break;
+                }
+            }
+        } else if key == "出身地" {
+            info.hometown = Some(val.chars().take(24).collect());
+        } else if key == "身長" {
+            let digits: String = val.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(cm) = digits.parse::<i64>() {
+                if (120..=220).contains(&cm) {
+                    info.height_cm = Some(cm);
+                }
+            }
+        } else if key.contains("スリーサイズ") {
+            let nums: Vec<String> = val
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|s| s.len() >= 2 && s.len() <= 3)
+                .map(str::to_string)
+                .collect();
+            let cup: Option<char> = val.find("カップ").and_then(|pos| {
+                val[..pos].chars().rev().find(|c| c.is_ascii_alphabetic()).map(|c| c.to_ascii_uppercase())
+            });
+            let mut parts = Vec::new();
+            if let Some(ch) = cup {
+                parts.push(format!("{ch}罩杯"));
+            }
+            if nums.len() >= 3 {
+                parts.push(format!("B{} / W{} / H{}", nums[0], nums[1], nums[2]));
+            }
+            if !parts.is_empty() {
+                info.measurements = Some(parts.join(" · "));
+            }
+        } else if key.contains("デビュー") {
+            info.debut_year = Some(val.chars().take(12).collect());
+        }
+    }
+    info
+}
+
 /// Automatically fetch performer portrait and rich profile info (birthday, blood type, height,
-/// measurements, hometown, debut year, agency, hobby, bio) from gfriends + Wikipedia + JavBus.
+/// measurements, hometown, debut year, agency, hobby, bio, social links) using whole-source
+/// priority: sexy-profile / ja.wikipedia > JavBus > JavDB, with gfriends portrait prioritized.
 pub async fn fetch_performer_enrichment(name: &str, existing_profile_url: Option<&str>) -> Result<EnrichedPerformerInfo, String> {
     let clean_name = name.trim();
     if clean_name.is_empty() { return Err("演员姓名为空".into()); }
@@ -1321,13 +1431,48 @@ pub async fn fetch_performer_enrichment(name: &str, existing_profile_url: Option
     let mut result = EnrichedPerformerInfo::default();
     let mut lookup_names = vec![clean_name.to_string()];
 
-    // 1. Japanese Wikipedia structured Infobox (birthday, height, B/W/H, blood type, hometown, debut, agency, hobby)
-    fetch_ja_wikipedia_infobox(&wiki_client, clean_name, &mut result).await;
-    for alias in &result.aliases {
+    // 1. Concurrently gather ja.wikipedia, sexy-profile, and JavDB aliases/social links
+    let mut wiki_info = EnrichedPerformerInfo::default();
+    let wiki_fut = fetch_ja_wikipedia_infobox(&wiki_client, clean_name, &mut wiki_info);
+    let sexy_fut = fetch_sexy_profile_info(&web_client, clean_name);
+    let javdb_fut = fetch_javdb_performer_candidate(&web_client, clean_name);
+    let (_, sexy_info, javdb_opt) = tokio::join!(wiki_fut, sexy_fut, javdb_fut);
+
+    // Collect aliases from all sources before querying gfriends so renamed actresses match!
+    for alias in wiki_info.aliases.iter()
+        .chain(javdb_opt.as_ref().map(|c| c.aliases.as_slice()).unwrap_or(&[]))
+    {
+        if !result.aliases.contains(alias) { result.aliases.push(alias.clone()); }
         if !lookup_names.contains(alias) { lookup_names.push(alias.clone()); }
     }
 
-    // 2. gfriends CDN portrait lookup (instant in-memory index after first load)
+    // Apply whole-source priority for measurements/height/birth: sexy-profile > ja.wikipedia (avoids inflated JavBus heights)
+    let sp_has_body = sexy_info.height_cm.is_some() || sexy_info.measurements.is_some() || sexy_info.birth_date.is_some();
+    if sp_has_body {
+        result.birth_date = sexy_info.birth_date.or(wiki_info.birth_date);
+        result.height_cm = sexy_info.height_cm.or(wiki_info.height_cm);
+        result.measurements = sexy_info.measurements.or(wiki_info.measurements);
+        result.hometown = sexy_info.hometown.or(wiki_info.hometown);
+        result.debut_year = sexy_info.debut_year.or(wiki_info.debut_year);
+        result.profile_url = sexy_info.profile_url;
+    } else {
+        result.birth_date = wiki_info.birth_date;
+        result.height_cm = wiki_info.height_cm;
+        result.measurements = wiki_info.measurements;
+        result.hometown = wiki_info.hometown;
+        result.debut_year = wiki_info.debut_year;
+    }
+    result.blood_type = wiki_info.blood_type;
+    result.agency = wiki_info.agency;
+    result.hobby = wiki_info.hobby;
+
+    if let Some(ref jdb) = javdb_opt {
+        if result.twitter_url.is_none() { result.twitter_url = jdb.twitter_url.clone(); }
+        if result.instagram_url.is_none() { result.instagram_url = jdb.instagram_url.clone(); }
+        if result.profile_url.is_none() { result.profile_url = jdb.profile_url.clone(); }
+    }
+
+    // 2. gfriends CDN portrait lookup using name + all discovered aliases
     if let Some(avatar) = lookup_gfriends_avatar(&wiki_client, &lookup_names).await {
         result.avatar_url = Some(avatar);
     }
@@ -1342,8 +1487,8 @@ pub async fn fetch_performer_enrichment(name: &str, existing_profile_url: Option
         }
     }
 
-    // 4. Fallback to JavBus (with age-verification cookie) if portrait or core measurements still missing
-    if result.avatar_url.is_none() || (result.birth_date.is_none() && result.measurements.is_none()) {
+    // 4. Fallback to JavBus (also retrieves hobby / male actor details not in female-only sources)
+    if result.avatar_url.is_none() || (result.birth_date.is_none() && result.measurements.is_none()) || result.hobby.is_none() {
         let mut star_url: Option<String> = existing_profile_url
             .map(str::trim)
             .filter(|u| u.contains("javbus.com/star/"))
@@ -1380,15 +1525,25 @@ pub async fn fetch_performer_enrichment(name: &str, existing_profile_url: Option
                         if let Ok(html) = resp.text().await {
                             let parsed = parse_javbus_star_page(&parsed_url, &html);
                             if result.avatar_url.is_none() && parsed.avatar_url.is_some() { result.avatar_url = parsed.avatar_url; }
-                            if parsed.profile_url.is_some() { result.profile_url = parsed.profile_url; }
+                            if result.profile_url.is_none() && parsed.profile_url.is_some() { result.profile_url = parsed.profile_url; }
                             if result.birth_date.is_none() { result.birth_date = parsed.birth_date; }
-                            if result.height_cm.is_none() { result.height_cm = parsed.height_cm; }
-                            if result.measurements.is_none() { result.measurements = parsed.measurements; }
+                            if result.height_cm.is_none() && result.measurements.is_none() {
+                                result.height_cm = parsed.height_cm;
+                                result.measurements = parsed.measurements;
+                            }
                             if result.hometown.is_none() { result.hometown = parsed.hometown; }
                             if result.hobby.is_none() { result.hobby = parsed.hobby; }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    if result.avatar_url.is_none() {
+        if let Some(ref jdb) = javdb_opt {
+            if jdb.avatar_url.is_some() {
+                result.avatar_url = jdb.avatar_url.clone();
             }
         }
     }
@@ -1400,6 +1555,8 @@ pub async fn fetch_performer_enrichment(name: &str, existing_profile_url: Option
         && result.bio.is_none()
         && result.blood_type.is_none()
         && result.hometown.is_none()
+        && result.twitter_url.is_none()
+        && result.instagram_url.is_none()
     {
         return Err(format!("未能从公开站点获取到「{clean_name}」的头像或资料"));
     }
@@ -1484,6 +1641,8 @@ pub fn apply_performer_enrichment(
     let blood_type = info.blood_type.clone().or(existing.blood_type);
     let debut_year = info.debut_year.clone().or(existing.debut_year);
     let agency = info.agency.clone().or(existing.agency);
+    let twitter_url = info.twitter_url.clone().or(existing.twitter_url);
+    let instagram_url = info.instagram_url.clone().or(existing.instagram_url);
     let mut merged_aliases = existing.aliases.clone();
     for a in &info.aliases {
         if a != &existing.name && !merged_aliases.contains(a) && merged_aliases.len() < MAX_ALIASES {
@@ -1494,11 +1653,11 @@ pub fn apply_performer_enrichment(
     conn.execute(
         "UPDATE performers SET aliases_json=?2, avatar_url=?3, profile_url=?4, birth_date=?5, height_cm=?6,
          measurements=?7, hometown=?8, hobby=?9, bio=?10, blood_type=?11, debut_year=?12, agency=?13,
-         status='confirmed', updated_at=?14 WHERE id=?1",
+         twitter_url=?14, instagram_url=?15, status='confirmed', updated_at=?16 WHERE id=?1",
         params![
             id, aliases_json, avatar, profile, birth_date, height_cm,
             measurements, hometown, hobby, bio, blood_type, debut_year, agency,
-            chrono::Utc::now().timestamp()
+            twitter_url, instagram_url, chrono::Utc::now().timestamp()
         ],
     )?;
     read_person(conn, id)?.ok_or(PerformerError::NotFound)
@@ -2206,7 +2365,11 @@ pub async fn fetch_movie_magnets(
     detail_url: Option<&str>,
     force_refresh: bool,
 ) -> Result<Vec<MovieMagnetItem>, String> {
-    let clean_num = crate::jav_scraper::normalize_jav_number(number)
+    let candidates = crate::movie_extras::standard_jav_query_codes(number);
+    let clean_num = candidates
+        .first()
+        .cloned()
+        .or_else(|| crate::jav_scraper::normalize_jav_number(number))
         .unwrap_or_else(|| number.trim().to_uppercase());
     if clean_num.is_empty() {
         return Err("缺少番号参数".to_string());
@@ -2226,54 +2389,104 @@ pub async fn fetch_movie_magnets(
     let mut all: Vec<MovieMagnetItem> = Vec::new();
     let mut seen_hashes = std::collections::HashSet::new();
 
-    // 1. Primary: JavDB detail page
-    let resolved_javdb_url: Option<String> = if let Some(u) = detail_url.map(str::trim).filter(|s| s.starts_with("https://javdb.com/v/")) {
-        Some(u.to_string())
-    } else {
-        let encoded = percent_encoding::utf8_percent_encode(&clean_num, percent_encoding::NON_ALPHANUMERIC).to_string();
-        let search_url = format!("https://javdb.com/search?q={encoded}&f=all");
-        if let Ok(resp) = client.get(&search_url).header("Cookie", "over18=1").send().await {
-            if let Ok(html) = resp.text().await {
-                parse_javdb_actor_releases(&html)
-                    .into_iter()
-                    .find(|item| item.number.eq_ignore_ascii_case(&clean_num))
-                    .map(|item| item.detail_url)
-            } else {
-                None
+    // 1. JavBus AJAX magnet table (official 字幕/高清 badges) + JavDB concurrently for candidate codes
+    let javbus_fut = async {
+        for cand in &candidates {
+            if let Ok(list) = crate::movie_extras::fetch_javbus_magnets(cand).await {
+                if !list.is_empty() {
+                    return list;
+                }
             }
-        } else {
-            None
         }
+        Vec::new()
     };
 
-    if let Some(jurl) = resolved_javdb_url {
-        if let Ok(resp) = client.get(&jurl).header("Cookie", "over18=1").send().await {
-            if resp.status().is_success() {
-                if let Ok(html) = resp.text().await {
-                    for m in parse_javdb_magnets(&html) {
-                        let key = extract_btih_key(&m.magnet);
-                        if seen_hashes.insert(key) {
-                            all.push(m);
+    let javdb_fut = async {
+        let resolved_javdb_url: Option<String> = if let Some(u) = detail_url.map(str::trim).filter(|s| s.starts_with("https://javdb.com/v/")) {
+            Some(u.to_string())
+        } else {
+            let mut found = None;
+            for cand in &candidates {
+                let encoded = percent_encoding::utf8_percent_encode(cand, percent_encoding::NON_ALPHANUMERIC).to_string();
+                let search_url = format!("https://javdb.com/search?q={encoded}&f=all");
+                if let Ok(resp) = client.get(&search_url).header("Cookie", "over18=1").send().await {
+                    if let Ok(html) = resp.text().await {
+                        if let Some(hit) = parse_javdb_actor_releases(&html)
+                            .into_iter()
+                            .find(|item| item.number.eq_ignore_ascii_case(cand))
+                        {
+                            found = Some(hit.detail_url);
+                            break;
                         }
                     }
                 }
             }
+            found
+        };
+
+        if let Some(jurl) = resolved_javdb_url {
+            if let Ok(resp) = client.get(&jurl).header("Cookie", "over18=1").send().await {
+                if resp.status().is_success() {
+                    if let Ok(html) = resp.text().await {
+                        return parse_javdb_magnets(&html);
+                    }
+                }
+            }
+        }
+        Vec::new()
+    };
+
+    let (javbus_items, javdb_items) = tokio::join!(javbus_fut, javdb_fut);
+    for m in javbus_items.into_iter().chain(javdb_items.into_iter()) {
+        let key = extract_btih_key(&m.magnet);
+        if seen_hashes.insert(key) {
+            all.push(m);
         }
     }
 
-    // 2. Supplement / Fallback: Sukebei Nyaa if JavDB returned fewer than 4 magnets
+    // 2. Supplement / Fallback: Sukebei (.si -> .net mirror) if fewer than 4 magnets
     if all.len() < 4 {
-        let encoded = percent_encoding::utf8_percent_encode(&clean_num, percent_encoding::NON_ALPHANUMERIC).to_string();
-        let sukebei_url = format!("https://sukebei.nyaa.si/?f=0&c=0_0&q={encoded}");
-        if let Ok(resp) = client.get(&sukebei_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(html) = resp.text().await {
-                    for m in parse_sukebei_magnets(&html) {
+        for cand in &candidates {
+            let encoded = percent_encoding::utf8_percent_encode(cand, percent_encoding::NON_ALPHANUMERIC).to_string();
+            let mut got_sukebei = false;
+            for host in ["sukebei.nyaa.si", "sukebei.nyaa.net"] {
+                let sukebei_url = format!("https://{host}/?f=0&c=0_0&q={encoded}");
+                if let Ok(resp) = client.get(&sukebei_url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(html) = resp.text().await {
+                            let parsed = parse_sukebei_magnets(&html);
+                            if !parsed.is_empty() {
+                                got_sukebei = true;
+                                for m in parsed {
+                                    let key = extract_btih_key(&m.magnet);
+                                    if seen_hashes.insert(key) {
+                                        all.push(m);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if got_sukebei {
+                break;
+            }
+        }
+    }
+
+    // 3. Final DHT fallback: BTDig (.com -> .co mirror) if still fewer than 2 magnets
+    if all.len() < 2 {
+        for cand in &candidates {
+            if let Ok(list) = crate::movie_extras::fetch_btdig_magnets(cand).await {
+                if !list.is_empty() {
+                    for m in list {
                         let key = extract_btih_key(&m.magnet);
                         if seen_hashes.insert(key) {
                             all.push(m);
                         }
                     }
+                    break;
                 }
             }
         }
@@ -2282,8 +2495,8 @@ pub async fn fetch_movie_magnets(
     // Sort: 字幕+高清 > 字幕 > 高清 > seeders desc > date desc
     all.sort_by(|a, b| {
         let score = |m: &MovieMagnetItem| -> u8 {
-            let has_sub = m.tags.iter().any(|t| t.contains("字幕"));
-            let has_hd = m.tags.iter().any(|t| t.contains("高清"));
+            let has_sub = m.tags.iter().any(|t| t.contains("字幕") || t.contains("中字"));
+            let has_hd = m.tags.iter().any(|t| t.contains("高清") || t.eq_ignore_ascii_case("HD"));
             (if has_sub { 2 } else { 0 }) + (if has_hd { 1 } else { 0 })
         };
         score(b)
@@ -2303,11 +2516,19 @@ fn online_movie_search_cache() -> &'static std::sync::Mutex<std::collections::Ha
     CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn prefix_utf8(s: &str, max_bytes: usize) -> &str {
+    let mut end = s.len().min(max_bytes);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn parse_javbus_search_results(html: &str) -> Vec<PerformerRecentRelease> {
     let mut items = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for seg in html.split("class=\"movie-box\"").skip(1) {
-        let block = &seg[..seg.len().min(1800)];
+        let block = prefix_utf8(seg, 1800);
         let Some(href_pos) = block.find("href=\"") else { continue; };
         let href_rest = &block[href_pos + 6..];
         let Some(href_end) = href_rest.find('"') else { continue; };
@@ -2500,6 +2721,44 @@ pub struct PerformerSourceCandidate {
     pub debut_year: Option<String>,
     pub agency: Option<String>,
     pub bio: Option<String>,
+    #[serde(default)]
+    pub twitter_url: Option<String>,
+    #[serde(default)]
+    pub instagram_url: Option<String>,
+}
+
+fn parse_javdb_actor_socials_and_aliases(html: &str, name: &str, aliases: &mut Vec<String>) -> (Option<String>, Option<String>) {
+    let mut twitter: Option<String> = None;
+    let mut instagram: Option<String> = None;
+    for seg in html.split("href=\"").skip(1) {
+        let Some((raw, _)) = seg.split_once('"') else { continue; };
+        let low = raw.to_ascii_lowercase();
+        if twitter.is_none() && (low.contains("twitter.com/") || low.contains("x.com/")) && !low.contains("intent/") && !low.contains("share") {
+            if let Ok(u) = reqwest::Url::parse(raw) {
+                if u.scheme() == "https" {
+                    twitter = Some(u.to_string());
+                }
+            }
+        } else if instagram.is_none() && low.contains("instagram.com/") && !low.contains("share") {
+            if let Ok(u) = reqwest::Url::parse(raw) {
+                if u.scheme() == "https" {
+                    instagram = Some(u.to_string());
+                }
+            }
+        }
+    }
+    if let Some((_, after)) = html.split_once("class=\"actor-section-name\"") {
+        if let Some((_, inside)) = after.split_once('>') {
+            let txt = strip_html_tags(inside.split("</").next().unwrap_or(""));
+            for part in txt.split(|c| c == ',' || c == '、' || c == '/') {
+                let a = part.trim();
+                if !a.is_empty() && a != name && !aliases.iter().any(|x| x == a) && aliases.len() < 12 {
+                    aliases.push(a.to_string());
+                }
+            }
+        }
+    }
+    (twitter, instagram)
 }
 
 async fn fetch_javdb_performer_candidate(client: &reqwest::Client, name: &str) -> Option<PerformerSourceCandidate> {
@@ -2515,7 +2774,7 @@ async fn fetch_javdb_performer_candidate(client: &reqwest::Client, name: &str) -
     if !resp.status().is_success() { return None; }
     let html = resp.text().await.ok()?;
     for seg in html.split("class=\"box actor-box\"").skip(1) {
-        let block = &seg[..seg.len().min(1200)];
+        let block = prefix_utf8(seg, 1200);
         let href = block.find("href=\"/actors/").and_then(|p| {
             let rest = &block[p + 6..];
             let end = rest.find('"')?;
@@ -2537,7 +2796,25 @@ async fn fetch_javdb_performer_candidate(client: &reqwest::Client, name: &str) -
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s != name)
             .collect();
-        aliases.truncate(8);
+        let (mut twitter_url, mut instagram_url) = (None, None);
+        if let Some(ref actor_url) = href {
+            if let Ok(dresp) = client
+                .get(actor_url)
+                .header("Cookie", "over18=1; locale=zh;")
+                .header("Accept-Language", "zh-CN,zh;q=0.9")
+                .send()
+                .await
+            {
+                if dresp.status().is_success() {
+                    if let Ok(dhtml) = dresp.text().await {
+                        let (tw, ig) = parse_javdb_actor_socials_and_aliases(&dhtml, name, &mut aliases);
+                        twitter_url = tw;
+                        instagram_url = ig;
+                    }
+                }
+            }
+        }
+        aliases.truncate(12);
         return Some(PerformerSourceCandidate {
             source: "javdb".to_string(),
             source_label: "JavDB 演员页".to_string(),
@@ -2554,12 +2831,14 @@ async fn fetch_javdb_performer_candidate(client: &reqwest::Client, name: &str) -
             debut_year: None,
             agency: None,
             bio: None,
+            twitter_url,
+            instagram_url,
         });
     }
     None
 }
 
-/// Query all performer sources separately (Wikipedia, gfriends, JavBus, JavDB) so user can pick.
+/// Query all performer sources separately (Wikipedia, sexy-profile, gfriends, JavBus, JavDB) so user can pick.
 pub async fn query_performer_multi_source(
     name: &str,
     existing_profile_url: Option<&str>,
@@ -2603,11 +2882,40 @@ pub async fn query_performer_multi_source(
                 debut_year: info.debut_year,
                 agency: info.agency,
                 bio: info.bio,
+                twitter_url: None,
+                instagram_url: None,
             })
         } else { None }
     };
 
-    // 2. gfriends CDN avatar
+    // 2. sexy-profile
+    let sexy_fut = async {
+        let info = fetch_sexy_profile_info(&web_client, clean_name).await;
+        let has_any = info.birth_date.is_some() || info.height_cm.is_some() || info.measurements.is_some();
+        if has_any {
+            Some(PerformerSourceCandidate {
+                source: "sexy_profile".to_string(),
+                source_label: "sexy-profile（实测身材）".to_string(),
+                name: clean_name.to_string(),
+                aliases: Vec::new(),
+                avatar_url: None,
+                profile_url: info.profile_url,
+                birth_date: info.birth_date,
+                height_cm: info.height_cm,
+                measurements: info.measurements,
+                hometown: info.hometown,
+                hobby: None,
+                blood_type: None,
+                debut_year: info.debut_year,
+                agency: None,
+                bio: None,
+                twitter_url: None,
+                instagram_url: None,
+            })
+        } else { None }
+    };
+
+    // 3. gfriends CDN avatar
     let gfriends_fut = async {
         let names = vec![clean_name.to_string()];
         lookup_gfriends_avatar(&wiki_client, &names).await.map(|avatar| PerformerSourceCandidate {
@@ -2626,10 +2934,12 @@ pub async fn query_performer_multi_source(
             debut_year: None,
             agency: None,
             bio: None,
+            twitter_url: None,
+            instagram_url: None,
         })
     };
 
-    // 3. JavBus star page
+    // 4. JavBus star page
     let javbus_fut = async {
         let mut info = EnrichedPerformerInfo::default();
         let mut star_url: Option<String> = existing_profile_url
@@ -2697,15 +3007,18 @@ pub async fn query_performer_multi_source(
                 debut_year: info.debut_year,
                 agency: info.agency,
                 bio: info.bio,
+                twitter_url: None,
+                instagram_url: None,
             })
         } else { None }
     };
 
-    // 4. JavDB actor search
+    // 5. JavDB actor search
     let javdb_fut = fetch_javdb_performer_candidate(&web_client, clean_name);
 
-    let (w, g, b, d) = tokio::join!(wiki_fut, gfriends_fut, javbus_fut, javdb_fut);
+    let (w, sp, g, b, d) = tokio::join!(wiki_fut, sexy_fut, gfriends_fut, javbus_fut, javdb_fut);
     let mut list = Vec::new();
+    if let Some(c) = sp { list.push(c); }
     if let Some(c) = w { list.push(c); }
     if let Some(c) = g { list.push(c); }
     if let Some(c) = b { list.push(c); }
@@ -2739,6 +3052,8 @@ pub fn apply_performer_source_candidate(
         agency: candidate.agency.clone(),
         bio: candidate.bio.clone(),
         aliases: candidate.aliases.clone(),
+        twitter_url: candidate.twitter_url.clone(),
+        instagram_url: candidate.instagram_url.clone(),
     };
     apply_performer_enrichment(conn, id, &info, true)
 }

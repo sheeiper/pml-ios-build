@@ -20,6 +20,8 @@ pub struct MovieMetadata {
     pub tags: Vec<String>,
     pub source: String,
     pub updated_at: i64,
+    #[serde(default)]
+    pub translated_title: Option<String>,
 }
 
 /// Ensure database schema for movie metadata and scraper whitelist.
@@ -114,16 +116,24 @@ pub fn ensure_scraper_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
            );"
     ).ok();
 
-    let has_version = {
+    let (has_version, has_translated) = {
         let mut stmt = conn.prepare("PRAGMA table_info(movie_metadata)")?;
         let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        let mut found = false;
-        for name in names { if name? == "verification_version" { found = true; } }
-        found
+        let mut found_ver = false;
+        let mut found_tr = false;
+        for name in names {
+            let n = name?;
+            if n == "verification_version" { found_ver = true; }
+            if n == "translated_title" { found_tr = true; }
+        }
+        (found_ver, found_tr)
     };
     if !has_version {
         // Preserve legacy metadata, but quarantine unverified search-first results.
         conn.execute("ALTER TABLE movie_metadata ADD COLUMN verification_version INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    if !has_translated {
+        let _ = conn.execute("ALTER TABLE movie_metadata ADD COLUMN translated_title TEXT", []);
     }
     // Normalize FC2/legacy slash dates (e.g. 2026/07/15 -> 2026-07-15) so release_date
     // lexicographical sorting matches true chronological order across all providers.
@@ -389,7 +399,7 @@ pub fn list_movies_by_series(conn: &Connection, series: &str) -> Result<Vec<Movi
     let mut stmt = conn.prepare(
         "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
                 director, release_date, duration_minutes, cover_url, sample_images_json,
-                tags_json, source, updated_at
+                tags_json, source, updated_at, translated_title
          FROM movie_metadata
          WHERE verification_version = 1
            AND source NOT IN ('javdb_not_found','not_found','')
@@ -397,29 +407,7 @@ pub fn list_movies_by_series(conn: &Connection, series: &str) -> Result<Vec<Movi
            AND series = ?1
          ORDER BY COALESCE(release_date, '') DESC, updated_at DESC"
     )?;
-    let rows = stmt.query_map(params![clean], |r| {
-        let actors_str: String = r.get(4)?;
-        let samples_str: String = r.get(12)?;
-        let tags_str: String = r.get(13)?;
-        Ok(MovieMetadata {
-            number: r.get(0)?,
-            asset_id: r.get(1)?,
-            title: r.get(2)?,
-            original_title: r.get(3)?,
-            actors: serde_json::from_str(&actors_str).unwrap_or_default(),
-            maker: r.get(5)?,
-            label: r.get(6)?,
-            series: r.get(7)?,
-            director: r.get(8)?,
-            release_date: r.get(9)?,
-            duration_minutes: r.get(10)?,
-            cover_url: r.get(11)?,
-            sample_images: serde_json::from_str(&samples_str).unwrap_or_default(),
-            tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-            source: r.get(14)?,
-            updated_at: r.get(15)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![clean], metadata_from_row)?;
     rows.collect()
 }
 
@@ -445,6 +433,12 @@ pub struct SubtitleSearchCandidate {
     pub lang_label: String,
     pub download_url: String,
     pub source: String,
+    #[serde(default)]
+    pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub duration_diff_sec: Option<i64>,
+    #[serde(default)]
+    pub duration_matched: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,101 +465,265 @@ fn subtitlecat_client() -> Result<reqwest::Client, String> {
     Ok(client)
 }
 
-/// Search SubtitleCat for Simplified Chinese (zh-CN) and Traditional Chinese (zh-TW) SRT subtitles.
-pub async fn search_movie_subtitles(number: &str) -> Result<Vec<SubtitleSearchCandidate>, String> {
-    let query = number.trim();
+fn is_allowed_xunlei_subtitle_host(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "geilijiasu.com" || h.ends_with(".geilijiasu.com")
+        || h == "xunlei.com" || h.ends_with(".xunlei.com")
+        || h == "sandai.net" || h.ends_with(".sandai.net")
+        || h == "sandai.cn" || h.ends_with(".sandai.cn")
+}
+
+async fn search_xunlei_subtitles(
+    client: &reqwest::Client,
+    code: &str,
+    expected_duration_sec: Option<i64>,
+) -> Vec<SubtitleSearchCandidate> {
+    let Ok(mut api) = reqwest::Url::parse("https://api-shoulei-ssl.xunlei.com/oracle/subtitle") else {
+        return Vec::new();
+    };
+    api.query_pairs_mut()
+        .append_pair("gcid", "")
+        .append_pair("cid", "")
+        .append_pair("name", code);
+    let Ok(resp) = client
+        .get(api)
+        .header("Accept", "application/json, text/plain, */*")
+        .send()
+        .await else { return Vec::new(); };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(val) = resp.json::<serde_json::Value>().await else { return Vec::new(); };
+    let data = val.get("data").and_then(|d| {
+        if d.is_array() { d.as_array() } else { d.get("list").and_then(|l| l.as_array()) }
+    });
+    let Some(arr) = data else { return Vec::new(); };
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for it in arr {
+        let dl = it.get("url")
+            .or_else(|| it.get("link"))
+            .or_else(|| it.get("download_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if dl.is_empty() || !seen.insert(dl.clone()) {
+            continue;
+        }
+        let Ok(parsed) = reqwest::Url::parse(&dl) else { continue; };
+        let host = parsed.host_str().unwrap_or("");
+        if parsed.scheme() != "https" || !is_allowed_xunlei_subtitle_host(host) {
+            continue;
+        }
+        let path_low = parsed.path().to_ascii_lowercase();
+        if !(path_low.ends_with(".srt") || path_low.ends_with(".vtt")) {
+            continue;
+        }
+        let name = it.get("name")
+            .or_else(|| it.get("filename"))
+            .or_else(|| it.get("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("迅雷字幕")
+            .trim();
+        let dur_ms = it.get("duration").and_then(|v| v.as_i64()).filter(|&d| d > 0);
+        let (diff_sec, matched) = match (expected_duration_sec.filter(|&s| s > 0), dur_ms) {
+            (Some(exp), Some(ms)) => {
+                let d = (ms / 1000 - exp).abs();
+                (Some(d), d <= 5)
+            }
+            _ => (None, false),
+        };
+        let langs: Vec<String> = it.get("languages")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let lower_name = name.to_ascii_lowercase();
+        let is_zh = langs.iter().any(|l| l.contains("中") || l.to_ascii_lowercase().contains("zh") || l.contains("chi"))
+            || name.contains("中") || lower_name.contains("chs") || lower_name.contains("cht") || lower_name.contains("chinese");
+        let lang = if name.contains("繁") || lower_name.contains("cht") {
+            "zh-TW"
+        } else if is_zh {
+            "zh-CN"
+        } else {
+            langs.first().map(String::as_str).unwrap_or("zh-CN")
+        };
+        let lang_label = if lang == "zh-TW" {
+            "繁体中文".to_string()
+        } else if is_zh {
+            "中文字幕".to_string()
+        } else {
+            langs.first().cloned().unwrap_or_else(|| "外挂字幕".to_string())
+        };
+        out.push(SubtitleSearchCandidate {
+            title: name.chars().take(150).collect(),
+            lang: lang.to_string(),
+            lang_label,
+            download_url: dl,
+            source: "迅雷字幕".to_string(),
+            duration_ms: dur_ms,
+            duration_diff_sec: diff_sec,
+            duration_matched: matched,
+        });
+    }
+    out
+}
+
+/// Search both Xunlei subtitle library and SubtitleCat concurrently, ranking exact duration match & Chinese first.
+pub async fn search_movie_subtitles(
+    number: &str,
+    expected_duration_sec: Option<i64>,
+) -> Result<Vec<SubtitleSearchCandidate>, String> {
+    let codes = crate::movie_extras::standard_jav_query_codes(number);
+    let query = codes.first().cloned().unwrap_or_else(|| number.trim().to_uppercase());
     if query.is_empty() { return Err("番号不能为空".into()); }
     let client = subtitlecat_client()?;
-    let mut search_url = reqwest::Url::parse("https://www.subtitlecat.com/index.php")
-        .map_err(|e| e.to_string())?;
-    search_url.query_pairs_mut().append_pair("search", query);
 
-    let html = client
-        .get(search_url)
-        .send()
-        .await
-        .map_err(|e| format!("连接字幕源失败：{e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("读取字幕搜索结果失败：{e}"))?;
+    let subcat_fut = async {
+        let mut search_url = match reqwest::Url::parse("https://www.subtitlecat.com/index.php") {
+            Ok(u) => u,
+            Err(_) => return Vec::new(),
+        };
+        search_url.query_pairs_mut().append_pair("search", &query);
 
-    // Extract top 4 matching detail page links `href="subs/..."`
-    let mut detail_links: Vec<String> = Vec::new();
-    for seg in html.split("href=\"").skip(1) {
-        let Some((href, _)) = seg.split_once('"') else { continue; };
-        if (href.starts_with("subs/") || href.starts_with("/subs/")) && href.ends_with(".html") {
-            let full = if href.starts_with('/') {
-                format!("https://www.subtitlecat.com{href}")
-            } else {
-                format!("https://www.subtitlecat.com/{href}")
-            };
-            if !detail_links.contains(&full) {
-                detail_links.push(full);
-                if detail_links.len() >= 4 { break; }
-            }
-        }
-    }
-
-    if detail_links.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Fetch up to 4 detail pages concurrently and extract ONLY zh-CN and zh-TW .srt downloads
-    let futures = detail_links.into_iter().map(|page_url| {
-        let c = client.clone();
-        async move {
-            let text = match c.get(&page_url).send().await {
-                Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
-                _ => return Vec::new(),
-            };
-            let page_title = page_url
-                .rsplit('/')
-                .next()
-                .unwrap_or("subtitle")
-                .trim_end_matches(".html")
-                .replace("%20", " ");
-            let mut found = Vec::new();
-            for seg in text.split("href=\"").skip(1) {
-                let Some((href, _)) = seg.split_once('"') else { continue; };
-                if !href.to_ascii_lowercase().ends_with(".srt") { continue; }
-                let (lang, lang_label) = if href.contains("-zh-CN.srt") || href.contains("_zh-CN.srt") {
-                    ("zh-CN", "简体中文")
-                } else if href.contains("-zh-TW.srt") || href.contains("_zh-TW.srt") {
-                    ("zh-TW", "繁体中文")
-                } else {
-                    continue;
-                };
-                let download_url = if href.starts_with("http://") || href.starts_with("https://") {
-                    href.to_string()
-                } else if href.starts_with('/') {
+        let Ok(resp) = client.get(search_url).send().await else { return Vec::new(); };
+        let html = resp.text().await.unwrap_or_default();
+        let mut detail_links: Vec<String> = Vec::new();
+        for seg in html.split("href=\"").skip(1) {
+            let Some((href, _)) = seg.split_once('"') else { continue; };
+            if (href.starts_with("subs/") || href.starts_with("/subs/")) && href.ends_with(".html") {
+                let full = if href.starts_with('/') {
                     format!("https://www.subtitlecat.com{href}")
                 } else {
                     format!("https://www.subtitlecat.com/{href}")
                 };
-                found.push(SubtitleSearchCandidate {
-                    title: format!("{page_title} [{lang_label}]"),
-                    lang: lang.to_string(),
-                    lang_label: lang_label.to_string(),
-                    download_url,
-                    source: "SubtitleCat".to_string(),
-                });
+                if !detail_links.contains(&full) {
+                    detail_links.push(full);
+                    if detail_links.len() >= 4 { break; }
+                }
             }
-            found
         }
-    });
+        if detail_links.is_empty() { return Vec::new(); }
+
+        let futures = detail_links.into_iter().map(|page_url| {
+            let c = client.clone();
+            async move {
+                let text = match c.get(&page_url).send().await {
+                    Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+                    _ => return Vec::new(),
+                };
+                let page_title = page_url
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("subtitle")
+                    .trim_end_matches(".html")
+                    .replace("%20", " ");
+                let mut found = Vec::new();
+                for seg in text.split("href=\"").skip(1) {
+                    let Some((href, _)) = seg.split_once('"') else { continue; };
+                    if !href.to_ascii_lowercase().ends_with(".srt") { continue; }
+                    let (lang, lang_label) = if href.contains("-zh-CN.srt") || href.contains("_zh-CN.srt") {
+                        ("zh-CN", "简体中文")
+                    } else if href.contains("-zh-TW.srt") || href.contains("_zh-TW.srt") {
+                        ("zh-TW", "繁体中文")
+                    } else {
+                        continue;
+                    };
+                    let download_url = if href.starts_with("http://") || href.starts_with("https://") {
+                        href.to_string()
+                    } else if href.starts_with('/') {
+                        format!("https://www.subtitlecat.com{href}")
+                    } else {
+                        format!("https://www.subtitlecat.com/{href}")
+                    };
+                    found.push(SubtitleSearchCandidate {
+                        title: format!("{page_title} [{lang_label}]"),
+                        lang: lang.to_string(),
+                        lang_label: lang_label.to_string(),
+                        download_url,
+                        source: "SubtitleCat".to_string(),
+                        duration_ms: None,
+                        duration_diff_sec: None,
+                        duration_matched: false,
+                    });
+                }
+                found
+            }
+        });
+        let mut out = Vec::new();
+        for batch in futures_util::future::join_all(futures).await {
+            out.extend(batch);
+        }
+        out
+    };
+
+    let xunlei_fut = async {
+        let mut items = Vec::new();
+        for c in &codes {
+            let list = search_xunlei_subtitles(&client, c, expected_duration_sec).await;
+            if !list.is_empty() {
+                items = list;
+                break;
+            }
+        }
+        items
+    };
+
+    let (subcat_list, xunlei_list) = tokio::join!(subcat_fut, xunlei_fut);
 
     let mut all: Vec<SubtitleSearchCandidate> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for batch in futures_util::future::join_all(futures).await {
-        for item in batch {
-            if seen.insert(item.download_url.clone()) {
-                all.push(item);
-            }
+    for item in xunlei_list.into_iter().chain(subcat_list.into_iter()) {
+        if seen.insert(item.download_url.clone()) {
+            all.push(item);
         }
     }
-    // Prefer Simplified Chinese first, then Traditional Chinese
-    all.sort_by_key(|c| if c.lang == "zh-CN" { 0 } else { 1 });
+
+    // Priority: exact duration matched (<= 5s) -> Chinese lang -> smallest duration diff -> Xunlei/SubtitleCat
+    all.sort_by(|a, b| {
+        b.duration_matched
+            .cmp(&a.duration_matched)
+            .then_with(|| {
+                let azh = a.lang.starts_with("zh") || a.lang_label.contains("中文");
+                let bzh = b.lang.starts_with("zh") || b.lang_label.contains("中文");
+                bzh.cmp(&azh)
+            })
+            .then_with(|| {
+                a.duration_diff_sec
+                    .unwrap_or(i64::MAX)
+                    .cmp(&b.duration_diff_sec.unwrap_or(i64::MAX))
+            })
+            .then_with(|| {
+                let ao = if a.lang == "zh-CN" { 0 } else { 1 };
+                let bo = if b.lang == "zh-CN" { 0 } else { 1 };
+                ao.cmp(&bo)
+            })
+    });
     Ok(all)
+}
+
+fn decode_subtitle_bytes(raw: &[u8]) -> String {
+    let trimmed = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        if let Ok(s) = std::str::from_utf8(&raw[3..]) {
+            return s.to_string();
+        }
+        &raw[3..]
+    } else {
+        raw
+    };
+    if let Ok(s) = std::str::from_utf8(trimmed) {
+        return s.to_string();
+    }
+    let (gbk_decoded, _, had_gbk_err) = encoding_rs::GBK.decode(trimmed);
+    if !had_gbk_err {
+        return gbk_decoded.into_owned();
+    }
+    let (big5_decoded, _, had_big5_err) = encoding_rs::BIG5.decode(trimmed);
+    if !had_big5_err {
+        return big5_decoded.into_owned();
+    }
+    String::from_utf8_lossy(trimmed).into_owned()
 }
 
 pub async fn download_and_save_subtitle(
@@ -573,11 +731,14 @@ pub async fn download_and_save_subtitle(
     name: &str,
     lang: &str,
     download_url: &str,
-) -> Result<(String, String, String, String, String), String> {
+    source_hint: Option<&str>,
+) -> Result<(String, String, String, String, String, String), String> {
     let parsed = reqwest::Url::parse(download_url.trim()).map_err(|_| "无效的字幕下载地址".to_string())?;
     let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-    if parsed.scheme() != "https" || !(host == "subtitlecat.com" || host == "www.subtitlecat.com") {
-        return Err("仅允许从已验证的 SubtitleCat 下载字幕".into());
+    let is_subcat = host == "subtitlecat.com" || host == "www.subtitlecat.com";
+    let is_xunlei = is_allowed_xunlei_subtitle_host(&host);
+    if parsed.scheme() != "https" || (!is_subcat && !is_xunlei) {
+        return Err("仅允许从已验证的 SubtitleCat 或迅雷字幕 CDN 下载字幕".into());
     }
     let client = subtitlecat_client()?;
     let resp = client
@@ -592,19 +753,26 @@ pub async fn download_and_save_subtitle(
     if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
         return Err("字幕文件为空或超过 4MB 限制".into());
     }
-    let raw_text = String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').to_string();
-    if !raw_text.contains("-->") {
-        return Err("下载到的文件不是有效的 SRT 字幕".into());
+    let raw_text = decode_subtitle_bytes(&bytes).trim_start_matches('\u{feff}').to_string();
+    if !raw_text.contains("-->") && !raw_text.starts_with("WEBVTT") {
+        return Err("下载到的文件不是有效的 SRT/VTT 字幕".into());
     }
     let clean_num = normalize_jav_number(number).unwrap_or_else(|| number.trim().to_uppercase());
     let clean_name = if name.trim().is_empty() { format!("{clean_num}.{lang}.srt") } else { name.trim().to_string() };
     let clean_lang = if lang.trim().is_empty() { "zh-CN".to_string() } else { lang.trim().to_string() };
+    let source = if let Some(h) = source_hint.map(str::trim).filter(|s| !s.is_empty()) {
+        h.to_string()
+    } else if is_xunlei {
+        "迅雷字幕".to_string()
+    } else {
+        "SubtitleCat".to_string()
+    };
     let id = format!(
         "sub_{}_{}",
         clean_num.to_ascii_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), ""),
         chrono::Utc::now().timestamp_millis()
     );
-    Ok((id, clean_num, clean_name, clean_lang, raw_text))
+    Ok((id, clean_num, clean_name, clean_lang, source, raw_text))
 }
 
 pub fn save_movie_subtitle_row(
@@ -1503,7 +1671,7 @@ pub async fn scrape_from_fc2(number: &str) -> Result<MovieMetadata, String> {
         return Err(format!("FC2 官方页面未找到作品（软404）【{number}】"));
     }
     let parsed = parse_fc2_html(&html, id, &url)?;
-    Ok(MovieMetadata { number: number.to_string(), asset_id: None, title: parsed.title.clone(), original_title: Some(parsed.title), actors: vec![], maker: Some("FC2".to_string()), label: None, series: None, director: None, release_date: parsed.release_date, duration_minutes: None, cover_url: parsed.cover, sample_images: parsed.samples, tags: vec!["FC2".to_string()], source: "fc2-official".to_string(), updated_at: chrono::Utc::now().timestamp() })
+    Ok(MovieMetadata { number: number.to_string(), asset_id: None, title: parsed.title.clone(), original_title: Some(parsed.title), actors: vec![], maker: Some("FC2".to_string()), label: None, series: None, director: None, release_date: parsed.release_date, duration_minutes: None, cover_url: parsed.cover, sample_images: parsed.samples, tags: vec!["FC2".to_string()], source: "fc2-official".to_string(), updated_at: chrono::Utc::now().timestamp(), translated_title: None })
 }
 
 /// Fetch metadata from JavBus by JAV number (Direct, fast, highly reliable for commercial JAV).
@@ -1667,6 +1835,7 @@ pub async fn scrape_from_javbus(number: &str) -> Result<MovieMetadata, String> {
         tags,
         source: "javbus".to_string(),
         updated_at: now,
+        translated_title: None,
     })
 }
 
@@ -1773,6 +1942,7 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
                 tags: if number.starts_with("FC2-") { vec!["FC2".to_string()] } else { Vec::new() },
                 source: "javdb".to_string(),
                 updated_at: chrono::Utc::now().timestamp(),
+                translated_title: None,
             });
         }
         return Err(format!("JavDB 详情页需要验证或加载失败【{number}】"));
@@ -2002,6 +2172,7 @@ pub async fn scrape_from_javdb(number: &str) -> Result<MovieMetadata, String> {
         tags,
         source: "javdb".to_string(),
         updated_at: now,
+        translated_title: None,
     })
 }
 
@@ -2090,6 +2261,7 @@ pub async fn scrape_from_caribbeancom(number: &str) -> Result<MovieMetadata, Str
         tags: vec!["无码".to_string(), "加勒比".to_string()],
         source: "caribbeancom".to_string(),
         updated_at: now,
+        translated_title: None,
     })
 }
 
@@ -2180,6 +2352,7 @@ pub async fn scrape_from_1pondo(number: &str) -> Result<MovieMetadata, String> {
         tags: vec!["无码".to_string(), "一本道".to_string()],
         source: "1pondo".to_string(),
         updated_at: now,
+        translated_title: None,
     })
 }
 
@@ -2349,6 +2522,7 @@ pub async fn scrape_from_jav321(number: &str) -> Result<MovieMetadata, String> {
         tags,
         source: "jav321".to_string(),
         updated_at: chrono::Utc::now().timestamp(),
+        translated_title: None,
     })
 }
 
@@ -2416,6 +2590,7 @@ pub async fn scrape_from_avwiki(number: &str) -> Result<MovieMetadata, String> {
         tags: vec!["AV-Wiki".to_string()],
         source: "avwiki".to_string(),
         updated_at: chrono::Utc::now().timestamp(),
+        translated_title: None,
     })
 }
 
@@ -2622,6 +2797,7 @@ pub async fn scrape_from_javfree(number: &str) -> Result<MovieMetadata, String> 
         tags: if number.starts_with("FC2-") { vec!["FC2".to_string()] } else { Vec::new() },
         source: "javfree".to_string(),
         updated_at: chrono::Utc::now().timestamp(),
+        translated_title: None,
     })
 }
 
@@ -2730,8 +2906,8 @@ pub fn save_movie_metadata(conn: &Connection, meta: &MovieMetadata) -> Result<()
         "INSERT INTO movie_metadata (
             number, asset_id, title, original_title, actors_json, maker, label, series,
             director, release_date, duration_minutes, cover_url, sample_images_json,
-            tags_json, source, updated_at, verification_version
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1)
+            tags_json, source, updated_at, verification_version, translated_title
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1, ?17)
         ON CONFLICT(number) DO UPDATE SET
             asset_id = COALESCE(excluded.asset_id, movie_metadata.asset_id),
             title = excluded.title,
@@ -2748,7 +2924,8 @@ pub fn save_movie_metadata(conn: &Connection, meta: &MovieMetadata) -> Result<()
             tags_json = excluded.tags_json,
             source = excluded.source,
             updated_at = excluded.updated_at,
-            verification_version = excluded.verification_version",
+            verification_version = excluded.verification_version,
+            translated_title = COALESCE(excluded.translated_title, movie_metadata.translated_title)",
         params![
             meta.number,
             meta.asset_id,
@@ -2765,7 +2942,8 @@ pub fn save_movie_metadata(conn: &Connection, meta: &MovieMetadata) -> Result<()
             samples_json,
             tags_json,
             meta.source,
-            meta.updated_at
+            meta.updated_at,
+            meta.translated_title
         ],
     )?;
 
@@ -2781,7 +2959,7 @@ pub fn get_movie_metadata(conn: &Connection, identifier: &str) -> Result<Option<
     let mut stmt = conn.prepare(
         "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
                 director, release_date, duration_minutes, cover_url, sample_images_json,
-                tags_json, source, updated_at
+                tags_json, source, updated_at, translated_title
          FROM movie_metadata
          WHERE (number = ?1 OR asset_id = ?2 OR number IN (SELECT number FROM movie_asset_bindings WHERE asset_id = ?2))
            AND verification_version = 1
@@ -2790,30 +2968,7 @@ pub fn get_movie_metadata(conn: &Connection, identifier: &str) -> Result<Option<
          LIMIT 1"
     )?;
 
-    let res = stmt.query_row(params![upper, identifier], |row| {
-        let actors_json: String = row.get(4)?;
-        let sample_json: String = row.get(12)?;
-        let tags_json: String = row.get(13)?;
-
-        Ok(MovieMetadata {
-            number: row.get(0)?,
-            asset_id: row.get(1)?,
-            title: row.get(2)?,
-            original_title: row.get(3)?,
-            actors: serde_json::from_str(&actors_json).unwrap_or_default(),
-            maker: row.get(5)?,
-            label: row.get(6)?,
-            series: row.get(7)?,
-            director: row.get(8)?,
-            release_date: row.get(9)?,
-            duration_minutes: row.get(10)?,
-            cover_url: row.get(11)?,
-            sample_images: serde_json::from_str(&sample_json).unwrap_or_default(),
-            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            source: row.get(14)?,
-            updated_at: row.get(15)?,
-        })
-    }).optional()?;
+    let res = stmt.query_row(params![upper, identifier], metadata_from_row).optional()?;
 
     // When addressed by asset ID, return that exact file, not the movie's first edition.
     Ok(res.map(|mut meta| {
@@ -2822,13 +2977,31 @@ pub fn get_movie_metadata(conn: &Connection, identifier: &str) -> Result<Option<
     }))
 }
 
+pub fn set_movie_translated_title(
+    conn: &Connection,
+    number: &str,
+    translated_title: Option<&str>,
+) -> Result<Option<MovieMetadata>, rusqlite::Error> {
+    ensure_scraper_schema(conn)?;
+    let clean_num = normalize_jav_number(number).unwrap_or_else(|| number.trim().to_uppercase());
+    let clean_tr = translated_title
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    conn.execute(
+        "UPDATE movie_metadata SET translated_title = ?1 WHERE number = ?2",
+        params![clean_tr, clean_num],
+    )?;
+    get_movie_metadata(conn, &clean_num)
+}
+
 /// List recently scraped movie metadata
 pub fn list_movie_metadata(conn: &Connection, limit: u32, offset: u32) -> Result<Vec<MovieMetadata>, rusqlite::Error> {
     ensure_scraper_schema(conn)?;
     let mut stmt = conn.prepare(
         "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
                 director, release_date, duration_minutes, cover_url, sample_images_json,
-                tags_json, source, updated_at
+                tags_json, source, updated_at, translated_title
          FROM movie_metadata
          WHERE verification_version = 1 AND source NOT IN ('javdb_not_found', 'not_found', '')
            AND cover_url IS NOT NULL AND cover_url != ''
@@ -2836,30 +3009,7 @@ pub fn list_movie_metadata(conn: &Connection, limit: u32, offset: u32) -> Result
          LIMIT ?1 OFFSET ?2"
     )?;
 
-    let rows = stmt.query_map(params![limit, offset], |row| {
-        let actors_json: String = row.get(4)?;
-        let sample_json: String = row.get(12)?;
-        let tags_json: String = row.get(13)?;
-
-        Ok(MovieMetadata {
-            number: row.get(0)?,
-            asset_id: row.get(1)?,
-            title: row.get(2)?,
-            original_title: row.get(3)?,
-            actors: serde_json::from_str(&actors_json).unwrap_or_default(),
-            maker: row.get(5)?,
-            label: row.get(6)?,
-            series: row.get(7)?,
-            director: row.get(8)?,
-            release_date: row.get(9)?,
-            duration_minutes: row.get(10)?,
-            cover_url: row.get(11)?,
-            sample_images: serde_json::from_str(&sample_json).unwrap_or_default(),
-            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            source: row.get(14)?,
-            updated_at: row.get(15)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![limit, offset], metadata_from_row)?;
 
     rows.collect::<Result<Vec<_>, _>>()
 }
@@ -2874,16 +3024,18 @@ pub struct MovieLibraryPage {
     pub actors: Vec<String>,
 }
 
-fn metadata_from_row(row: &rusqlite::Row<'_>) -> Result<MovieMetadata, rusqlite::Error> {
+pub(crate) fn metadata_from_row(row: &rusqlite::Row<'_>) -> Result<MovieMetadata, rusqlite::Error> {
     let actors_json: String = row.get(4)?;
     let sample_json: String = row.get(12)?;
     let tags_json: String = row.get(13)?;
+    let translated_title: Option<String> = row.get(16).ok().flatten();
     Ok(MovieMetadata {
         number: row.get(0)?, asset_id: row.get(1)?, title: row.get(2)?, original_title: row.get(3)?,
         actors: serde_json::from_str(&actors_json).unwrap_or_default(), maker: row.get(5)?, label: row.get(6)?,
         series: row.get(7)?, director: row.get(8)?, release_date: row.get(9)?, duration_minutes: row.get(10)?,
         cover_url: row.get(11)?, sample_images: serde_json::from_str(&sample_json).unwrap_or_default(),
         tags: serde_json::from_str(&tags_json).unwrap_or_default(), source: row.get(14)?, updated_at: row.get(15)?,
+        translated_title,
     })
 }
 
@@ -2920,9 +3072,9 @@ pub fn query_movie_library_filtered(conn: &Connection, query: &str, maker: &str,
     let a = actor.trim();
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
     if !q.is_empty() {
-        where_sql.push_str(" AND (lower(number) LIKE lower(?) ESCAPE '\\' OR lower(title) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(original_title,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(maker,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(label,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(series,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(director,'')) LIKE lower(?) ESCAPE '\\' OR lower(actors_json) LIKE lower(?) ESCAPE '\\' OR lower(tags_json) LIKE lower(?) ESCAPE '\\' OR EXISTS (SELECT 1 FROM movie_cast qc JOIN performers qp ON qp.id=qc.person_id WHERE qc.number=movie_metadata.number AND (lower(qp.name) LIKE lower(?) ESCAPE '\\' OR EXISTS (SELECT 1 FROM json_each(qp.aliases_json) qa WHERE lower(CAST(qa.value AS TEXT)) LIKE lower(?) ESCAPE '\\'))))");
+        where_sql.push_str(" AND (lower(number) LIKE lower(?) ESCAPE '\\' OR lower(title) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(translated_title,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(original_title,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(maker,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(label,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(series,'')) LIKE lower(?) ESCAPE '\\' OR lower(COALESCE(director,'')) LIKE lower(?) ESCAPE '\\' OR lower(actors_json) LIKE lower(?) ESCAPE '\\' OR lower(tags_json) LIKE lower(?) ESCAPE '\\' OR EXISTS (SELECT 1 FROM movie_cast qc JOIN performers qp ON qp.id=qc.person_id WHERE qc.number=movie_metadata.number AND (lower(qp.name) LIKE lower(?) ESCAPE '\\' OR EXISTS (SELECT 1 FROM json_each(qp.aliases_json) qa WHERE lower(CAST(qa.value AS TEXT)) LIKE lower(?) ESCAPE '\\'))))");
         let pat = format!("%{}%", escape_like_pattern(q));
-        for _ in 0..11 { args.push(Box::new(pat.clone())); }
+        for _ in 0..12 { args.push(Box::new(pat.clone())); }
     }
     if !m.is_empty() { where_sql.push_str(" AND maker = ?"); args.push(Box::new(m.to_string())); }
     if !a.is_empty() {
@@ -2960,7 +3112,7 @@ pub fn query_movie_library_filtered(conn: &Connection, query: &str, maker: &str,
         "updated_at_asc" | "added_asc" => "updated_at ASC, number ASC",
         _ => "updated_at DESC, number ASC",
     };
-    let sql = format!("SELECT number, asset_id, title, original_title, actors_json, maker, label, series, director, release_date, duration_minutes, cover_url, sample_images_json, tags_json, source, updated_at FROM movie_metadata{where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?");
+    let sql = format!("SELECT number, asset_id, title, original_title, actors_json, maker, label, series, director, release_date, duration_minutes, cover_url, sample_images_json, tags_json, source, updated_at, translated_title FROM movie_metadata{where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?");
     let mut stmt = conn.prepare(&sql)?;
     let mut page_args: Vec<Box<dyn ToSql>> = args;
     page_args.push(Box::new(limit.min(100)));
@@ -2989,7 +3141,7 @@ pub fn get_random_featured_movies(conn: &Connection, limit: u32) -> Result<Vec<M
     let mut stmt = conn.prepare(
         "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
                 director, release_date, duration_minutes, cover_url, sample_images_json,
-                tags_json, source, updated_at
+                tags_json, source, updated_at, translated_title
          FROM movie_metadata
          WHERE verification_version = 1
            AND source NOT IN ('javdb_not_found','not_found','')
@@ -3317,34 +3469,12 @@ pub fn get_related_movies(conn: &Connection, number: &str, limit: u32) -> Result
             let mut stmt = conn.prepare(
                 "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
                         director, release_date, duration_minutes, cover_url, sample_images_json,
-                        tags_json, source, updated_at
+                        tags_json, source, updated_at, translated_title
                  FROM movie_metadata
                  WHERE verification_version = 1 AND series = ?1 AND number != ?2
                  LIMIT ?3"
             )?;
-            let rows = stmt.query_map(params![series, current.number, limit], |row| {
-                let actors_json: String = row.get(4)?;
-                let sample_json: String = row.get(12)?;
-                let tags_json: String = row.get(13)?;
-                Ok(MovieMetadata {
-                    number: row.get(0)?,
-                    asset_id: row.get(1)?,
-                    title: row.get(2)?,
-                    original_title: row.get(3)?,
-                    actors: serde_json::from_str(&actors_json).unwrap_or_default(),
-                    maker: row.get(5)?,
-                    label: row.get(6)?,
-                    series: row.get(7)?,
-                    director: row.get(8)?,
-                    release_date: row.get(9)?,
-                    duration_minutes: row.get(10)?,
-                    cover_url: row.get(11)?,
-                    sample_images: serde_json::from_str(&sample_json).unwrap_or_default(),
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    source: row.get(14)?,
-                    updated_at: row.get(15)?,
-                })
-            })?;
+            let rows = stmt.query_map(params![series, current.number, limit], metadata_from_row)?;
             for r in rows.flatten() {
                 if seen_numbers.insert(r.number.clone()) {
                     related.push(r);
@@ -3362,34 +3492,12 @@ pub fn get_related_movies(conn: &Connection, number: &str, limit: u32) -> Result
         let mut stmt = conn.prepare(
             "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
                     director, release_date, duration_minutes, cover_url, sample_images_json,
-                    tags_json, source, updated_at
+                    tags_json, source, updated_at, translated_title
              FROM movie_metadata
              WHERE verification_version = 1 AND actors_json LIKE ?1 AND number != ?2
              LIMIT ?3"
         )?;
-        let rows = stmt.query_map(params![pattern, current.number, limit], |row| {
-            let actors_json: String = row.get(4)?;
-            let sample_json: String = row.get(12)?;
-            let tags_json: String = row.get(13)?;
-            Ok(MovieMetadata {
-                number: row.get(0)?,
-                asset_id: row.get(1)?,
-                title: row.get(2)?,
-                original_title: row.get(3)?,
-                actors: serde_json::from_str(&actors_json).unwrap_or_default(),
-                maker: row.get(5)?,
-                label: row.get(6)?,
-                series: row.get(7)?,
-                director: row.get(8)?,
-                release_date: row.get(9)?,
-                duration_minutes: row.get(10)?,
-                cover_url: row.get(11)?,
-                sample_images: serde_json::from_str(&sample_json).unwrap_or_default(),
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                source: row.get(14)?,
-                updated_at: row.get(15)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![pattern, current.number, limit], metadata_from_row)?;
         for r in rows.flatten() {
             if seen_numbers.insert(r.number.clone()) {
                 related.push(r);
@@ -3406,34 +3514,12 @@ pub fn get_related_movies(conn: &Connection, number: &str, limit: u32) -> Result
             let mut stmt = conn.prepare(
                 "SELECT number, asset_id, title, original_title, actors_json, maker, label, series,
                         director, release_date, duration_minutes, cover_url, sample_images_json,
-                        tags_json, source, updated_at
+                        tags_json, source, updated_at, translated_title
                  FROM movie_metadata
                  WHERE verification_version = 1 AND maker = ?1 AND number != ?2
                  LIMIT ?3"
             )?;
-            let rows = stmt.query_map(params![maker, current.number, (limit as usize - related.len()) as u32], |row| {
-                let actors_json: String = row.get(4)?;
-                let sample_json: String = row.get(12)?;
-                let tags_json: String = row.get(13)?;
-                Ok(MovieMetadata {
-                    number: row.get(0)?,
-                    asset_id: row.get(1)?,
-                    title: row.get(2)?,
-                    original_title: row.get(3)?,
-                    actors: serde_json::from_str(&actors_json).unwrap_or_default(),
-                    maker: row.get(5)?,
-                    label: row.get(6)?,
-                    series: row.get(7)?,
-                    director: row.get(8)?,
-                    release_date: row.get(9)?,
-                    duration_minutes: row.get(10)?,
-                    cover_url: row.get(11)?,
-                    sample_images: serde_json::from_str(&sample_json).unwrap_or_default(),
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                    source: row.get(14)?,
-                    updated_at: row.get(15)?,
-                })
-            })?;
+            let rows = stmt.query_map(params![maker, current.number, (limit as usize - related.len()) as u32], metadata_from_row)?;
             for r in rows.flatten() {
                 if seen_numbers.insert(r.number.clone()) {
                     related.push(r);
@@ -4469,7 +4555,7 @@ mod tests {
             original_title: None, actors: vec![], maker: None, label: None, series: None,
             director: None, release_date: None, duration_minutes: None,
             cover_url: Some("https://example.com/cover.jpg".into()), sample_images: vec![],
-            tags: vec![], source: "javbus".into(), updated_at: 123,
+            tags: vec![], source: "javbus".into(), updated_at: 123, translated_title: None,
         }
     }
 

@@ -476,6 +476,30 @@ struct MoviePerformerDetailSheet: View {
                 Text("\(detail?.total ?? person.movieCount) 部库内作品")
                     .font(.caption)
                     .foregroundStyle(.purple)
+
+                if person.twitterUrl != nil || person.instagramUrl != nil {
+                    HStack(spacing: 8) {
+                        if let raw = person.twitterUrl, let url = URL(string: raw), !raw.isEmpty {
+                            Link(destination: url) {
+                                Label("Twitter/X", systemImage: "link")
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.blue.opacity(0.16), in: Capsule())
+                            }
+                        }
+                        if let raw = person.instagramUrl, let url = URL(string: raw), !raw.isEmpty {
+                            Link(destination: url) {
+                                Label("Instagram", systemImage: "camera")
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.pink.opacity(0.16), in: Capsule())
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                }
             }
             Spacer()
         }
@@ -502,7 +526,7 @@ struct MoviePerformerDetailSheet: View {
                 .aspectRatio(3 / 2, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
 
-                Text(movie.title)
+                Text(movie.translatedTitle?.isEmpty == false ? movie.translatedTitle! : movie.title)
                     .font(.caption.weight(.semibold))
                     .lineLimit(2)
                     .foregroundStyle(.primary)

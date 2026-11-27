@@ -29,6 +29,10 @@ pub struct UniversalMagnetItem {
     pub tracker: String,
     pub pub_date: String,
     pub timestamp: i64,
+    #[serde(default)]
+    pub cn_sub: bool,
+    #[serde(default)]
+    pub hd: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +226,8 @@ async fn query_knaben(client: &reqwest::Client, query: &str, category: &str) -> 
                 .unwrap_or("Knaben")
                 .to_string();
             let (pub_date, timestamp) = parse_rfc3339_or_rfc2822_ts(h.get("date").and_then(Value::as_str).unwrap_or(""));
+            let cn_sub = title.contains("中文字幕") || title.contains("中字");
+            let hd = title.to_ascii_uppercase().contains("1080P") || title.to_ascii_uppercase().contains("4K");
             out.push(UniversalMagnetItem {
                 title,
                 magnet,
@@ -235,6 +241,8 @@ async fn query_knaben(client: &reqwest::Client, query: &str, category: &str) -> 
                 tracker,
                 pub_date,
                 timestamp,
+                cn_sub,
+                hd,
             });
         }
     }
@@ -329,6 +337,8 @@ async fn query_tpb(client: &reqwest::Client, query: &str, category: &str) -> (Ve
             Some('5') => "成人",
             _ => "综合",
         };
+        let cn_sub = title.contains("中文字幕") || title.contains("中字");
+        let hd = title.to_ascii_uppercase().contains("1080P") || title.to_ascii_uppercase().contains("4K");
         out.push(UniversalMagnetItem {
             magnet: build_magnet(&hash, &title),
             title,
@@ -342,6 +352,8 @@ async fn query_tpb(client: &reqwest::Client, query: &str, category: &str) -> (Ve
             tracker: "The Pirate Bay".to_string(),
             pub_date,
             timestamp,
+            cn_sub,
+            hd,
         });
     }
     let count = out.len();
@@ -368,25 +380,31 @@ async fn query_nyaa_family(
     cat_code: &str,
 ) -> (Vec<UniversalMagnetItem>, MagnetSourceStat) {
     let t0 = Instant::now();
-    let url = format!("https://{host}/?page=rss&q={}&c={cat_code}&s=seeders&o=desc", urlencoding(query));
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                Vec::new(),
-                MagnetSourceStat {
-                    source: source_id.to_string(),
-                    label: label.to_string(),
-                    count: 0,
-                    ok: false,
-                    elapsed_ms: t0.elapsed().as_millis() as u64,
-                    error: Some(e.to_string()),
-                },
-            );
-        }
+    let hosts: Vec<&str> = if host == "sukebei.nyaa.si" {
+        vec!["sukebei.nyaa.si", "sukebei.nyaa.net"]
+    } else {
+        vec![host]
     };
-    if !resp.status().is_success() {
-        let code = resp.status();
+    let mut xml_opt: Option<String> = None;
+    let mut last_err = String::new();
+    for h in hosts {
+        let url = format!("https://{h}/?page=rss&q={}&c={cat_code}&s=seeders&o=desc", urlencoding(query));
+        match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(s) = r.text().await {
+                    xml_opt = Some(s);
+                    break;
+                }
+            }
+            Ok(r) => {
+                last_err = format!("HTTP {}", r.status());
+            }
+            Err(e) => {
+                last_err = e.to_string();
+            }
+        }
+    }
+    let Some(xml) = xml_opt else {
         return (
             Vec::new(),
             MagnetSourceStat {
@@ -395,25 +413,9 @@ async fn query_nyaa_family(
                 count: 0,
                 ok: false,
                 elapsed_ms: t0.elapsed().as_millis() as u64,
-                error: Some(format!("HTTP {code}")),
+                error: Some(if last_err.is_empty() { "请求失败".to_string() } else { last_err }),
             },
         );
-    }
-    let xml = match resp.text().await {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                Vec::new(),
-                MagnetSourceStat {
-                    source: source_id.to_string(),
-                    label: label.to_string(),
-                    count: 0,
-                    ok: false,
-                    elapsed_ms: t0.elapsed().as_millis() as u64,
-                    error: Some(e.to_string()),
-                },
-            );
-        }
     };
     let Ok(doc) = roxmltree::Document::parse(&xml) else {
         return (
@@ -457,6 +459,8 @@ async fn query_nyaa_family(
         }
         let size_bytes = parse_size_text_to_bytes(&size_raw);
         let (pub_date, timestamp) = parse_rfc3339_or_rfc2822_ts(&pub_raw);
+        let cn_sub = title.contains("中文字幕") || title.contains("中字");
+        let hd = title.to_ascii_uppercase().contains("1080P") || title.to_ascii_uppercase().contains("4K");
         out.push(UniversalMagnetItem {
             magnet: build_magnet(&hash, &title),
             title,
@@ -470,6 +474,8 @@ async fn query_nyaa_family(
             tracker: label.to_string(),
             pub_date,
             timestamp,
+            cn_sub,
+            hd,
         });
     }
     let count = out.len();
@@ -669,6 +675,8 @@ async fn query_bt4g(client: &reqwest::Client, query: &str, category: &str, sort:
         }
         let (size_bytes, size_text) = parse_size_from_description(&desc);
         let (pub_date, timestamp) = parse_rfc3339_or_rfc2822_ts(&pub_raw);
+        let cn_sub = title.contains("中文字幕") || title.contains("中字");
+        let hd = title.to_ascii_uppercase().contains("1080P") || title.to_ascii_uppercase().contains("4K");
         out.push(UniversalMagnetItem {
             title,
             magnet,
@@ -682,6 +690,8 @@ async fn query_bt4g(client: &reqwest::Client, query: &str, category: &str, sort:
             tracker: "BT4G".to_string(),
             pub_date,
             timestamp,
+            cn_sub,
+            hd,
         });
     }
     let count = out.len();
@@ -789,6 +799,8 @@ async fn query_dmhy(client: &reqwest::Client, query: &str) -> (Vec<UniversalMagn
             continue;
         }
         let (pub_date, timestamp) = parse_rfc3339_or_rfc2822_ts(&pub_raw);
+        let cn_sub = title.contains("中文字幕") || title.contains("中字");
+        let hd = title.to_ascii_uppercase().contains("1080P") || title.to_ascii_uppercase().contains("4K");
         out.push(UniversalMagnetItem {
             title,
             magnet,
@@ -802,6 +814,8 @@ async fn query_dmhy(client: &reqwest::Client, query: &str) -> (Vec<UniversalMagn
             tracker: "动漫花园".to_string(),
             pub_date,
             timestamp,
+            cn_sub,
+            hd,
         });
     }
     let count = out.len();
@@ -818,6 +832,119 @@ async fn query_dmhy(client: &reqwest::Client, query: &str) -> (Vec<UniversalMagn
     )
 }
 
+fn convert_movie_magnets_to_universal(
+    list: Vec<crate::performers::MovieMagnetItem>,
+    source_id: &str,
+    tracker_label: &str,
+) -> Vec<UniversalMagnetItem> {
+    list.into_iter()
+        .filter_map(|m| {
+            let hash = extract_info_hash_from_magnet(&m.magnet);
+            if hash.is_empty() || m.title.is_empty() {
+                return None;
+            }
+            let size_bytes = m.size.as_deref().map(parse_size_text_to_bytes).unwrap_or(0);
+            let cn_sub = m.tags.iter().any(|t| t.contains("字幕") || t.contains("中字"))
+                || m.title.contains("中文字幕")
+                || m.title.contains("中字");
+            let hd = m.tags.iter().any(|t| t.contains("高清") || t.eq_ignore_ascii_case("HD"))
+                || m.title.to_ascii_uppercase().contains("1080P")
+                || m.title.to_ascii_uppercase().contains("4K");
+            let pub_date = m.date.clone().unwrap_or_default();
+            Some(UniversalMagnetItem {
+                title: m.title,
+                magnet: m.magnet,
+                info_hash: hash,
+                size_bytes,
+                size_text: m.size.unwrap_or_else(|| format_bytes(size_bytes)),
+                seeders: m.seeders.map(|s| s as i64).unwrap_or(if source_id == "javbus" { 2 } else { 1 }),
+                leechers: 0,
+                category: "番号磁力".to_string(),
+                source: source_id.to_string(),
+                tracker: tracker_label.to_string(),
+                pub_date,
+                timestamp: 0,
+                cn_sub,
+                hd,
+            })
+        })
+        .collect()
+}
+
+async fn query_javbus_source(query: &str) -> (Vec<UniversalMagnetItem>, MagnetSourceStat) {
+    let t0 = Instant::now();
+    let codes = crate::movie_extras::standard_jav_query_codes(query);
+    let mut last_err: Option<String> = None;
+    for c in &codes {
+        match crate::movie_extras::fetch_javbus_magnets(c).await {
+            Ok(list) if !list.is_empty() => {
+                let items = convert_movie_magnets_to_universal(list, "javbus", "JavBus");
+                let count = items.len();
+                return (
+                    items,
+                    MagnetSourceStat {
+                        source: "javbus".to_string(),
+                        label: "JavBus".to_string(),
+                        count,
+                        ok: true,
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                        error: None,
+                    },
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+    (
+        Vec::new(),
+        MagnetSourceStat {
+            source: "javbus".to_string(),
+            label: "JavBus".to_string(),
+            count: 0,
+            ok: last_err.is_none(),
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            error: last_err,
+        },
+    )
+}
+
+async fn query_btdig_source(query: &str) -> (Vec<UniversalMagnetItem>, MagnetSourceStat) {
+    let t0 = Instant::now();
+    let codes = crate::movie_extras::standard_jav_query_codes(query);
+    let target = codes.first().map(String::as_str).unwrap_or(query);
+    match crate::movie_extras::fetch_btdig_magnets(target).await {
+        Ok(list) => {
+            let items = convert_movie_magnets_to_universal(list, "btdig", "BTDig");
+            let count = items.len();
+            (
+                items,
+                MagnetSourceStat {
+                    source: "btdig".to_string(),
+                    label: "BTDig DHT".to_string(),
+                    count,
+                    ok: true,
+                    elapsed_ms: t0.elapsed().as_millis() as u64,
+                    error: None,
+                },
+            )
+        }
+        Err(e) => (
+            Vec::new(),
+            MagnetSourceStat {
+                source: "btdig".to_string(),
+                label: "BTDig DHT".to_string(),
+                count: 0,
+                ok: false,
+                elapsed_ms: t0.elapsed().as_millis() as u64,
+                error: Some(e),
+            },
+        ),
+    }
+}
+
 pub fn search_all_magnets(req: MagnetSearchRequest) -> Result<MagnetSearchResponse, String> {
     let q = req.query.trim().to_string();
     if q.is_empty() {
@@ -831,18 +958,20 @@ pub fn search_all_magnets(req: MagnetSearchRequest) -> Result<MagnetSearchRespon
     let category = req.category.as_deref().unwrap_or("all").trim().to_lowercase();
     let sort = req.sort.as_deref().unwrap_or("seeders").trim().to_lowercase();
     let limit = req.limit.unwrap_or(80).clamp(10, 150);
+    let looks_like_jav = crate::jav_scraper::normalize_jav_number(&q).is_some();
 
     let enabled_sources: Vec<String> = match req.sources {
         Some(list) if !list.is_empty() => list
             .into_iter()
             .map(|s| s.to_lowercase())
-            .filter(|s| s != "tpb" && s != "sukebei")
             .collect(),
         _ => match category.as_str() {
             "anime" => vec!["dmhy".into(), "nyaa".into(), "bt4g".into(), "knaben".into()],
-            "adult" => vec!["bt4g".into(), "knaben".into(), "nyaa".into()],
+            "adult" => vec!["javbus".into(), "sukebei".into(), "btdig".into(), "bt4g".into(), "knaben".into()],
+            "video" if looks_like_jav => vec!["javbus".into(), "sukebei".into(), "btdig".into(), "bt4g".into(), "knaben".into()],
             "video" => vec!["bt4g".into(), "dmhy".into(), "knaben".into(), "nyaa".into()],
             "software" | "audio_book" => vec!["bt4g".into(), "knaben".into(), "nyaa".into()],
+            _ if looks_like_jav => vec!["javbus".into(), "sukebei".into(), "btdig".into(), "bt4g".into(), "knaben".into(), "nyaa".into()],
             _ => vec!["bt4g".into(), "dmhy".into(), "knaben".into(), "nyaa".into()],
         },
     };
@@ -853,6 +982,8 @@ pub fn search_all_magnets(req: MagnetSearchRequest) -> Result<MagnetSearchRespon
     let want_tpb = enabled_sources.iter().any(|s| s == "tpb");
     let want_nyaa = enabled_sources.iter().any(|s| s == "nyaa");
     let want_sukebei = enabled_sources.iter().any(|s| s == "sukebei");
+    let want_javbus = enabled_sources.iter().any(|s| s == "javbus");
+    let want_btdig = enabled_sources.iter().any(|s| s == "btdig");
 
     let q_clone = q.clone();
     let cat_clone = category.clone();
@@ -892,19 +1023,25 @@ pub fn search_all_magnets(req: MagnetSearchRequest) -> Result<MagnetSearchRespon
                 None
             }
         };
+        let f_javbus = async {
+            if want_javbus { Some(query_javbus_source(&q_clone).await) } else { None }
+        };
+        let f_btdig = async {
+            if want_btdig { Some(query_btdig_source(&q_clone).await) } else { None }
+        };
 
-        let (r_bt4g, r_dmhy, r_knaben, r_tpb, r_nyaa, r_sukebei) =
-            tokio::join!(f_bt4g, f_dmhy, f_knaben, f_tpb, f_nyaa, f_sukebei);
+        let (r_javbus, r_sukebei, r_btdig, r_bt4g, r_dmhy, r_knaben, r_tpb, r_nyaa) =
+            tokio::join!(f_javbus, f_sukebei, f_btdig, f_bt4g, f_dmhy, f_knaben, f_tpb, f_nyaa);
 
         let mut source_stats = Vec::new();
         let mut by_hash: HashMap<String, UniversalMagnetItem> = HashMap::new();
 
-        for res_opt in [r_bt4g, r_dmhy, r_knaben, r_tpb, r_nyaa, r_sukebei] {
+        for res_opt in [r_javbus, r_sukebei, r_btdig, r_bt4g, r_dmhy, r_knaben, r_tpb, r_nyaa] {
             if let Some((items, mut stat)) = res_opt {
                 // Apply strict relevance filter across ALL sources so upstream fallback junk is dropped cleanly
                 let relevant: Vec<UniversalMagnetItem> = items
                     .into_iter()
-                    .filter(|it| is_relevant_title(&q_clone, &it.title))
+                    .filter(|it| stat.source == "javbus" || is_relevant_title(&q_clone, &it.title))
                     .collect();
                 stat.count = relevant.len();
                 source_stats.push(stat);
@@ -920,6 +1057,8 @@ pub fn search_all_magnets(req: MagnetSearchRequest) -> Result<MagnetSearchRespon
                                 existing.size_bytes = item.size_bytes;
                                 existing.size_text = item.size_text;
                             }
+                            if item.cn_sub { existing.cn_sub = true; }
+                            if item.hd { existing.hd = true; }
                         }
                         None => {
                             by_hash.insert(key, item);

@@ -202,21 +202,70 @@ extension PMLAPIClient {
         try await command("stop_performer_enrich", as: PerformerEnrichProgress.self)
     }
 
-    func searchMovieSubtitles(number: String) async throws -> [SubtitleSearchCandidate] {
-        try await command("search_movie_subtitles", arguments: ["number": number], as: [SubtitleSearchCandidate].self)
+    func searchMovieSubtitles(number: String, expectedDurationSec: Int? = nil) async throws -> [SubtitleSearchCandidate] {
+        var args: [String: Any] = ["number": number]
+        if let expectedDurationSec, expectedDurationSec > 0 {
+            args["expectedDurationSec"] = expectedDurationSec
+        }
+        return try await command("search_movie_subtitles", arguments: args, as: [SubtitleSearchCandidate].self)
     }
 
-    func downloadMovieSubtitle(number: String, name: String, lang: String, downloadUrl: String) async throws -> SavedMovieSubtitle {
-        try await command(
+    func downloadMovieSubtitle(number: String, name: String, lang: String, downloadUrl: String, source: String? = nil) async throws -> SavedMovieSubtitle {
+        var args: [String: Any] = [
+            "number": number,
+            "name": name,
+            "lang": lang,
+            "downloadUrl": downloadUrl,
+        ]
+        if let source, !source.isEmpty { args["source"] = source }
+        return try await command(
             "download_movie_subtitle",
-            arguments: [
-                "number": number,
-                "name": name,
-                "lang": lang,
-                "downloadUrl": downloadUrl
-            ],
+            arguments: args,
             as: SavedMovieSubtitle.self
         )
+    }
+
+    func getMovieTrailer(number: String, coverUrl: String? = nil, forceRefresh: Bool = false) async throws -> MovieTrailerResult {
+        var args: [String: Any] = ["number": number, "forceRefresh": forceRefresh]
+        if let coverUrl, !coverUrl.isEmpty { args["coverUrl"] = coverUrl }
+        return try await command("get_movie_trailer", arguments: args, as: MovieTrailerResult.self)
+    }
+
+    func getOnlineMovieStream(number: String, forceRefresh: Bool = false) async throws -> OnlineStreamResult {
+        try await command("get_online_movie_stream", arguments: ["number": number, "forceRefresh": forceRefresh], as: OnlineStreamResult.self)
+    }
+
+    func getMovieComments(number: String, forceRefresh: Bool = false) async throws -> MovieCommentsResult {
+        try await command("get_movie_comments", arguments: ["number": number, "forceRefresh": forceRefresh], as: MovieCommentsResult.self)
+    }
+
+    func getMovieTranslateConfig() async throws -> MovieTranslateConfig {
+        try await command("get_movie_translate_config", arguments: [:], as: MovieTranslateConfig.self)
+    }
+
+    func saveMovieTranslateConfig(_ config: MovieTranslateConfig) async throws {
+        try await command("save_movie_translate_config", arguments: [
+            "config": [
+                "endpoint": config.endpoint,
+                "apiKey": config.apiKey,
+                "model": config.model,
+            ]
+        ])
+    }
+
+    func translateMovieTitle(number: String, title: String, manualTitle: String? = nil, saveToDb: Bool = false) async throws -> MovieTitleTranslationResponse {
+        var args: [String: Any] = [
+            "number": number,
+            "title": title,
+            "saveToDb": saveToDb,
+        ]
+        if let manualTitle { args["manualTitle"] = manualTitle }
+        return try await command("translate_movie_title", arguments: args, as: MovieTitleTranslationResponse.self)
+    }
+
+    func translateMovieTitlesBatch(items: [(number: String, title: String)]) async throws -> MovieTitleBatchTranslationResponse {
+        let payload = items.map { ["number": $0.number, "title": $0.title] }
+        return try await command("translate_movie_titles_batch", arguments: ["items": payload], as: MovieTitleBatchTranslationResponse.self)
     }
 
     func listMovieSubtitles(number: String) async throws -> [SavedMovieSubtitle] {
@@ -225,5 +274,29 @@ extension PMLAPIClient {
 
     func deleteMovieSubtitle(id: String) async throws {
         try await command("delete_movie_subtitle", arguments: ["id": id])
+    }
+
+    func fetchMovieSubtitleText(id: String) async throws -> String {
+        guard var components = URLComponents(url: configuration.baseURL, resolvingAgainstBaseURL: false) else {
+            throw APIError.badURL
+        }
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        components.path = "/api/movie-subtitles/\(encoded)"
+        components.query = nil
+        guard let url = components.url else { throw APIError.badURL }
+
+        var request = URLRequest(url: url, timeoutInterval: 30)
+        request.httpMethod = "GET"
+        for (k, v) in basicAuthHeaders {
+            request.setValue(v, forHTTPHeaderField: k)
+        }
+        let (data, response) = try await APISession.shared.session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.server("读取字幕文本失败")
+        }
+        if let text = String(data: data, encoding: .utf8) { return text }
+        let gb18030 = String.Encoding(rawValue: 0x80000632)
+        if let text = String(data: data, encoding: gb18030) { return text }
+        return String(decoding: data, as: UTF8.self)
     }
 }

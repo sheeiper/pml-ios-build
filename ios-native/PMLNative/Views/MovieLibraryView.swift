@@ -176,7 +176,7 @@ public struct MovieLibraryView: View {
                     MovieDetailSheet(
                         number: movie.number,
                         assetId: movie.assetId,
-                        fileName: movie.title,
+                        fileName: movie.translatedTitle ?? movie.title,
                         remotePath: nil,
                         onPlay: { target in
                             selectedMovie = nil
@@ -334,14 +334,14 @@ public struct MovieLibraryView: View {
                 }
             }
 
-            Text(movie.title)
+            Text(movie.translatedTitle?.isEmpty == false ? movie.translatedTitle! : movie.title)
                 .font(.subheadline.bold())
                 .lineLimit(2)
 
             HStack(spacing: 10) {
                 if let assetId = movie.assetId {
                     Button {
-                        Task { await playAsset(assetId, title: movie.title) }
+                        Task { await playAsset(assetId, title: movie.translatedTitle ?? movie.title) }
                     } label: {
                         Label("立即播放", systemImage: "play.fill")
                             .font(.caption.bold())
@@ -1036,7 +1036,7 @@ public struct MovieLibraryView: View {
                 .aspectRatio(3 / 2, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-                Text(movie.title)
+                Text(movie.translatedTitle?.isEmpty == false ? movie.translatedTitle! : movie.title)
                     .font(.caption.weight(.semibold))
                     .lineLimit(2)
                 HStack(spacing: 4) {

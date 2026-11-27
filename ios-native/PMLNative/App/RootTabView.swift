@@ -406,6 +406,9 @@ struct MagnetSearchView: View {
         ("dmhy", "动漫花园"),
         ("knaben", "Knaben"),
         ("nyaa", "Nyaa"),
+        ("javbus", "JavBus"),
+        ("sukebei", "Sukebei"),
+        ("btdig", "BTDig"),
     ]
 
     private var loading: Bool { buckets.contains(where: { $0.loading }) }
@@ -910,6 +913,22 @@ struct MagnetSearchView: View {
                                             .padding(.vertical, 2)
                                             .background(trackerColor(item.source).opacity(0.2), in: RoundedRectangle(cornerRadius: 4))
                                             .foregroundStyle(trackerColor(item.source))
+                                        if item.cnSub == true {
+                                            Text("中字")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 2)
+                                                .background(Color.pink.opacity(0.22), in: RoundedRectangle(cornerRadius: 4))
+                                                .foregroundStyle(.pink)
+                                        }
+                                        if item.hd == true {
+                                            Text("HD")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 2)
+                                                .background(Color.blue.opacity(0.22), in: RoundedRectangle(cornerRadius: 4))
+                                                .foregroundStyle(.blue)
+                                        }
                                         Text(item.title)
                                             .font(.subheadline.weight(.semibold))
                                             .foregroundStyle(.primary)
@@ -1525,6 +1544,8 @@ struct MagnetSearchView: View {
         case "tpb": return .orange
         case "nyaa": return .green
         case "sukebei": return .pink
+        case "javbus": return .indigo
+        case "btdig": return .cyan
         default: return .blue
         }
     }

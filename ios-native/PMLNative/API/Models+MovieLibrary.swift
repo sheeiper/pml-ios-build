@@ -83,6 +83,8 @@ public struct MoviePerformer: Codable, Identifiable, Hashable {
     public let agency: String?
     public let latestReleaseDate: String?
     public let latestAddedAt: Int64?
+    public let twitterUrl: String?
+    public let instagramUrl: String?
 }
 
 public struct PerformerRecentRelease: Codable, Identifiable, Hashable {
@@ -170,6 +172,83 @@ public struct SubtitleSearchCandidate: Codable, Identifiable, Hashable {
     public let langLabel: String
     public let downloadUrl: String
     public let source: String
+    public let durationMs: UInt64?
+    public let durationDiffSec: Int64?
+    public let durationMatched: Bool?
+}
+
+public struct TrailerQualityItem: Codable, Identifiable, Hashable {
+    public var id: String { "\(label)-\(url)" }
+    public let label: String
+    public let url: String
+}
+
+public struct MovieTrailerResult: Codable, Hashable {
+    public let number: String
+    public let cid: String
+    public let cached: Bool
+    public let items: [TrailerQualityItem]
+    public let fallbackUrl: String
+}
+
+public struct OnlineStreamSource: Codable, Identifiable, Hashable {
+    public var id: String { url }
+    public let name: String
+    public let url: String
+}
+
+public struct OnlineStreamResult: Codable, Hashable {
+    public let code: String
+    public let via: String
+    public let pageUrl: String
+    public let searchUrl: String
+    public let poster: String?
+    public let title: String?
+    public let proxied: Bool
+    public let cached: Bool
+    public let sources: [OnlineStreamSource]
+}
+
+public struct MovieCommentItem: Codable, Identifiable, Hashable {
+    public var id: String { "\(author)-\(date ?? "")-\(text)" }
+    public let author: String
+    public let score: String?
+    public let date: String?
+    public let text: String
+}
+
+public struct MovieCommentsResult: Codable, Hashable {
+    public let number: String
+    public let videoUrl: String
+    public let total: Int
+    public let items: [MovieCommentItem]
+    public let notFound: Bool
+    public let geoBlocked: Bool
+    public let cached: Bool
+    public let error: String?
+}
+
+public struct MovieTranslateConfig: Codable, Hashable {
+    public var endpoint: String
+    public var apiKey: String
+    public var model: String
+}
+
+public struct MovieTitleTranslationResponse: Codable {
+    public let number: String
+    public let translatedTitle: String
+    public let engine: String
+    public let movie: MovieMetadata?
+}
+
+public struct MovieTitleBatchTranslatedItem: Codable, Hashable {
+    public let number: String
+    public let translatedTitle: String
+}
+
+public struct MovieTitleBatchTranslationResponse: Codable {
+    public let items: [MovieTitleBatchTranslatedItem]
+    public let engine: String
 }
 
 public struct SavedMovieSubtitle: Codable, Identifiable, Hashable {

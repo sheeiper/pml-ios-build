@@ -47,6 +47,14 @@ public struct MovieDetailSheet: View {
     @State private var showMultiSourceSheet = false
     @State private var showMoreVersionsSheet = false
     @State private var activeSeriesSheet: String?
+    @State private var previewModeSheet: OnlinePreviewMode?
+    @State private var commentsOpen = false
+    @State private var commentsLoading = false
+    @State private var commentsData: MovieCommentsResult?
+    @State private var commentsError: String?
+    @State private var translatingTitle = false
+    @State private var editingTranslation = false
+    @State private var draftTranslatedTitle = ""
 
     public init(
         number: String? = nil,
@@ -77,6 +85,15 @@ public struct MovieDetailSheet: View {
                 }
                 .sheet(isPresented: $showMultiSourceSheet) {
                     multiSourceSheet
+                }
+                .sheet(item: $previewModeSheet) { mode in
+                    OnlinePreviewPlayerSheet(
+                        mode: mode,
+                        number: metadata?.number ?? currentNumber ?? number ?? "",
+                        title: metadata?.translatedTitle ?? metadata?.title ?? fileName ?? "",
+                        coverUrl: metadata?.coverUrl
+                    )
+                    .environmentObject(appModel)
                 }
                 .alert("未找到本地视频文件", isPresented: $showNoAssetAlert) {
                     Button("知道了", role: .cancel) {}
@@ -359,15 +376,38 @@ public struct MovieDetailSheet: View {
                                 }
                             }
 
-                            Text(meta.title)
+                            Text(meta.translatedTitle?.isEmpty == false ? meta.translatedTitle! : meta.title)
                                 .font(.headline)
                                 .foregroundStyle(.primary)
 
-                            if let orig = meta.originalTitle, !orig.isEmpty, orig != meta.title {
+                            if let tr = meta.translatedTitle, !tr.isEmpty, tr != meta.title {
+                                Text(meta.title)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            } else if let orig = meta.originalTitle, !orig.isEmpty, orig != meta.title {
                                 Text(orig)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
+                            }
+
+                            if editingTranslation {
+                                HStack(spacing: 6) {
+                                    TextField("输入自定义中文译名…", text: $draftTranslatedTitle)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.caption)
+                                    Button("保存") {
+                                        Task { await translateTitle(for: meta, manual: draftTranslatedTitle) }
+                                    }
+                                    .font(.caption.bold())
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.purple)
+                                    .disabled(translatingTitle)
+                                    Button("取消") { editingTranslation = false }
+                                        .font(.caption)
+                                        .buttonStyle(.bordered)
+                                }
                             }
                         }
 
@@ -462,6 +502,59 @@ public struct MovieDetailSheet: View {
                                     Task { await loadData(force: true) }
                                 } label: {
                                     Label("刷新", systemImage: "arrow.clockwise")
+                                        .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.bordered)
+
+                                Button {
+                                    previewModeSheet = .trailer
+                                } label: {
+                                    Label("预告片", systemImage: "film")
+                                        .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.bordered)
+
+                                Button {
+                                    previewModeSheet = .stream
+                                } label: {
+                                    Label("在线预览", systemImage: "play.tv")
+                                        .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.green)
+
+                                Button {
+                                    Task { await translateTitle(for: meta, manual: nil) }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        if translatingTitle { ProgressView().scaleEffect(0.7) }
+                                        else { Image(systemName: "character.book.closed") }
+                                        Text("翻译标题").lineLimit(1)
+                                    }
+                                    .font(.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(translatingTitle)
+
+                                Button {
+                                    draftTranslatedTitle = meta.translatedTitle ?? meta.title
+                                    editingTranslation.toggle()
+                                } label: {
+                                    Label("编辑译名", systemImage: "pencil")
                                         .font(.caption.weight(.semibold))
                                         .lineLimit(1)
                                         .minimumScaleFactor(0.85)
@@ -640,7 +733,7 @@ public struct MovieDetailSheet: View {
 
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(spacing: 8) {
-                                        ForEach(Array(meta.sampleImages.enumerated()), id: \.offset) { idx, sample in
+                                    ForEach(Array(meta.sampleImages.enumerated()), id: \.offset) { idx, sample in
                                             if let url = appModel.proxyScraperImageURL(rawUrl: sample) {
                                                 Button {
                                                     activeFullScreen = .sample(idx)
@@ -656,6 +749,8 @@ public struct MovieDetailSheet: View {
                                 }
                             }
                         }
+
+                        commentsAccordionSection(number: meta.number)
 
                         // Partitioned Related Movies: Same Actors vs Same Maker
                         if let grouped = relatedGrouped {
@@ -837,7 +932,8 @@ public struct MovieDetailSheet: View {
         subtitleError = nil
         subtitleCandidates = []
         do {
-            subtitleCandidates = try await client.searchMovieSubtitles(number: num)
+            let expected = parts.first?.durationSeconds.map { Int($0.rounded()) } ?? metadata?.durationMinutes.map { $0 * 60 }
+            subtitleCandidates = try await client.searchMovieSubtitles(number: num, expectedDurationSec: expected)
             subtitleSearchDone = true
         } catch {
             subtitleError = error.localizedDescription
@@ -854,7 +950,8 @@ public struct MovieDetailSheet: View {
                 number: num,
                 name: cand.title,
                 lang: cand.lang,
-                downloadUrl: cand.downloadUrl
+                downloadUrl: cand.downloadUrl,
+                source: cand.source
             )
             savedSubtitles.removeAll(where: { $0.id == saved.id })
             savedSubtitles.insert(saved, at: 0)
@@ -862,6 +959,114 @@ public struct MovieDetailSheet: View {
             subtitleError = error.localizedDescription
         }
         subtitleDownloadingId = nil
+    }
+
+    @ViewBuilder
+    private func commentsAccordionSection(number: String) -> some View {
+        DisclosureGroup(isExpanded: Binding(
+            get: { commentsOpen },
+            set: { next in
+                commentsOpen = next
+                if next && commentsData == nil && !commentsLoading {
+                    Task { await loadComments(number: number, forceRefresh: false) }
+                }
+            }
+        )) {
+            VStack(alignment: .leading, spacing: 8) {
+                if commentsLoading {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.8)
+                        Text("正在按需拉取 JavDB 短评…").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 6)
+                } else if let err = commentsError {
+                    Text(err).font(.caption).foregroundStyle(.orange)
+                } else if commentsData?.geoBlocked == true {
+                    Text("当前网络被 JavDB 风控拦截，暂无法读取评论。").font(.caption).foregroundStyle(.orange)
+                } else if commentsData?.items.isEmpty ?? true {
+                    Text("暂未找到该番号的公开短评。").font(.caption).foregroundStyle(.secondary)
+                } else if let items = commentsData?.items {
+                    ForEach(items) { c in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Text(c.author.isEmpty ? "匿名用户" : c.author).font(.caption.bold())
+                                if let s = c.score, !s.isEmpty {
+                                    Text("★ \(s)").font(.caption2.bold()).foregroundStyle(.orange)
+                                }
+                                Spacer()
+                                if let d = c.date, !d.isEmpty {
+                                    Text(d).font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            Text(c.text).font(.caption).foregroundStyle(.primary)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack {
+                Label("JavDB 评论区", systemImage: "text.bubble")
+                    .font(.footnote.bold())
+                if let total = commentsData?.total {
+                    Text("(\(total))").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func loadComments(number: String, forceRefresh: Bool) async {
+        guard let client = appModel.apiClient else { return }
+        commentsLoading = true
+        commentsError = nil
+        do {
+            let res = try await client.getMovieComments(number: number, forceRefresh: forceRefresh)
+            commentsData = res
+            commentsError = res.error
+        } catch {
+            commentsError = error.localizedDescription
+        }
+        commentsLoading = false
+    }
+
+    private func translateTitle(for meta: MovieMetadata, manual: String?) async {
+        guard let client = appModel.apiClient, !translatingTitle else { return }
+        translatingTitle = true
+        defer { translatingTitle = false }
+        do {
+            let res = try await client.translateMovieTitle(number: meta.number, title: meta.title, manualTitle: manual, saveToDb: true)
+            if let updated = res.movie {
+                metadata = updated
+            } else {
+                metadata = MovieMetadata(
+                    number: meta.number,
+                    assetId: meta.assetId,
+                    title: meta.title,
+                    originalTitle: meta.originalTitle,
+                    actors: meta.actors,
+                    maker: meta.maker,
+                    label: meta.label,
+                    series: meta.series,
+                    director: meta.director,
+                    releaseDate: meta.releaseDate,
+                    durationMinutes: meta.durationMinutes,
+                    coverUrl: meta.coverUrl,
+                    sampleImages: meta.sampleImages,
+                    tags: meta.tags,
+                    source: meta.source,
+                    updatedAt: meta.updatedAt,
+                    translatedTitle: res.translatedTitle
+                )
+            }
+            editingTranslation = false
+        } catch {
+            copyToast = "翻译失败：\(error.localizedDescription)"
+        }
     }
 
     private func deleteSubtitle(_ sub: SavedMovieSubtitle) async {
@@ -961,6 +1166,22 @@ public struct MovieDetailSheet: View {
                                 .padding(.vertical, 2)
                                 .background((cand.lang == "zh-CN" ? Color.blue : Color.orange).opacity(0.2), in: Capsule())
                                 .foregroundStyle(cand.lang == "zh-CN" ? .blue : .orange)
+                            if cand.source == "xunlei" {
+                                Text("迅雷")
+                                    .font(.caption2.bold())
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(Color.cyan.opacity(0.2), in: Capsule())
+                                    .foregroundStyle(.cyan)
+                            }
+                            if cand.durationMatched == true {
+                                Text("时长匹配")
+                                    .font(.caption2.bold())
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(Color.green.opacity(0.2), in: Capsule())
+                                    .foregroundStyle(.green)
+                            }
                             Text(cand.title)
                                 .font(.caption)
                                 .lineLimit(1)

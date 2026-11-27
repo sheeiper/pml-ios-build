@@ -10,6 +10,7 @@ pub mod telegram_public;
 pub mod v2_catalog;
 pub mod v2_state;
 pub mod jav_scraper;
+pub mod movie_extras;
 pub mod performers;
 pub mod album_bundler;
 pub mod cleaner;

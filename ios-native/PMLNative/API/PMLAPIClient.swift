@@ -144,4 +144,18 @@ struct PMLAPIClient {
         }
         return data
     }
+
+    var basicAuthHeaders: [String: String] {
+        let credential = Data("\(configuration.username):\(configuration.password)".utf8).base64EncodedString()
+        return ["Authorization": "Basic \(credential)"]
+    }
+
+    func onlinePreviewM3U8URL(sourceURL: String) -> URL? {
+        guard var components = URLComponents(url: configuration.baseURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        components.path = "/api/online-preview/m3u8"
+        components.queryItems = [URLQueryItem(name: "u", value: sourceURL)]
+        return components.url
+    }
 }

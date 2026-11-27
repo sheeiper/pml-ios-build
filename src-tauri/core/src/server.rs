@@ -386,6 +386,8 @@ fn build_router(state: ServerState, static_dir: String) -> Router {
         .route("/api/telegram-user-stream/{chat_id}/{message_id}", get(proxy_telegram_user_stream).head(proxy_telegram_user_stream))
         .route("/api/telegram-user-thumb/{chat_id}/{message_id}", get(proxy_telegram_user_thumb).head(proxy_telegram_user_thumb))
         .route("/api/scraper/proxy-image", get(proxy_scraper_image).head(proxy_scraper_image))
+        .route("/api/online-preview/m3u8", get(proxy_online_preview_m3u8))
+        .route("/api/online-preview/ts", get(proxy_online_preview_ts))
         .route("/api/movie-subtitles/{id}", get(serve_movie_subtitle).head(serve_movie_subtitle))
         // A 2 MiB avatar expands to ~2.7 MiB base64; keep a bounded JSON envelope.
         .route("/api/{command}", post(dispatch_command).layer(axum::extract::DefaultBodyLimit::max(3 * 1024 * 1024)))
@@ -1787,20 +1789,30 @@ async fn dispatch_command(
         }
         "search_movie_subtitles" => {
             let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
-            result_response(crate::jav_scraper::search_movie_subtitles(&number).await)
+            let expected_duration_sec = payload.get("expectedDurationSec").and_then(Value::as_i64);
+            result_response(crate::jav_scraper::search_movie_subtitles(&number, expected_duration_sec).await)
         }
         "download_movie_subtitle" => {
             let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
             let name = payload.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
             let lang = payload.get("lang").and_then(Value::as_str).unwrap_or("zh-CN").to_owned();
             let download_url = payload.get("downloadUrl").and_then(Value::as_str).unwrap_or("").to_owned();
-            let downloaded = match crate::jav_scraper::download_and_save_subtitle(&number, &name, &lang, &download_url).await {
+            let source_hint = payload.get("source").and_then(Value::as_str).map(str::to_owned);
+            let downloaded = match crate::jav_scraper::download_and_save_subtitle(
+                &number,
+                &name,
+                &lang,
+                &download_url,
+                source_hint.as_deref(),
+            )
+            .await
+            {
                 Ok(v) => v,
                 Err(e) => return error_response(&e),
             };
             let app = app.clone();
             blocking_result_response(move || {
-                let (id, clean_num, clean_name, clean_lang, content) = downloaded;
+                let (id, clean_num, clean_name, clean_lang, source, content) = downloaded;
                 let conn = four_domains::open_v2(&app)?;
                 crate::jav_scraper::save_movie_subtitle_row(
                     &conn,
@@ -1808,10 +1820,150 @@ async fn dispatch_command(
                     &clean_num,
                     &clean_name,
                     &clean_lang,
-                    "subtitlecat",
+                    &source,
                     &content,
                 )
                 .map_err(|e| format!("保存字幕失败：{e}"))
+            })
+            .await
+        }
+        "get_movie_trailer" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let cover_url = payload.get("coverUrl").and_then(Value::as_str).map(str::to_owned);
+            let force_refresh = payload.get("forceRefresh").and_then(Value::as_bool).unwrap_or(false);
+            result_response(crate::movie_extras::fetch_fanza_trailer(&number, cover_url.as_deref(), force_refresh).await)
+        }
+        "get_online_movie_stream" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let force_refresh = payload.get("forceRefresh").and_then(Value::as_bool).unwrap_or(false);
+            result_response(crate::movie_extras::fetch_online_movie_stream(&number, force_refresh).await)
+        }
+        "get_movie_comments" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").to_owned();
+            let force_refresh = payload.get("forceRefresh").and_then(Value::as_bool).unwrap_or(false);
+            result_response(crate::movie_extras::fetch_javdb_comments(&number, force_refresh).await)
+        }
+        "get_movie_translate_config" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::movie_extras::get_movie_translate_config(&app)).await
+        }
+        "save_movie_translate_config" => {
+            let cfg: crate::movie_extras::MovieTranslateConfig = if let Some(inner) = payload.get("config") {
+                match serde_json::from_value(inner.clone()) {
+                    Ok(v) => v,
+                    Err(e) => return error_response(&format!("翻译配置格式错误：{e}")),
+                }
+            } else {
+                match serde_json::from_value(payload) {
+                    Ok(v) => v,
+                    Err(e) => return error_response(&format!("翻译配置格式错误：{e}")),
+                }
+            };
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::movie_extras::save_movie_translate_config(&app, &cfg)?;
+                Ok(serde_json::json!({ "ok": true }))
+            })
+            .await
+        }
+        "translate_movie_title" => {
+            let number = payload.get("number").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+            let title = payload.get("title").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+            let manual_title = payload.get("manualTitle").and_then(Value::as_str).map(|s| s.trim().to_owned());
+            let save_to_db = payload.get("saveToDb").and_then(Value::as_bool).unwrap_or(true);
+            if number.is_empty() {
+                return error_response("缺少番号参数");
+            }
+            let (translated, engine) = if let Some(manual) = manual_title {
+                (manual, "manual".to_string())
+            } else {
+                if title.is_empty() {
+                    return error_response("原标题为空");
+                }
+                let app_cfg = app.clone();
+                let cfg = tokio::task::spawn_blocking(move || crate::movie_extras::get_movie_translate_config(&app_cfg))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default();
+                let res = match crate::movie_extras::translate_titles_with_fallback(&cfg, &[title.clone()]).await {
+                    Ok((mut out, eng)) => (out.pop().unwrap_or(title), eng),
+                    Err(e) => return error_response(&e),
+                };
+                res
+            };
+            if save_to_db {
+                let app_save = app.clone();
+                let num_save = number.clone();
+                let tr_save = translated.clone();
+                let eng_save = engine.clone();
+                blocking_result_response(move || {
+                    let conn = four_domains::open_v2(&app_save)?;
+                    let updated = crate::jav_scraper::set_movie_translated_title(
+                        &conn,
+                        &num_save,
+                        if tr_save.is_empty() { None } else { Some(&tr_save) },
+                    )
+                    .map_err(|e| format!("保存译文失败：{e}"))?;
+                    Ok(serde_json::json!({
+                        "number": num_save,
+                        "translatedTitle": tr_save,
+                        "engine": eng_save,
+                        "movie": updated
+                    }))
+                })
+                .await
+            } else {
+                result_response(Ok(serde_json::json!({
+                    "number": number,
+                    "translatedTitle": translated,
+                    "engine": engine
+                })))
+            }
+        }
+        "translate_movie_titles_batch" => {
+            #[derive(serde::Deserialize)]
+            struct BatchItem {
+                number: String,
+                title: String,
+            }
+            let items: Vec<BatchItem> = match payload.get("items").cloned().and_then(|v| serde_json::from_value(v).ok()) {
+                Some(v) => v,
+                None => return error_response("缺少 items 参数"),
+            };
+            if items.is_empty() {
+                return result_response(Ok(serde_json::json!({ "items": [], "engine": "none" })));
+            }
+            let capped: Vec<BatchItem> = items.into_iter().take(40).collect();
+            let app_cfg = app.clone();
+            let cfg = tokio::task::spawn_blocking(move || crate::movie_extras::get_movie_translate_config(&app_cfg))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let titles: Vec<String> = capped.iter().map(|i| i.title.clone()).collect();
+            let (translated_list, engine) = match crate::movie_extras::translate_titles_with_fallback(&cfg, &titles).await {
+                Ok(v) => v,
+                Err(e) => return error_response(&e),
+            };
+            let pairs: Vec<(String, String)> = capped
+                .into_iter()
+                .zip(translated_list.into_iter())
+                .map(|(it, tr)| (it.number, tr))
+                .collect();
+            let app_save = app.clone();
+            let pairs_clone = pairs.clone();
+            let eng_out = engine.clone();
+            blocking_result_response(move || {
+                let conn = four_domains::open_v2(&app_save)?;
+                let mut saved_items = Vec::new();
+                for (num, tr) in pairs_clone {
+                    if !tr.trim().is_empty() {
+                        let _ = crate::jav_scraper::set_movie_translated_title(&conn, &num, Some(&tr));
+                        saved_items.push(serde_json::json!({ "number": num, "translatedTitle": tr }));
+                    }
+                }
+                Ok(serde_json::json!({ "items": saved_items, "engine": eng_out }))
             })
             .await
         }
@@ -3573,6 +3725,53 @@ async fn proxy_scraper_image(
         if attempt == 0 { tokio::time::sleep(std::time::Duration::from_millis(200)).await; }
     }
     scraper_image_error(StatusCode::BAD_GATEWAY, "Image source unavailable")
+}
+
+#[derive(Deserialize)]
+struct OnlinePreviewUrlQuery {
+    u: Option<String>,
+}
+
+async fn proxy_online_preview_m3u8(
+    query: Result<Query<OnlinePreviewUrlQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let u = match query {
+        Ok(Query(q)) => q.u.unwrap_or_default(),
+        Err(_) => return scraper_image_error(StatusCode::BAD_REQUEST, "Invalid m3u8 query"),
+    };
+    match crate::movie_extras::proxy_online_m3u8(&u).await {
+        Ok(text) => (
+            StatusCode::OK,
+            [
+                (CONTENT_TYPE, "application/vnd.apple.mpegurl; charset=utf-8"),
+                (CACHE_CONTROL, "no-store"),
+            ],
+            text,
+        )
+            .into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, [(CACHE_CONTROL, "no-store")], err).into_response(),
+    }
+}
+
+async fn proxy_online_preview_ts(
+    query: Result<Query<OnlinePreviewUrlQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let u = match query {
+        Ok(Query(q)) => q.u.unwrap_or_default(),
+        Err(_) => return scraper_image_error(StatusCode::BAD_REQUEST, "Invalid segment query"),
+    };
+    match crate::movie_extras::proxy_online_ts(&u).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (CONTENT_TYPE, "video/mp2t"),
+                (CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, [(CACHE_CONTROL, "no-store")], err).into_response(),
+    }
 }
 
 const SCRAPER_IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
