@@ -689,7 +689,7 @@ struct MagnetSearchView: View {
                             buckets[idx].loading = false
                             buckets[idx].ok = st?.ok ?? true
                             buckets[idx].count = res.items.count
-                            buckets[idx].elapsedMs = st?.elapsedMs ?? 0
+                            buckets[idx].elapsedMs = Int64(st?.elapsedMs ?? 0)
                             buckets[idx].error = st?.error ?? ""
                             buckets[idx].items = res.items
                         }

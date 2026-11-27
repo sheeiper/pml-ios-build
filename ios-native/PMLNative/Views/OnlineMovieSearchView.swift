@@ -317,7 +317,7 @@ struct OnlineMovieDetailSheet: View {
     @State private var magnets: [MovieMagnetItem] = []
     @State private var magnetsLoading = true
     @State private var magnetsError: String?
-    @State private var magnetTab = "exact"
+    @State private var magnetTab = 0
     @State private var aggMagnets: [UniversalMagnetItem] = []
     @State private var aggLoading = false
     @State private var aggLoaded = false
