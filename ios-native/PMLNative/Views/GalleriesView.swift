@@ -350,7 +350,7 @@ private struct GallerySetCardView: View {
                     Spacer()
                     HStack {
                         Spacer()
-                        Text(item.isArchive ? "压缩包" : "\(item.itemCount) P")
+                        Text(item.itemCount > 1 ? "\(item.itemCount) P" : (item.isArchive ? "压缩包" : "\(item.itemCount) P"))
                             .font(.caption2.monospacedDigit().weight(.semibold))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 7)

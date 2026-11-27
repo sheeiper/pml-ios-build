@@ -44,6 +44,8 @@ pub struct ComicWorkItem {
     #[serde(default)]
     pub cover_page_index: i64,
     pub volume_count: i64,
+    #[serde(default)]
+    pub total_pages: i64,
     pub total_bytes: i64,
     pub source: String,
     #[serde(default)]
@@ -1739,6 +1741,7 @@ fn map_work_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComicWorkItem> {
         cover_is_archive: row.get::<_, i64>(15)? != 0,
         cover_page_index: row.get::<_, Option<i64>>(24)?.unwrap_or(0),
         volume_count: row.get(16)?,
+        total_pages: 0,
         total_bytes: row.get(17)?,
         source: row.get(18)?,
         category: row.get::<_, Option<String>>(22)?.unwrap_or_default(),
@@ -1889,6 +1892,25 @@ pub fn list_continue_reading_comics(app: &AppHandle, limit: Option<i64>) -> Resu
 
 const WORK_SELECT_COLS: &str = "id, title, raw_title, authors_json, circle, parody, event_tag, translators_json, tags_json, language, is_uncensored, is_full_color, is_dl, is_ongoing, cover_asset_id, cover_is_archive, volume_count, total_bytes, source, summary, updated_at, rating, category, published_at, cover_page_index";
 
+fn load_work_pages_map(conn: &Connection) -> HashMap<String, i64> {
+    let mut map = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT v.work_id, SUM(CASE WHEN COALESCE(ca.page_count, 0) > v.page_count THEN ca.page_count ELSE v.page_count END)
+         FROM comic_volumes v
+         LEFT JOIN comic_archives ca ON ca.asset_id = v.asset_id
+         GROUP BY v.work_id",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            for (wid, tp) in rows.flatten() {
+                if tp > 0 {
+                    map.insert(wid, tp);
+                }
+            }
+        }
+    }
+    map
+}
+
 pub fn get_comic_library_stats(app: &AppHandle) -> Result<ComicLibraryStats, String> {
     four_domains::ensure_v2(app)?;
     let mut conn = four_domains::open_v2(app)?;
@@ -1972,6 +1994,7 @@ pub fn query_comic_library(app: &AppHandle, req: QueryComicLibraryRequest) -> Re
     };
 
     let prog_map = load_work_progress_map(&conn);
+    let pages_map = load_work_pages_map(&conn);
     let sql = format!("SELECT {WORK_SELECT_COLS} FROM comic_works {order_sql}");
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let all_rows = stmt.query_map([], map_work_row).map_err(|e| e.to_string())?;
@@ -1992,6 +2015,9 @@ pub fn query_comic_library(app: &AppHandle, req: QueryComicLibraryRequest) -> Re
 
     let mut matched: Vec<ComicWorkItem> = Vec::new();
     for mut item in all_rows.flatten() {
+        if let Some(&tp) = pages_map.get(&item.id) {
+            item.total_pages = tp;
+        }
         if let Some(p) = prog_map.get(&item.id) {
             apply_work_progress(&mut item, p);
         }

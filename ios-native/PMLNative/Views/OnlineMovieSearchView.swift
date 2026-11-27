@@ -303,6 +303,7 @@ struct OnlineMovieSearchTabView: View {
 /// 线上作品完整详情页：高清封面 + 演员/片厂/标签 + 剧照画廊（可大图滑动）+ 内嵌磁力列表
 struct OnlineMovieDetailSheet: View {
     @EnvironmentObject private var model: AppModel
+    @ObservedObject private var copiedStore = CopiedMagnetsStore.shared
     @Environment(\.dismiss) private var dismiss
 
     let release: PerformerRecentRelease
@@ -316,6 +317,12 @@ struct OnlineMovieDetailSheet: View {
     @State private var magnets: [MovieMagnetItem] = []
     @State private var magnetsLoading = true
     @State private var magnetsError: String?
+    @State private var magnetTab = "exact"
+    @State private var aggMagnets: [UniversalMagnetItem] = []
+    @State private var aggLoading = false
+    @State private var aggLoaded = false
+    @State private var aggError: String?
+    @State private var filesTarget: MagnetFilesSheetTarget?
 
     @State private var copiedMagnet: String?
     @State private var copyToast: String?
@@ -411,6 +418,9 @@ struct OnlineMovieDetailSheet: View {
                 Button("知道了", role: .cancel) { playbackErrorText = nil }
             } message: {
                 Text(playbackErrorText ?? "")
+            }
+            .sheet(item: $filesTarget) { target in
+                MagnetFilesSheetView(target: target).environmentObject(model)
             }
         }
     }
@@ -636,85 +646,209 @@ struct OnlineMovieDetailSheet: View {
     private var magnetsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("磁力资源\(magnetsLoading ? "" : " (\(magnets.count))")", systemImage: "link")
+                Label("磁力资源", systemImage: "link")
                     .font(.subheadline.bold())
                 Spacer()
                 Button {
-                    Task { await loadMagnets(forceRefresh: true) }
+                    if magnetTab == 0 {
+                        Task { await loadMagnets(forceRefresh: true) }
+                    } else {
+                        Task { await loadAggregatedMagnets() }
+                    }
                 } label: {
                     Label("刷新", systemImage: "arrow.clockwise")
                         .font(.caption.weight(.semibold))
                 }
-                .disabled(magnetsLoading)
+                .disabled(magnetTab == 0 ? magnetsLoading : aggLoading)
             }
 
-            if let magnetsError {
-                Label(magnetsError, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.red)
+            Picker("磁力模式", selection: $magnetTab) {
+                Text("番号磁力\(magnetsLoading ? "" : " (\(magnets.count))")").tag(0)
+                Text("聚合搜索\(aggLoaded ? " (\(aggMagnets.count))" : "")").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: magnetTab) { _, newVal in
+                if newVal == 1 && !aggLoaded && !aggLoading {
+                    Task { await loadAggregatedMagnets() }
+                }
             }
 
-            if magnetsLoading {
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text("正在检索可用磁力链接…")
+            if magnetTab == 0 {
+                if let magnetsError {
+                    Label(magnetsError, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                if magnetsLoading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("正在检索可用磁力链接…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 20)
+                } else if magnets.isEmpty {
+                    Text("暂未找到该番号的公开磁力链接")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
+                } else {
+                    ForEach(magnets) { item in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(item.title)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(3)
+                            HStack(spacing: 6) {
+                                ForEach(item.tags, id: \.self) { tag in
+                                    Text(tag)
+                                        .font(.system(size: 10, weight: .bold))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(
+                                            (tag.contains("字幕") ? Color.pink : (tag.contains("高清") ? Color.blue : Color.secondary)).opacity(0.18),
+                                            in: Capsule()
+                                        )
+                                        .foregroundStyle(tag.contains("字幕") ? .pink : (tag.contains("高清") ? .blue : .secondary))
+                                }
+                                if let size = item.size, !size.isEmpty {
+                                    Text(size).font(.caption2).foregroundStyle(.secondary)
+                                }
+                                if let seeders = item.seeders {
+                                    Text("做种 \(seeders)").font(.caption2).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Text(item.source).font(.caption2).foregroundStyle(.tertiary)
+                            }
+                            HStack(spacing: 8) {
+                                Button {
+                                    filesTarget = MagnetFilesSheetTarget(infoHash: extractMagnetHash(item.magnet), title: item.title)
+                                } label: {
+                                    Label("文件", systemImage: "folder")
+                                        .font(.caption.bold())
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+
+                                Button {
+                                    UIPasteboard.general.string = item.magnet
+                                    copiedMagnet = item.magnet
+                                    copiedStore.markCopied(item.magnet)
+                                    showToast("已复制磁力链接")
+                                } label: {
+                                    Label(copiedStore.isCopied(item.magnet) ? "已复制磁力" : "复制磁力链接", systemImage: copiedStore.isCopied(item.magnet) ? "checkmark" : "doc.on.doc")
+                                        .font(.caption.bold())
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(copiedStore.isCopied(item.magnet) ? .green : .purple)
+                                .controlSize(.small)
+                            }
+                        }
+                        .padding(12)
+                        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+                    }
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 20)
-            } else if magnets.isEmpty {
-                Text("暂未找到该番号的公开磁力链接")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
             } else {
-                ForEach(magnets) { item in
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(item.title)
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(3)
-                        HStack(spacing: 6) {
-                            ForEach(item.tags, id: \.self) { tag in
-                                Text(tag)
+                if let aggError {
+                    Label(aggError, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                if aggLoading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("正在并发检索全网 6 源磁力…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 20)
+                } else if aggMagnets.isEmpty {
+                    Text("全网聚合暂未找到与「\(release.number)」相关的磁力")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
+                } else {
+                    ForEach(aggMagnets) { item in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(item.title)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(3)
+                            HStack(spacing: 6) {
+                                Text(item.sourceLabel)
                                     .font(.system(size: 10, weight: .bold))
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
-                                    .background(
-                                        (tag.contains("字幕") ? Color.pink : (tag.contains("高清") ? Color.blue : Color.secondary)).opacity(0.18),
-                                        in: Capsule()
-                                    )
-                                    .foregroundStyle(tag.contains("字幕") ? .pink : (tag.contains("高清") ? .blue : .secondary))
+                                    .background(Color.blue.opacity(0.16), in: Capsule())
+                                    .foregroundStyle(.blue)
+                                Text(item.sizeText).font(.caption2).foregroundStyle(.secondary)
+                                Text("做种 \(item.seeders)").font(.caption2).foregroundStyle(.green)
+                                Spacer()
+                                if let dt = item.dateText, !dt.isEmpty {
+                                    Text(dt).font(.caption2).foregroundStyle(.tertiary)
+                                }
                             }
-                            if let size = item.size, !size.isEmpty {
-                                Text(size).font(.caption2).foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                Button {
+                                    filesTarget = MagnetFilesSheetTarget(infoHash: item.infoHash, title: item.title)
+                                } label: {
+                                    Label("文件", systemImage: "folder")
+                                        .font(.caption.bold())
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+
+                                Button {
+                                    UIPasteboard.general.string = item.magnet
+                                    copiedMagnet = item.magnet
+                                    copiedStore.markCopied(item.magnet)
+                                    showToast("已复制磁力链接")
+                                } label: {
+                                    Label(copiedStore.isCopied(item.magnet) ? "已复制磁力" : "复制磁力链接", systemImage: copiedStore.isCopied(item.magnet) ? "checkmark" : "doc.on.doc")
+                                        .font(.caption.bold())
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(copiedStore.isCopied(item.magnet) ? .green : .purple)
+                                .controlSize(.small)
                             }
-                            if let seeders = item.seeders {
-                                Text("做种 \(seeders)").font(.caption2).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Text(item.source).font(.caption2).foregroundStyle(.tertiary)
                         }
-                        Button {
-                            UIPasteboard.general.string = item.magnet
-                            copiedMagnet = item.magnet
-                            showToast("已复制磁力链接")
-                        } label: {
-                            Label(copiedMagnet == item.magnet ? "已复制磁力" : "复制磁力链接", systemImage: copiedMagnet == item.magnet ? "checkmark" : "doc.on.doc")
-                                .font(.caption.bold())
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(copiedMagnet == item.magnet ? .green : .purple)
-                        .controlSize(.small)
+                        .padding(12)
+                        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
                     }
-                    .padding(12)
-                    .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
                 }
             }
         }
+    }
+
+    private func extractMagnetHash(_ magnet: String) -> String {
+        if let range = magnet.range(of: "btih:", options: .caseInsensitive) {
+            let tail = magnet[range.upperBound...]
+            let hash = tail.prefix { $0 != "&" }
+            return String(hash)
+        }
+        return magnet
+    }
+
+    private func loadAggregatedMagnets() async {
+        guard let client = model.apiClient else { return }
+        aggLoading = true
+        aggError = nil
+        do {
+            let resp = try await client.searchAllMagnets(query: release.number, category: "all", sort: "seeders")
+            aggMagnets = resp.items
+            aggLoaded = true
+        } catch {
+            aggError = error.localizedDescription
+        }
+        aggLoading = false
     }
 
     private func showToast(_ text: String) {

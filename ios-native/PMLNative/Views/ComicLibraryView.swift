@@ -339,6 +339,14 @@ struct ComicLibraryView: View {
                                                 .background(Color.black.opacity(0.76), in: RoundedRectangle(cornerRadius: 4))
                                                 .foregroundStyle(.white)
                                                 .padding(5)
+                                        } else if let tp = work.totalPages, tp > 0 {
+                                            Text("\(tp)P")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 2)
+                                                .background(Color.black.opacity(0.76), in: RoundedRectangle(cornerRadius: 4))
+                                                .foregroundStyle(.white)
+                                                .padding(5)
                                         } else if work.language != "zh" {
                                             Text("生")
                                                 .font(.system(size: 9, weight: .bold))
@@ -1136,8 +1144,9 @@ private struct OnlineComicsPaneView: View {
     @State private var showMagnetSheet = false
     @State private var magnetQuery = ""
     @State private var magnetLoading = false
-    @State private var magnetItems: [ComicMagnetItem] = []
+    @State private var magnetItems: [UniversalMagnetItem] = []
     @State private var copiedMagnetHash = ""
+    @State private var filesTarget: MagnetFilesSheetTarget?
     @State private var cbzTask: CbzPackageTask?
     @State private var cbzPollTask: Task<Void, Never>?
 
@@ -1550,22 +1559,30 @@ private struct OnlineComicsPaneView: View {
                                     ForEach(magnetItems) { m in
                                         VStack(alignment: .leading, spacing: 6) {
                                             Text(m.title).font(.caption.weight(.semibold))
-                                            HStack(spacing: 10) {
-                                                Text(m.source)
+                                            HStack(spacing: 8) {
+                                                Text(m.tracker)
                                                     .font(.caption2.bold())
                                                     .padding(.horizontal, 6)
                                                     .padding(.vertical, 2)
                                                     .background(Color.blue.opacity(0.16), in: Capsule())
                                                     .foregroundStyle(.blue)
-                                                Text(m.size).font(.caption2).foregroundStyle(.secondary)
+                                                Text(m.sizeText).font(.caption2).foregroundStyle(.secondary)
                                                 Text("做种 \(m.seeders)").font(.caption2).foregroundStyle(.green)
                                                 Spacer()
+                                                Button {
+                                                    filesTarget = MagnetFilesSheetTarget(infoHash: m.infoHash, title: m.title)
+                                                } label: {
+                                                    Image(systemName: "folder").font(.caption2)
+                                                }
+                                                .buttonStyle(.bordered)
+                                                .controlSize(.mini)
+
                                                 Button {
                                                     UIPasteboard.general.string = m.magnet
                                                     copiedMagnetHash = m.infoHash
                                                 } label: {
                                                     Label(
-                                                        copiedMagnetHash == m.infoHash ? "已复制" : "复制磁力",
+                                                        copiedMagnetHash == m.infoHash ? "已复制" : "复制",
                                                         systemImage: copiedMagnetHash == m.infoHash ? "checkmark" : "doc.on.doc"
                                                     )
                                                     .font(.caption2.bold())
@@ -1586,6 +1603,9 @@ private struct OnlineComicsPaneView: View {
                             ToolbarItem(placement: .confirmationAction) {
                                 Button("完成") { showMagnetSheet = false }
                             }
+                        }
+                        .sheet(item: $filesTarget) { t in
+                            MagnetFilesSheetView(target: t).environmentObject(model)
                         }
                     }
                 }
@@ -1747,7 +1767,7 @@ private struct OnlineComicsPaneView: View {
         guard !q.isEmpty else { return }
         magnetLoading = true
         defer { magnetLoading = false }
-        magnetItems = (try? await client.searchComicMagnets(query: q)) ?? []
+        magnetItems = (try? await client.searchAllMagnets(query: q, category: "all", sort: "seeders", limit: 60))?.items ?? []
     }
 
     private func startCbzPackage(comicId: String, chapter: OnlineComicChapter, title: String, author: String?) async {

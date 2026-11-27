@@ -759,6 +759,21 @@ async fn dispatch_command(
             })
             .await
         }
+        "search_all_magnets" => {
+            let req: crate::magnet_search::MagnetSearchRequest = match parse_args(&payload) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            blocking_result_response(move || crate::magnet_search::search_all_magnets(req)).await
+        }
+        "inspect_magnet_files" => {
+            let info_hash = payload
+                .get("infoHash")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            blocking_result_response(move || crate::magnet_search::inspect_magnet_files(&info_hash)).await
+        }
         "start_online_comic_cbz" => {
             let source = payload.get("source").and_then(Value::as_str).unwrap_or("jm").to_owned();
             let comic_id = payload.get("comicId").and_then(Value::as_str).unwrap_or("").to_owned();

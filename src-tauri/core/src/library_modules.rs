@@ -2621,9 +2621,11 @@ pub fn list_gallery_sets(
     let refs: Vec<&dyn rusqlite::ToSql> = bind_vals.iter().map(|b| b.as_ref()).collect();
 
     let sql = format!(
-        "SELECT id, model_name, album_name, remote_path, is_archive, cover_asset_id,
-                item_count, total_bytes, updated_at
-         FROM gallery_sets
+        "SELECT g.id, g.model_name, g.album_name, g.remote_path, g.is_archive, g.cover_asset_id,
+                CASE WHEN g.is_archive = 1 AND COALESCE(ca.page_count, 0) > g.item_count THEN ca.page_count ELSE g.item_count END AS effective_count,
+                g.total_bytes, g.updated_at
+         FROM gallery_sets g
+         LEFT JOIN comic_archives ca ON ca.asset_id = g.cover_asset_id
          WHERE {where_sql}
          ORDER BY {order_sql}
          LIMIT ? OFFSET ?"

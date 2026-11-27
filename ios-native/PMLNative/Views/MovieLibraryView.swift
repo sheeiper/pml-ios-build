@@ -66,7 +66,7 @@ public struct MovieLibraryView: View {
 
     private let pageSize = 40
     private enum LibraryMode: String, CaseIterable, Identifiable {
-        case movies = "影视库", performers = "演员", search = "搜番号", pending = "数据"
+        case movies = "影视库", performers = "演员", pending = "数据"
         var id: String { rawValue }
     }
     private enum PendingSubFilter: String, CaseIterable, Identifiable {
@@ -115,20 +115,7 @@ public struct MovieLibraryView: View {
                     .padding(.top, 8)
                     .onChange(of: mode) { _, _ in resetAndLoad() }
 
-                    if mode == .search {
-                        OnlineMovieSearchTabView(
-                            presetQuery: $onlineSearchPreset,
-                            onPlayAsset: { assetId, title in
-                                Task { await playAsset(assetId, title: title) }
-                            },
-                            onFilterActor: { actorName in
-                                mode = .movies
-                                selectedActor = actorName
-                                resetAndLoad()
-                            }
-                        )
-                        .environmentObject(model)
-                    } else if mode == .pending {
+                    if mode == .pending {
                         dataConsoleView
                     } else {
                         if mode == .movies, activeMovieFilterCount > 0 { activeMovieFilterStrip }
@@ -248,17 +235,6 @@ public struct MovieLibraryView: View {
         } else if currentCount == 0 {
             VStack(spacing: 16) {
                 ContentUnavailableView(emptyTitle, systemImage: emptySymbol, description: Text(emptyDescription))
-                if mode == .movies, !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Button {
-                        onlineSearchPreset = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-                        mode = .search
-                    } label: {
-                        Label("去搜番号查「\(searchQuery.trimmingCharacters(in: .whitespacesAndNewlines))」", systemImage: "globe")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.purple)
-                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -305,8 +281,6 @@ public struct MovieLibraryView: View {
                                 performerCell(person).onAppear { loadMoreIfNeeded(person) }
                             }
                         }
-                    case .search:
-                        EmptyView()
                     }
                     if loadingMore { ProgressView().padding() }
                 }
@@ -542,7 +516,6 @@ public struct MovieLibraryView: View {
     private var currentCount: Int {
         switch mode {
         case .movies: return pageItems.count
-        case .search: return 0
         case .pending:
             switch pendingFilter {
             case .all: return issues.count + unrecognized.count
@@ -555,7 +528,6 @@ public struct MovieLibraryView: View {
     private var emptyTitle: String {
         switch mode {
         case .movies: return onlyFavMovies ? "暂无收藏影片" : "暂无匹配的影视作品"
-        case .search: return ""
         case .pending:
             switch pendingFilter {
             case .all: return "暂无待处理项"
@@ -568,7 +540,6 @@ public struct MovieLibraryView: View {
     private var emptySymbol: String {
         switch mode {
         case .movies: return onlyFavMovies ? "heart.slash" : "film.stack"
-        case .search: return "globe"
         case .pending: return "checkmark.shield"
         case .performers: return onlyFavPerformers ? "heart.slash" : "person.2"
         }
@@ -576,7 +547,6 @@ public struct MovieLibraryView: View {
     private var emptyDescription: String {
         switch mode {
         case .movies: return onlyFavMovies ? "点击影片卡片或详情页的红心即可加入收藏。" : "服务端仅返回已验证影视记录；切换到顶部「数据」页可增量同步与刮削。"
-        case .search: return ""
         case .pending: return "刮削失败与无法识别番号的视频会统一归集在这里处理。"
         case .performers: return onlyFavPerformers ? "点击演员卡片或详情页的红心即可加入收藏。" : "完成影片刮削后会自动入库演员档案。"
         }
@@ -1291,8 +1261,6 @@ public struct MovieLibraryView: View {
                 let result = try await client.queryMovieLibrary(query: searchQuery, maker: selectedMaker, actor: selectedActor, sort: sort, onlyFavorites: onlyFavMovies, limit: pageSize, offset: offset)
                 guard version == requestVersion else { return }
                 pageItems = reset ? result.items : pageItems + result.items; total = result.total; makers = result.makers; actors = result.actors; offset += result.items.count
-            case .search:
-                return
             case .pending:
                 if reset {
                     async let issueReq = client.listScrapeIssues(category: issueCategory, query: searchQuery, limit: pageSize, offset: 0)

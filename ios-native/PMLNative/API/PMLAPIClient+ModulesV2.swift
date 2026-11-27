@@ -208,6 +208,27 @@ extension PMLAPIClient {
         try await command("get_online_comic_cbz_status", arguments: ["taskId": taskId])
     }
 
+    func searchAllMagnets(
+        query: String,
+        category: String = "all",
+        sort: String = "seeders",
+        sources: [String]? = nil,
+        limit: Int = 80
+    ) async throws -> MagnetSearchResponse {
+        var args: [String: Any] = [
+            "query": query,
+            "category": category,
+            "sort": sort,
+            "limit": limit,
+        ]
+        if let sources, !sources.isEmpty { args["sources"] = sources }
+        return try await command("search_all_magnets", arguments: args)
+    }
+
+    func inspectMagnetFiles(infoHash: String) async throws -> MagnetFilesResponse {
+        try await command("inspect_magnet_files", arguments: ["infoHash": infoHash])
+    }
+
     func getOnlineComicDetail(source: String, comicId: String) async throws -> OnlineComicDetail {
         try await command("get_online_comic_detail", arguments: ["source": source, "comicId": comicId])
     }

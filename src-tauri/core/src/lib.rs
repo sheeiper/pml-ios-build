@@ -3,6 +3,7 @@ pub mod library_modules;
 pub mod comic_library;
 pub mod comic_scraper;
 pub mod online_comics;
+pub mod magnet_search;
 pub mod media_library;
 pub mod telegram_public;
 pub mod v2_catalog;

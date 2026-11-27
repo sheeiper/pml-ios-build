@@ -45,6 +45,7 @@ public struct MovieDetailSheet: View {
     @State private var copyToast: String?
     @State private var showNoAssetAlert = false
     @State private var showMultiSourceSheet = false
+    @State private var showMoreVersionsSheet = false
     @State private var activeSeriesSheet: String?
 
     public init(
@@ -258,6 +259,17 @@ public struct MovieDetailSheet: View {
                                         .padding(.vertical, 6)
                                 }
                                 .buttonStyle(.bordered)
+
+                                Button {
+                                    showMoreVersionsSheet = true
+                                } label: {
+                                    Label("更多版本", systemImage: "link")
+                                        .font(.caption.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.purple)
 
                                 Button {
                                     showMultiSourceSheet = true
@@ -540,6 +552,24 @@ public struct MovieDetailSheet: View {
                     }
                 )
                 .environmentObject(appModel)
+            }
+            .sheet(isPresented: $showMoreVersionsSheet) {
+                if let targetNum = metadata?.number ?? currentNumber ?? number {
+                    OnlineMovieDetailSheet(
+                        release: PerformerRecentRelease(
+                            number: targetNum,
+                            title: metadata?.title ?? targetNum,
+                            releaseDate: metadata?.releaseDate,
+                            coverUrl: metadata?.coverUrl,
+                            detailUrl: nil,
+                            source: metadata?.source ?? "local",
+                            inLibrary: true
+                        ),
+                        onPlayAsset: { _, _ in showMoreVersionsSheet = false },
+                        onFilterActor: { _ in showMoreVersionsSheet = false }
+                    )
+                    .environmentObject(appModel)
+                }
             }
             .sheet(isPresented: $showMultiSourceSheet) {
                 if let targetNum = metadata?.number ?? currentNumber ?? number {

@@ -365,6 +365,7 @@ struct ComicWorkItem: Decodable, Identifiable, Hashable {
     let coverIsArchive: Bool
     let coverPageIndex: Int?
     let volumeCount: Int64
+    let totalPages: Int64?
     let totalBytes: Int64
     let source: String
     let category: String?
@@ -567,4 +568,54 @@ struct CbzPackageTask: Decodable {
     let downloadUrl: String?
     let sizeBytes: UInt64?
     let error: String?
+}
+
+struct UniversalMagnetItem: Decodable, Identifiable, Hashable {
+    var id: String { infoHash }
+    let title: String
+    let magnet: String
+    let infoHash: String
+    let sizeBytes: UInt64
+    let sizeText: String
+    let seeders: Int
+    let leechers: Int
+    let category: String
+    let source: String
+    let tracker: String
+    let pubDate: String
+    let timestamp: Int64
+}
+
+struct MagnetSourceStat: Decodable, Identifiable, Hashable {
+    var id: String { source }
+    let source: String
+    let label: String
+    let count: Int
+    let ok: Bool
+    let elapsedMs: UInt64
+    let error: String?
+}
+
+struct MagnetSearchResponse: Decodable {
+    let query: String
+    let total: Int
+    let items: [UniversalMagnetItem]
+    let sourceStats: [MagnetSourceStat]
+}
+
+struct MagnetFileEntry: Decodable, Identifiable, Hashable {
+    var id: String { "\(path)-\(sizeBytes)" }
+    let path: String
+    let sizeBytes: UInt64
+    let sizeText: String
+}
+
+struct MagnetFilesResponse: Decodable {
+    let infoHash: String
+    let name: String
+    let totalSizeBytes: UInt64
+    let totalSizeText: String
+    let fileCount: Int
+    let files: [MagnetFileEntry]
+    let source: String
 }
