@@ -548,7 +548,7 @@ struct MagnetSearchView: View {
             }
     }
 
-    private func cleanPreviewSheetView(_ target: OfflineInboxItem) -> some View {
+    private func cleanPreviewSheetView(_ target: InboxPlanItem) -> some View {
             NavigationStack {
                 List {
                     Section("主文件夹命名对比") {
