@@ -776,7 +776,7 @@ struct OnlineMovieDetailSheet: View {
                         .padding(.vertical, 16)
                         .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
                 } else {
-                    ForEach(aggMagnets) { item in
+                    ForEach(Array(aggMagnets.enumerated()), id: \.offset) { _, item in
                         VStack(alignment: .leading, spacing: 8) {
                             Text(item.title)
                                 .font(.caption.weight(.semibold))

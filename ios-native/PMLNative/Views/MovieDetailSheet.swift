@@ -68,8 +68,48 @@ public struct MovieDetailSheet: View {
 
     public var body: some View {
         NavigationStack {
-            ZStack(alignment: .top) {
-                mainScrollView
+            contentStack
+                .sheet(item: $selectedPerformer) { person in
+                    performerSheet(person)
+                }
+                .sheet(isPresented: $showMoreVersionsSheet) {
+                    moreVersionsSheet
+                }
+                .sheet(isPresented: $showMultiSourceSheet) {
+                    multiSourceSheet
+                }
+                .alert("未找到本地视频文件", isPresented: $showNoAssetAlert) {
+                    Button("知道了", role: .cancel) {}
+                } message: {
+                    Text("该作品当前仅有影视百科资料，网盘或本地尚未匹配到对应的视频文件。可在影视库【数据】中执行增量同步。")
+                }
+                .alert("无法播放视频", isPresented: Binding(
+                    get: { playbackErrorText != nil },
+                    set: { if !$0 { playbackErrorText = nil } }
+                )) {
+                    Button("知道了", role: .cancel) { playbackErrorText = nil }
+                } message: {
+                    Text(playbackErrorText ?? "")
+                }
+                .sheet(isPresented: Binding(
+                    get: { activeSeriesSheet != nil },
+                    set: { if !$0 { activeSeriesSheet = nil } }
+                )) {
+                    seriesSheet
+                }
+                .fullScreenCover(item: $activeFullScreen) { modal in
+                    fullScreenModal(modal)
+                }
+                .task {
+                    currentNumber = number
+                    await loadData()
+                }
+        }
+    }
+
+    private var contentStack: some View {
+        ZStack(alignment: .top) {
+            mainScrollView
 
             if let toast = copyToast {
                 Text(toast)
@@ -85,127 +125,116 @@ public struct MovieDetailSheet: View {
         }
         .animation(.easeInOut(duration: 0.2), value: copyToast)
         .navigationTitle(metadata?.number ?? "影视百科详情")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    if let favNumber = metadata?.number ?? currentNumber ?? number, !favNumber.isEmpty {
-                        let isFav = favs.isFavorited(.movie, id: favNumber)
-                        Button {
-                            Task { await favs.toggle(.movie, id: favNumber, client: appModel.apiClient) }
-                        } label: {
-                            Image(systemName: isFav ? "heart.fill" : "heart")
-                                .foregroundStyle(isFav ? .red : .primary)
-                        }
-                        .accessibilityLabel(isFav ? "取消收藏影片" : "收藏影片")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if let favNumber = metadata?.number ?? currentNumber ?? number, !favNumber.isEmpty {
+                    let isFav = favs.isFavorited(.movie, id: favNumber)
+                    Button {
+                        Task { await favs.toggle(.movie, id: favNumber, client: appModel.apiClient) }
+                    } label: {
+                        Image(systemName: isFav ? "heart.fill" : "heart")
+                            .foregroundStyle(isFav ? .red : .primary)
                     }
-                    Button("完成") { dismiss() }
+                    .accessibilityLabel(isFav ? "取消收藏影片" : "收藏影片")
+                }
+                Button("完成") { dismiss() }
+            }
+        }
+        .task {
+            await favs.ensureLoaded(client: appModel.apiClient)
+        }
+    }
+
+    @ViewBuilder
+    private func performerSheet(_ person: MoviePerformer) -> some View {
+        MoviePerformerDetailSheet(
+            performer: person,
+            onFilterMovies: onFilterActor.map { handler in { actorName in selectedPerformer = nil; dismiss(); handler(actorName) } },
+            onPlay: onPlay.map { handler in
+                { targetId, _ in
+                    selectedPerformer = nil
+                    dismiss()
+                    handler(targetId)
                 }
             }
-            .task {
-                await favs.ensureLoaded(client: appModel.apiClient)
+        )
+        .environmentObject(appModel)
+    }
+
+    @ViewBuilder
+    private var moreVersionsSheet: some View {
+        if let targetNum = metadata?.number ?? currentNumber ?? number {
+            OnlineMovieDetailSheet(
+                release: PerformerRecentRelease(
+                    number: targetNum,
+                    title: metadata?.title ?? targetNum,
+                    releaseDate: metadata?.releaseDate,
+                    coverUrl: metadata?.coverUrl,
+                    detailUrl: nil,
+                    source: metadata?.source ?? "local",
+                    inLibrary: true
+                ),
+                onPlayAsset: { _, _ in showMoreVersionsSheet = false },
+                onFilterActor: { _ in showMoreVersionsSheet = false }
+            )
+            .environmentObject(appModel)
+        }
+    }
+
+    @ViewBuilder
+    private var multiSourceSheet: some View {
+        if let targetNum = metadata?.number ?? currentNumber ?? number {
+            MovieMultiSourceSheet(number: targetNum, currentSource: metadata?.source) { saved in
+                metadata = saved
+                showMultiSourceSheet = false
             }
-            .sheet(item: $selectedPerformer) { person in
-                MoviePerformerDetailSheet(
-                    performer: person,
-                    onFilterMovies: onFilterActor.map { handler in { actorName in selectedPerformer = nil; dismiss(); handler(actorName) } },
-                    onPlay: onPlay.map { handler in
-                        { targetId, _ in
-                            selectedPerformer = nil
-                            dismiss()
-                            handler(targetId)
-                        }
-                    }
-                )
-                .environmentObject(appModel)
-            }
-            .sheet(isPresented: $showMoreVersionsSheet) {
-                if let targetNum = metadata?.number ?? currentNumber ?? number {
-                    OnlineMovieDetailSheet(
-                        release: PerformerRecentRelease(
-                            number: targetNum,
-                            title: metadata?.title ?? targetNum,
-                            releaseDate: metadata?.releaseDate,
-                            coverUrl: metadata?.coverUrl,
-                            detailUrl: nil,
-                            source: metadata?.source ?? "local",
-                            inLibrary: true
-                        ),
-                        onPlayAsset: { _, _ in showMoreVersionsSheet = false },
-                        onFilterActor: { _ in showMoreVersionsSheet = false }
-                    )
-                    .environmentObject(appModel)
+            .environmentObject(appModel)
+        }
+    }
+
+    @ViewBuilder
+    private var seriesSheet: some View {
+        if let series = activeSeriesSheet {
+            MovieSeriesSheet(
+                series: series,
+                onOpenLocalMovie: { movie in
+                    activeSeriesSheet = nil
+                    metadata = movie
+                    currentNumber = movie.number
+                    Task { await loadAux(for: movie.number) }
+                },
+                onPlayAsset: { targetId, title in
+                    activeSeriesSheet = nil
+                    Task { await playLocally(assetId: targetId, title: title) }
                 }
-            }
-            .sheet(isPresented: $showMultiSourceSheet) {
-                if let targetNum = metadata?.number ?? currentNumber ?? number {
-                    MovieMultiSourceSheet(number: targetNum, currentSource: metadata?.source) { saved in
-                        metadata = saved
-                        showMultiSourceSheet = false
-                    }
-                    .environmentObject(appModel)
-                }
-            }
-            .alert("未找到本地视频文件", isPresented: $showNoAssetAlert) {
-                Button("知道了", role: .cancel) {}
-            } message: {
-                Text("该作品当前仅有影视百科资料，网盘或本地尚未匹配到对应的视频文件。可在影视库【数据】中执行增量同步。")
-            }
-            .alert("无法播放视频", isPresented: Binding(
-                get: { playbackErrorText != nil },
-                set: { if !$0 { playbackErrorText = nil } }
-            )) {
-                Button("知道了", role: .cancel) { playbackErrorText = nil }
-            } message: {
-                Text(playbackErrorText ?? "")
-            }
-            .sheet(isPresented: Binding(
-                get: { activeSeriesSheet != nil },
-                set: { if !$0 { activeSeriesSheet = nil } }
-            )) {
-                if let series = activeSeriesSheet {
-                    MovieSeriesSheet(
-                        series: series,
-                        onOpenLocalMovie: { movie in
-                            activeSeriesSheet = nil
-                            metadata = movie
-                            currentNumber = movie.number
-                            Task { await loadAux(for: movie.number) }
-                        },
-                        onPlayAsset: { targetId, title in
-                            activeSeriesSheet = nil
-                            Task { await playLocally(assetId: targetId, title: title) }
-                        }
-                    )
-                    .environmentObject(appModel)
-                }
-            }
-            .fullScreenCover(item: $activeFullScreen) { modal in
-                switch modal {
-                case .sample(let idx):
-                    SampleGalleryPagerView(
-                        images: metadata?.sampleImages ?? [],
-                        initialIndex: idx,
-                        onClose: { activeFullScreen = nil }
-                    )
-                    .environmentObject(appModel)
-                case .player(let item):
-                    GestureVideoPlayerSheet(
-                        url: item.url,
-                        title: item.title,
-                        assetId: item.assetId,
-                        startAt: item.startAt,
-                        fallbackURL: item.fallbackURL,
-                        sourceLabel: item.sourceLabel,
-                        remotePath: item.remotePath
-                    )
-                    .id(item.id)
-                    .environmentObject(appModel)
-                }
-            }
-            .task {
-                currentNumber = number
-                await loadData()
-            }
+            )
+            .environmentObject(appModel)
+        }
+    }
+
+    @ViewBuilder
+    private func fullScreenModal(_ modal: DetailFullScreenModal) -> some View {
+        switch modal {
+        case .sample(let idx):
+            SampleGalleryPagerView(
+                images: metadata?.sampleImages ?? [],
+                initialIndex: idx,
+                onClose: { activeFullScreen = nil }
+            )
+            .environmentObject(appModel)
+        case .player(let item):
+            GestureVideoPlayerSheet(
+                url: item.url,
+                title: item.title,
+                assetId: item.assetId,
+                startAt: item.startAt,
+                fallbackURL: item.fallbackURL,
+                sourceLabel: item.sourceLabel,
+                remotePath: item.remotePath
+            )
+            .id(item.id)
+            .environmentObject(appModel)
         }
     }
 
