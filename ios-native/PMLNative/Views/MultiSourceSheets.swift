@@ -348,7 +348,9 @@ struct PerformerMultiSourceSheet: View {
             bloodType: pickString(["wikipedia", "javbus", "javdb"], { $0.bloodType }),
             debutYear: pickString(["wikipedia", "javbus", "javdb"], { $0.debutYear }),
             agency: pickString(["wikipedia", "javbus", "javdb"], { $0.agency }),
-            bio: pickString(["wikipedia", "javbus", "javdb"], { $0.bio })
+            bio: pickString(["wikipedia", "javbus", "javdb"], { $0.bio }),
+            twitterUrl: pickString(["wikipedia", "javbus", "javdb"], { $0.twitterUrl }),
+            instagramUrl: pickString(["wikipedia", "javbus", "javdb"], { $0.instagramUrl })
         )
         await adopt(merged, avatarOnly: false)
     }
