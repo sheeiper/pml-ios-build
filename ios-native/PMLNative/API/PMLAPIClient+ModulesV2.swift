@@ -249,7 +249,7 @@ extension PMLAPIClient {
     }
 
     func deleteOfflineDownloadTask(id: String) async throws {
-        let _: EmptyResponse? = try? await command("delete_offline_download_task", arguments: ["id": id])
+        try await command("delete_offline_download_task", arguments: ["id": id])
     }
 
     func getOfflineCloudStatus(page: Int = 1) async throws -> OfflineCloudStatusResponse {

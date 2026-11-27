@@ -452,262 +452,7 @@ struct MagnetSearchView: View {
             } else if mainTab == 2 {
                 inboxOrganizeTabView
             } else {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                // 简洁搜索框 + 排序菜单
-                HStack(spacing: 8) {
-                    TextField("搜索影片、动漫、软件或番号…", text: $query)
-                        .textFieldStyle(.roundedBorder)
-                        .submitLabel(.search)
-                        .onSubmit { Task { await runSearch() } }
-                    Button {
-                        Task { await runSearch() }
-                    } label: {
-                        if loading {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Text("搜索")
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.blue)
-                    .disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-                .padding(.horizontal, 14)
-
-                // 单行分类条 + 内联排序
-                HStack(spacing: 8) {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(categories, id: \.id) { c in
-                                Button {
-                                    category = c.id
-                                    if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                        Task { await runSearch() }
-                                    }
-                                } label: {
-                                    Text(c.label)
-                                        .font(.caption.weight(.semibold))
-                                        .padding(.horizontal, 11)
-                                        .padding(.vertical, 6)
-                                        .background(category == c.id ? Color.blue : Color.secondary.opacity(0.14), in: Capsule())
-                                        .foregroundStyle(category == c.id ? .white : .primary)
-                                }
-                            }
-                        }
-                    }
-                    Menu {
-                        Button("做种最多") { sort = "seeders"; if !query.isEmpty { Task { await runSearch() } } }
-                        Button("体积最大") { sort = "size_desc"; if !query.isEmpty { Task { await runSearch() } } }
-                        Button("最新发布") { sort = "date_desc"; if !query.isEmpty { Task { await runSearch() } } }
-                    } label: {
-                        Label(sortLabel, systemImage: "arrow.up.arrow.down")
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 6)
-                            .background(Color.secondary.opacity(0.14), in: Capsule())
-                            .foregroundStyle(.primary)
-                    }
-                }
-                .padding(.horizontal, 14)
-
-                // 搜索历史（未搜时展示）
-                if buckets.isEmpty && !historyList.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label("最近搜索", systemImage: "clock.arrow.circlepath")
-                                .font(.caption.bold())
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Button("清空") { historyRaw = "" }
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                ForEach(historyList, id: \.self) { term in
-                                    Button(term) {
-                                        query = term
-                                        Task { await runSearch() }
-                                    }
-                                    .font(.caption)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                                    .background(Color.secondary.opacity(0.14), in: Capsule())
-                                    .foregroundStyle(.primary)
-                                }
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                }
-
-                if !errorMsg.isEmpty {
-                    Text(errorMsg)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .padding(.horizontal, 14)
-                }
-
-                // 分源标签栏（先返回先展示，其他源转圈，不同源不混排）
-                if !buckets.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(buckets) { b in
-                                Button {
-                                    activeSourceId = b.id
-                                } label: {
-                                    HStack(spacing: 5) {
-                                        if b.loading {
-                                            ProgressView().controlSize(.mini)
-                                        } else {
-                                            Image(systemName: b.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                                .foregroundStyle(b.ok ? .green : .red)
-                                        }
-                                        Text(b.label)
-                                        if !b.loading {
-                                            Text("\(b.count)")
-                                                .fontWeight(.bold)
-                                        }
-                                    }
-                                    .font(.caption.weight(.semibold))
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 6)
-                                    .background(
-                                        activeBucket?.id == b.id ? Color.blue.opacity(0.22) : Color.secondary.opacity(0.12),
-                                        in: Capsule()
-                                    )
-                                    .overlay(
-                                        Capsule().stroke(activeBucket?.id == b.id ? Color.blue : Color.clear, lineWidth: 1)
-                                    )
-                                    .foregroundStyle(.primary)
-                                }
-                            }
-                        }
-                        .padding(.horizontal, 14)
-                    }
-                }
-
-                if let active = activeBucket {
-                    if active.loading {
-                        ProgressView("正在检索「\(active.label)」…")
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 36)
-                    } else if active.items.isEmpty {
-                        ContentUnavailableView(
-                            "「\(active.label)」暂无匹配磁力",
-                            systemImage: "link.badge.plus",
-                            description: Text("可点击上方其他数据源切换查看，或缩短关键词重试。")
-                        )
-                        .padding(.top, 30)
-                    } else {
-                        LazyVStack(spacing: 10) {
-                            ForEach(active.items) { item in
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack(alignment: .top, spacing: 6) {
-                                        Text(item.tracker)
-                                            .font(.system(size: 10, weight: .bold))
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(trackerColor(item.source).opacity(0.2), in: RoundedRectangle(cornerRadius: 4))
-                                            .foregroundStyle(trackerColor(item.source))
-                                        Text(item.title)
-                                            .font(.subheadline.weight(.semibold))
-                                            .foregroundStyle(.primary)
-                                            .lineLimit(3)
-                                    }
-
-                                    HStack(spacing: 10) {
-                                        Text(item.sizeText)
-                                            .font(.caption.bold())
-                                        Label("\(item.seeders)", systemImage: "arrow.up")
-                                            .font(.caption.bold())
-                                            .foregroundStyle(.green)
-                                        Label("\(item.leechers)", systemImage: "arrow.down")
-                                            .font(.caption)
-                                            .foregroundStyle(.orange)
-                                        if !item.pubDate.isEmpty {
-                                            Text(item.pubDate)
-                                                .font(.caption2)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        Spacer()
-                                    }
-
-                                    HStack(spacing: 10) {
-                                        Button {
-                                            Task { await submitOffline(magnet: item.magnet, title: item.title, key: item.infoHash) }
-                                        } label: {
-                                            if offlineBusyKey == item.infoHash {
-                                                ProgressView().controlSize(.mini)
-                                            } else {
-                                                Label(
-                                                    offlinedHashes.contains(item.infoHash.lowercased()) ? "已离线" : "离线",
-                                                    systemImage: offlinedHashes.contains(item.infoHash.lowercased()) ? "checkmark.icloud.fill" : "icloud.and.arrow.down"
-                                                )
-                                                .font(.caption.bold())
-                                            }
-                                        }
-                                        .buttonStyle(.borderedProminent)
-                                        .controlSize(.small)
-                                        .tint(offlinedHashes.contains(item.infoHash.lowercased()) ? .green : .blue)
-                                        .disabled(!offlineBusyKey.isEmpty)
-
-                                        Button {
-                                            UIPasteboard.general.string = item.magnet
-                                            copiedHash = item.infoHash
-                                            copiedStore.markCopied(item.infoHash)
-                                        } label: {
-                                            Label(
-                                                copiedStore.isCopied(item.infoHash) ? "已复制" : "复制",
-                                                systemImage: copiedStore.isCopied(item.infoHash) ? "checkmark" : "doc.on.doc"
-                                            )
-                                            .font(.caption.bold())
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-                                        .tint(copiedStore.isCopied(item.infoHash) ? .green : .secondary)
-
-                                        Button {
-                                            filesTarget = MagnetFilesSheetTarget(infoHash: item.infoHash, title: item.title)
-                                        } label: {
-                                            Label("文件", systemImage: "folder")
-                                                .font(.caption)
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-
-                                        ShareLink(item: item.magnet) {
-                                            Image(systemName: "square.and.arrow.up")
-                                                .font(.caption)
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-
-                                        Spacer()
-                                        Text(item.category)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                }
-                                .padding(12)
-                                .pmlGlassCard(cornerRadius: 14)
-                            }
-                        }
-                        .padding(.horizontal, 14)
-                    }
-                } else {
-                    ContentUnavailableView(
-                        "全网磁力分源搜索",
-                        systemImage: "link.circle.fill",
-                        description: Text("独立并发检索 BT4G 中文、动漫花园、Knaben 与 Nyaa，先返回先展示。")
-                    )
-                    .padding(.top, 36)
-                }
-            }
-            .padding(.vertical, 10)
-        }
+                searchTabView
             }
         }
         .navigationTitle("离线下载")
@@ -983,6 +728,265 @@ struct MagnetSearchView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var searchTabView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                // 简洁搜索框 + 排序菜单
+                HStack(spacing: 8) {
+                    TextField("搜索影片、动漫、软件或番号…", text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .submitLabel(.search)
+                        .onSubmit { Task { await runSearch() } }
+                    Button {
+                        Task { await runSearch() }
+                    } label: {
+                        if loading {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("搜索")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                    .disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(.horizontal, 14)
+
+                // 单行分类条 + 内联排序
+                HStack(spacing: 8) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(categories, id: \.id) { c in
+                                Button {
+                                    category = c.id
+                                    if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        Task { await runSearch() }
+                                    }
+                                } label: {
+                                    Text(c.label)
+                                        .font(.caption.weight(.semibold))
+                                        .padding(.horizontal, 11)
+                                        .padding(.vertical, 6)
+                                        .background(category == c.id ? Color.blue : Color.secondary.opacity(0.14), in: Capsule())
+                                        .foregroundStyle(category == c.id ? .white : .primary)
+                                }
+                            }
+                        }
+                    }
+                    Menu {
+                        Button("做种最多") { sort = "seeders"; if !query.isEmpty { Task { await runSearch() } } }
+                        Button("体积最大") { sort = "size_desc"; if !query.isEmpty { Task { await runSearch() } } }
+                        Button("最新发布") { sort = "date_desc"; if !query.isEmpty { Task { await runSearch() } } }
+                    } label: {
+                        Label(sortLabel, systemImage: "arrow.up.arrow.down")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .background(Color.secondary.opacity(0.14), in: Capsule())
+                            .foregroundStyle(.primary)
+                    }
+                }
+                .padding(.horizontal, 14)
+
+                // 搜索历史（未搜时展示）
+                if buckets.isEmpty && !historyList.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("最近搜索", systemImage: "clock.arrow.circlepath")
+                                .font(.caption.bold())
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("清空") { historyRaw = "" }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(historyList, id: \.self) { term in
+                                    Button(term) {
+                                        query = term
+                                        Task { await runSearch() }
+                                    }
+                                    .font(.caption)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.secondary.opacity(0.14), in: Capsule())
+                                    .foregroundStyle(.primary)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                }
+
+                if !errorMsg.isEmpty {
+                    Text(errorMsg)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .padding(.horizontal, 14)
+                }
+
+                // 分源标签栏（先返回先展示，其他源转圈，不同源不混排）
+                if !buckets.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(buckets) { b in
+                                Button {
+                                    activeSourceId = b.id
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        if b.loading {
+                                            ProgressView().controlSize(.mini)
+                                        } else {
+                                            Image(systemName: b.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                                .foregroundStyle(b.ok ? .green : .red)
+                                        }
+                                        Text(b.label)
+                                        if !b.loading {
+                                            Text("\(b.count)")
+                                                .fontWeight(.bold)
+                                        }
+                                    }
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        activeBucket?.id == b.id ? Color.blue.opacity(0.22) : Color.secondary.opacity(0.12),
+                                        in: Capsule()
+                                    )
+                                    .overlay(
+                                        Capsule().stroke(activeBucket?.id == b.id ? Color.blue : Color.clear, lineWidth: 1)
+                                    )
+                                    .foregroundStyle(.primary)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                    }
+                }
+
+                if let active = activeBucket {
+                    if active.loading {
+                        ProgressView("正在检索「\(active.label)」…")
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 36)
+                    } else if active.items.isEmpty {
+                        ContentUnavailableView(
+                            "「\(active.label)」暂无匹配磁力",
+                            systemImage: "link.badge.plus",
+                            description: Text("可点击上方其他数据源切换查看，或缩短关键词重试。")
+                        )
+                        .padding(.top, 30)
+                    } else {
+                        LazyVStack(spacing: 10) {
+                            ForEach(active.items) { item in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Text(item.tracker)
+                                            .font(.system(size: 10, weight: .bold))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(trackerColor(item.source).opacity(0.2), in: RoundedRectangle(cornerRadius: 4))
+                                            .foregroundStyle(trackerColor(item.source))
+                                        Text(item.title)
+                                            .font(.subheadline.weight(.semibold))
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(3)
+                                    }
+
+                                    HStack(spacing: 10) {
+                                        Text(item.sizeText)
+                                            .font(.caption.bold())
+                                        Label("\(item.seeders)", systemImage: "arrow.up")
+                                            .font(.caption.bold())
+                                            .foregroundStyle(.green)
+                                        Label("\(item.leechers)", systemImage: "arrow.down")
+                                            .font(.caption)
+                                            .foregroundStyle(.orange)
+                                        if !item.pubDate.isEmpty {
+                                            Text(item.pubDate)
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                    }
+
+                                    HStack(spacing: 10) {
+                                        Button {
+                                            Task { await submitOffline(magnet: item.magnet, title: item.title, key: item.infoHash) }
+                                        } label: {
+                                            if offlineBusyKey == item.infoHash {
+                                                ProgressView().controlSize(.mini)
+                                            } else {
+                                                Label(
+                                                    offlinedHashes.contains(item.infoHash.lowercased()) ? "已离线" : "离线",
+                                                    systemImage: offlinedHashes.contains(item.infoHash.lowercased()) ? "checkmark.icloud.fill" : "icloud.and.arrow.down"
+                                                )
+                                                .font(.caption.bold())
+                                            }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.small)
+                                        .tint(offlinedHashes.contains(item.infoHash.lowercased()) ? .green : .blue)
+                                        .disabled(!offlineBusyKey.isEmpty)
+
+                                        Button {
+                                            UIPasteboard.general.string = item.magnet
+                                            copiedHash = item.infoHash
+                                            copiedStore.markCopied(item.infoHash)
+                                        } label: {
+                                            Label(
+                                                copiedStore.isCopied(item.infoHash) ? "已复制" : "复制",
+                                                systemImage: copiedStore.isCopied(item.infoHash) ? "checkmark" : "doc.on.doc"
+                                            )
+                                            .font(.caption.bold())
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .tint(copiedStore.isCopied(item.infoHash) ? .green : .secondary)
+
+                                        Button {
+                                            filesTarget = MagnetFilesSheetTarget(infoHash: item.infoHash, title: item.title)
+                                        } label: {
+                                            Label("文件", systemImage: "folder")
+                                                .font(.caption)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+
+                                        ShareLink(item: item.magnet) {
+                                            Image(systemName: "square.and.arrow.up")
+                                                .font(.caption)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+
+                                        Spacer()
+                                        Text(item.category)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                .padding(12)
+                                .pmlGlassCard(cornerRadius: 14)
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                    }
+                } else {
+                    ContentUnavailableView(
+                        "全网磁力分源搜索",
+                        systemImage: "link.circle.fill",
+                        description: Text("独立并发检索 BT4G 中文、动漫花园、Knaben 与 Nyaa，先返回先展示。")
+                    )
+                    .padding(.top, 36)
+                }
+            }
+            .padding(.vertical, 10)
         }
     }
 
