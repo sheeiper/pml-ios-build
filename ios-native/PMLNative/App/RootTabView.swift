@@ -546,7 +546,6 @@ struct MagnetSearchView: View {
                     .environmentObject(model)
                 }
             }
-        }
     }
 
     private func cleanPreviewSheetView(_ target: OfflineInboxItem) -> some View {
@@ -649,7 +648,6 @@ struct MagnetSearchView: View {
                     }
                 }
             }
-        }
     }
 
     private var trashSheetView: some View {
@@ -743,7 +741,6 @@ struct MagnetSearchView: View {
                     }
                 }
             }
-        }
     }
 
     private var searchTabView: some View {
