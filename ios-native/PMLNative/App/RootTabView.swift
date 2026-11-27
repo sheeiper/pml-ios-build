@@ -473,6 +473,17 @@ struct MagnetSearchView: View {
             MagnetFilesSheetView(target: t).environmentObject(model)
         }
         .sheet(isPresented: $showOfflineSheet) {
+            offlineSheetView
+        }
+        .sheet(item: $cleanPreviewTarget) { target in
+            cleanPreviewSheetView(target)
+        }
+        .sheet(isPresented: $showTrashSheet) {
+            trashSheetView
+        }
+    }
+
+    private var offlineSheetView: some View {
             NavigationStack {
                 Form {
                     if !offlineError.isEmpty {
@@ -536,7 +547,9 @@ struct MagnetSearchView: View {
                 }
             }
         }
-        .sheet(item: $cleanPreviewTarget) { target in
+    }
+
+    private func cleanPreviewSheetView(_ target: OfflineInboxItem) -> some View {
             NavigationStack {
                 List {
                     Section("主文件夹命名对比") {
@@ -637,7 +650,9 @@ struct MagnetSearchView: View {
                 }
             }
         }
-        .sheet(isPresented: $showTrashSheet) {
+    }
+
+    private var trashSheetView: some View {
             NavigationStack {
                 List {
                     if !trashError.isEmpty {
