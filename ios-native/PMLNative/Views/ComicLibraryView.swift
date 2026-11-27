@@ -299,7 +299,7 @@ struct ComicLibraryView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 RoundedRectangle(cornerRadius: 8)
                                     .fill(Color.secondary.opacity(0.16))
-                                    .aspectRatio(2 / 3, contentMode: .fit)
+                                    .aspectRatio(2.0 / 3.0, contentMode: .fit)
                                 RoundedRectangle(cornerRadius: 4)
                                     .fill(Color.secondary.opacity(0.14))
                                     .frame(height: 11)
@@ -318,14 +318,18 @@ struct ComicLibraryView: View {
                             } label: {
                                 VStack(alignment: .leading, spacing: 5) {
                                     ZStack(alignment: .topTrailing) {
-                                        CachedImageView(
-                                            url: coverURL(assetId: work.coverAssetId, isArchive: work.coverIsArchive, pageIndex: work.coverPageIndex ?? 0),
-                                            contentMode: .fill,
-                                            minHeight: 150,
-                                            maxPixel: 420
-                                        )
-                                        .aspectRatio(2 / 3, contentMode: .fit)
-                                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                        Color.secondary.opacity(0.12)
+                                            .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                                            .overlay {
+                                                CachedImageView(
+                                                    url: coverURL(assetId: work.coverAssetId, isArchive: work.coverIsArchive, pageIndex: work.coverPageIndex ?? 0),
+                                                    contentMode: .fill,
+                                                    minHeight: 0,
+                                                    maxPixel: 420
+                                                )
+                                            }
+                                            .clipped()
+                                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
                                         if work.volumeCount > 1 {
                                             Text("\(work.volumeCount)卷")
@@ -1246,14 +1250,18 @@ private struct OnlineComicsPaneView: View {
                             } label: {
                                 VStack(alignment: .leading, spacing: 5) {
                                     ZStack(alignment: .topLeading) {
-                                        CachedImageView(
-                                            url: model.apiClient?.onlineComicImageURL(relativePath: item.coverUrl),
-                                            contentMode: .fill,
-                                            minHeight: 150,
-                                            maxPixel: 420
-                                        )
-                                        .aspectRatio(2.0 / 3.0, contentMode: .fill)
-                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                        Color.secondary.opacity(0.12)
+                                            .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                                            .overlay {
+                                                CachedImageView(
+                                                    url: model.apiClient?.onlineComicImageURL(relativePath: item.coverUrl),
+                                                    contentMode: .fill,
+                                                    minHeight: 0,
+                                                    maxPixel: 420
+                                                )
+                                            }
+                                            .clipped()
+                                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
                                         if mode.hasPrefix("rank_") {
                                             Text("#\(idx + 1)")

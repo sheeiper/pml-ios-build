@@ -318,15 +318,17 @@ private struct GallerySetCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack {
-                CachedImageView(
-                    url: client?.v2CoverURL(assetId: item.coverAssetId, isArchive: item.isArchive),
-                    contentMode: .fill,
-                    minHeight: 206,
-                    maxPixel: 540
-                )
-                .frame(height: 206)
-                .frame(maxWidth: .infinity)
-                .clipped()
+                Color.secondary.opacity(0.12)
+                    .aspectRatio(3.0 / 4.0, contentMode: .fit)
+                    .overlay {
+                        CachedImageView(
+                            url: client?.v2CoverURL(assetId: item.coverAssetId, isArchive: item.isArchive),
+                            contentMode: .fill,
+                            minHeight: 0,
+                            maxPixel: 540
+                        )
+                    }
+                    .clipped()
 
                 if isOpening {
                     Color.black.opacity(0.35)
