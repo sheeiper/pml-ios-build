@@ -23,178 +23,59 @@ enum ComicReadingMode: String, CaseIterable, Identifiable {
     }
 }
 
-/// 图片文件夹漫画：条漫连续阅读，或单页/双页翻页。
+/// 图片文件夹漫画：复用统一极简阅读器（缩放、原图直出+渐进增强动画、Metal 画质增强、单/双/条漫/日漫）。
 struct ComicFolderReaderView: View {
     let target: ComicFolderTarget
 
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
 
-    @State private var pages: [RemoteBrowserEntry] = []
-    @State private var urls: [String: URL] = [:]
+    @State private var pageSources: [ReaderPageSource] = []
+    @State private var initialIndex = 0
     @State private var loading = true
     @State private var errorText = ""
-    @State private var currentPage = 0
-    @State private var mode: ComicReadingMode = .webtoon
-    @State private var doubleStart = 0
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if loading && pages.isEmpty {
+        Group {
+            if loading && pageSources.isEmpty {
+                ZStack {
+                    Color.black.ignoresSafeArea()
                     ProgressView("加载目录…")
-                } else if !errorText.isEmpty {
+                        .tint(.white)
+                        .foregroundStyle(.white)
+                }
+            } else if !errorText.isEmpty {
+                NavigationStack {
                     ContentUnavailableView(
                         "无法打开漫画",
                         systemImage: "exclamationmark.triangle",
                         description: Text(errorText)
                     )
-                } else if pages.isEmpty {
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) { Button("关闭") { dismiss() } }
+                    }
+                }
+            } else if pageSources.isEmpty {
+                NavigationStack {
                     ContentUnavailableView("没有图片页", systemImage: "photo.on.rectangle")
-                } else if mode == .webtoon {
-                    webtoonBody
-                } else {
-                    pagedBody
-                }
-            }
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar(.hidden, for: .tabBar)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 14) {
-                        Menu {
-                            Picker("阅读模式", selection: $mode) {
-                                ForEach(ComicReadingMode.allCases) { item in
-                                    Label(item.rawValue, systemImage: item.symbol).tag(item)
-                                }
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis")
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) { Button("关闭") { dismiss() } }
                         }
-                        Button("完成") { dismiss() }
-                    }
                 }
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                if !pages.isEmpty, mode != .webtoon {
-                    Text(pageLabel)
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(.bottom, 6)
-                }
-            }
-            .task { await load() }
-            .task(id: currentPage) {
-                guard !pages.isEmpty else { return }
-                for offset in [1, 2, 3, -1] {
-                    let index = currentPage + offset
-                    guard pages.indices.contains(index) else { continue }
-                    let entry = pages[index]
-                    await ensureURL(entry)
-                    if let url = resolvedURL(for: entry) {
-                        Task {
-                            _ = await ImageCache.shared.cachedOrLoad(url, maxPixel: 1600)
-                        }
-                    }
-                }
+            } else {
+                ComicGalleryReaderView(
+                    kind: .comic,
+                    title: title,
+                    sources: pageSources,
+                    initialPage: initialIndex
+                )
             }
         }
+        .task { await load() }
     }
 
     private var title: String {
         target.path.split(separator: "/").last.map(String.init) ?? "漫画"
-    }
-
-    private var pageLabel: String {
-        if mode == .double {
-            let end = min(doubleStart + 2, pages.count)
-            return "\(doubleStart + 1)-\(end) / \(pages.count)"
-        }
-        return "\(currentPage + 1) / \(pages.count)"
-    }
-
-    private var webtoonBody: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(pages.enumerated()), id: \.element.id) { index, entry in
-                        pageView(entry, index: index)
-                            .id(entry.path)
-                            .onAppear {
-                                if currentPage != index { currentPage = index }
-                            }
-                    }
-                }
-            }
-            .onAppear {
-                guard let startPath = target.startPath,
-                      let index = pages.firstIndex(where: { $0.path == startPath }) else { return }
-                currentPage = index
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    proxy.scrollTo(startPath, anchor: .top)
-                }
-            }
-        }
-    }
-
-    private var pagedBody: some View {
-        TabView(selection: mode == .double ? $doubleStart : $currentPage) {
-            if mode == .double {
-                ForEach(doubleStarts, id: \.self) { start in
-                    HStack(spacing: 2) {
-                        ForEach(visibleIndexes(from: start), id: \.self) { index in
-                            pageView(pages[index], index: index, updatesCursor: false)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
-                    }
-                    .tag(start)
-                }
-            } else {
-                ForEach(Array(pages.enumerated()), id: \.element.id) { index, entry in
-                    pageView(entry, index: index)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .tag(index)
-                }
-            }
-        }
-        .tabViewStyle(.page(indexDisplayMode: .never))
-        .onChange(of: doubleStart) { _, newValue in
-            currentPage = newValue
-        }
-    }
-
-    private var doubleStarts: [Int] {
-        stride(from: 0, to: pages.count, by: 2).map { $0 }
-    }
-
-    private func visibleIndexes(from start: Int) -> [Int] {
-        [start, start + 1].filter { $0 < pages.count }
-    }
-
-    private func resolvedURL(for entry: RemoteBrowserEntry) -> URL? {
-        urls[entry.path]
-    }
-
-    @ViewBuilder
-    private func pageView(_ entry: RemoteBrowserEntry, index: Int, updatesCursor: Bool = true) -> some View {
-        Group {
-            if let url = resolvedURL(for: entry) {
-                CachedImageView(url: url, contentMode: .fit, minHeight: 320, maxPixel: 1600)
-                    .frame(maxWidth: .infinity)
-            } else {
-                ProgressView()
-                    .frame(maxWidth: .infinity, minHeight: 320)
-            }
-        }
-        .task { await ensureURL(entry) }
-        .onAppear {
-            if updatesCursor && currentPage != index {
-                currentPage = index
-            }
-        }
     }
 
     private func load() async {
@@ -213,31 +94,31 @@ struct ComicFolderReaderView: View {
                 collected.append(contentsOf: page.items.filter { $0.isImage })
                 cursor = page.nextCursor
             } while cursor != nil && collected.count < 800
-            pages = collected
-            if mode != .webtoon, let startPath = target.startPath,
-               let index = pages.firstIndex(where: { $0.path == startPath }) {
-                currentPage = index
+
+            var sources: [ReaderPageSource] = []
+            sources.reserveCapacity(collected.count)
+            for entry in collected {
+                let fallback: URL?
+                if let direct = model.alistDirectURL(remotePath: entry.path) {
+                    fallback = direct
+                } else {
+                    fallback = await model.imageSource(assetId: entry.assetId, remotePath: entry.path)?.url
+                }
+                guard let fallback else { continue }
+                sources.append(.remoteAsset(
+                    assetId: entry.assetId ?? "",
+                    remotePath: entry.path,
+                    fallbackURL: fallback
+                ))
+            }
+            pageSources = sources
+            if let startPath = target.startPath,
+               let idx = collected.firstIndex(where: { $0.path == startPath }) {
+                initialIndex = idx
             }
         } catch {
             errorText = error.localizedDescription
         }
         loading = false
-    }
-
-    private func ensureURL(_ entry: RemoteBrowserEntry) async {
-        guard urls[entry.path] == nil else { return }
-        if let assetId = entry.assetId,
-           let source = await model.imageSource(assetId: assetId, remotePath: entry.path) {
-            urls[entry.path] = source.url
-            return
-        }
-        // Older remote indexes may not have attached asset IDs to every page.
-        // Keep the configured AList image route as a direct-only fallback so
-        // those pages remain readable without making a video relay request.
-        if let direct = model.alistDirectURL(remotePath: entry.path) {
-            urls[entry.path] = direct
-            return
-        }
-        await MainActor.run { errorText = "图片页加载失败，请重试或检查服务器连接" }
     }
 }

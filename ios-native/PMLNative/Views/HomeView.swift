@@ -20,7 +20,8 @@ struct HomeView: View {
     @State private var comics: [LibraryAsset] = []
     @State private var roots: [LibraryRoot] = []
 
-    @State private var loading = false
+    @State private var loading = true
+    @State private var hasLoadedOnce = false
     @State private var checking = false
     @State private var noticeText = ""
     @State private var errorText = ""
@@ -28,6 +29,8 @@ struct HomeView: View {
     @State private var playingVideo: V2VideoPlayPayload?
     @State private var imageViewerContext: ImageViewerContext?
     @State private var archiveComic: ComicArchiveTarget?
+    @State private var archiveGallery: ComicArchiveTarget?
+    @State private var galleryReaderTarget: HomeGalleryReaderTarget?
     @State private var directoryTarget: HomeDirectoryTarget?
     @State private var selectedMovie: MovieMetadata?
     @State private var openingGalleryId: String?
@@ -138,6 +141,13 @@ struct HomeView: View {
             .fullScreenCover(item: $archiveComic) { target in
                 ComicReaderView(target: target).environmentObject(model)
             }
+            .fullScreenCover(item: $archiveGallery) { target in
+                ComicReaderView(target: target, kind: .gallery).environmentObject(model)
+            }
+            .fullScreenCover(item: $galleryReaderTarget) { target in
+                ComicGalleryReaderView(kind: .gallery, title: target.title, sources: target.sources)
+                    .environmentObject(model)
+            }
             .sheet(item: $directoryTarget) { target in
                 NavigationStack {
                     DirectoryView(root: target.root, path: target.path)
@@ -233,10 +243,24 @@ struct HomeView: View {
                     .buttonStyle(PressableTileStyle())
                 }
             }
-        } else if loading {
-            ProgressView()
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 16)
+        } else if loading && !hasLoadedOnce {
+            VStack(alignment: .leading, spacing: 10) {
+                PMLSkeletonBlock(cornerRadius: 6).frame(width: 96, height: 18)
+                LazyVGrid(columns: moduleColumns, spacing: 10) {
+                    ForEach(0..<6, id: \.self) { _ in
+                        HStack(spacing: 10) {
+                            PMLSkeletonBlock(cornerRadius: 10).frame(width: 36, height: 36)
+                            VStack(alignment: .leading, spacing: 5) {
+                                PMLSkeletonBlock(cornerRadius: 4).frame(width: 68, height: 12)
+                                PMLSkeletonBlock(cornerRadius: 4).frame(width: 48, height: 10)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(11)
+                        .pmlGlassCard(cornerRadius: 16)
+                    }
+                }
+            }
         }
     }
 
@@ -302,7 +326,21 @@ struct HomeView: View {
                 }
             }
 
-            if inboxEntries.isEmpty {
+            if loading && !hasLoadedOnce && inboxEntries.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 11) {
+                        ForEach(0..<4, id: \.self) { _ in
+                            VStack(alignment: .leading, spacing: 6) {
+                                PMLSkeletonBlock(cornerRadius: 12).frame(width: 144, height: 94)
+                                PMLSkeletonBlock(cornerRadius: 4).frame(width: 118, height: 12)
+                                PMLSkeletonBlock(cornerRadius: 4).frame(width: 82, height: 10)
+                            }
+                            .padding(7)
+                            .pmlGlassCard(cornerRadius: 15)
+                        }
+                    }
+                }
+            } else if inboxEntries.isEmpty {
                 HStack(spacing: 10) {
                     Image(systemName: "tray")
                         .foregroundStyle(.secondary)
@@ -376,7 +414,9 @@ struct HomeView: View {
 
     @ViewBuilder
     private var featuredMoviesSection: some View {
-        if !featuredMovies.isEmpty {
+        if loading && !hasLoadedOnce && featuredMovies.isEmpty {
+            homeHorizontalSkeletonSection(titleWidth: 88, cardWidth: 168, imageHeight: 104, count: 3)
+        } else if !featuredMovies.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text("影视库精选")
@@ -445,7 +485,24 @@ struct HomeView: View {
 
     @ViewBuilder
     private var creatorsSection: some View {
-        if !creatorsV2.isEmpty {
+        if loading && !hasLoadedOnce && creatorsV2.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                PMLSkeletonBlock(cornerRadius: 6).frame(width: 88, height: 18)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 14) {
+                        ForEach(0..<6, id: \.self) { _ in
+                            VStack(spacing: 6) {
+                                Circle()
+                                    .fill(Color.secondary.opacity(0.16))
+                                    .frame(width: 62, height: 62)
+                                    .pmlShimmer()
+                                PMLSkeletonBlock(cornerRadius: 4).frame(width: 52, height: 10)
+                            }
+                        }
+                    }
+                }
+            }
+        } else if !creatorsV2.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text("常看创作者")
@@ -502,7 +559,9 @@ struct HomeView: View {
 
     @ViewBuilder
     private var collectionsSection: some View {
-        if !featuredCollections.isEmpty {
+        if loading && !hasLoadedOnce && featuredCollections.isEmpty {
+            homeHorizontalSkeletonSection(titleWidth: 74, cardWidth: 162, imageHeight: 98, count: 3)
+        } else if !featuredCollections.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text("专题合集")
@@ -590,7 +649,9 @@ struct HomeView: View {
 
     @ViewBuilder
     private var galleriesSection: some View {
-        if !featuredGalleries.isEmpty {
+        if loading && !hasLoadedOnce && featuredGalleries.isEmpty {
+            homeHorizontalSkeletonSection(titleWidth: 74, cardWidth: 122, imageHeight: 164, count: 4)
+        } else if !featuredGalleries.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text("写真图集")
@@ -611,7 +672,7 @@ struct HomeView: View {
                                 VStack(alignment: .leading, spacing: 6) {
                                     ZStack {
                                         CachedImageView(
-                                            url: model.apiClient?.v2CoverURL(assetId: set.coverAssetId, isArchive: set.isArchive),
+                                            url: model.apiClient?.v2CoverURL(assetId: set.coverAssetId, isArchive: set.isArchive, pageIndex: set.coverPageIndex ?? 0),
                                             contentMode: .fill,
                                             minHeight: 164,
                                             maxPixel: 420
@@ -667,7 +728,9 @@ struct HomeView: View {
 
     @ViewBuilder
     private var comicsSection: some View {
-        if !comics.isEmpty {
+        if loading && !hasLoadedOnce && comics.isEmpty {
+            homeHorizontalSkeletonSection(titleWidth: 74, cardWidth: 112, imageHeight: 150, count: 4)
+        } else if !comics.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text("漫画馆藏").font(.headline)
@@ -751,7 +814,10 @@ struct HomeView: View {
         guard let client = model.apiClient else { return }
         loading = true
         errorText = ""
-        defer { loading = false }
+        defer {
+            loading = false
+            hasLoadedOnce = true
+        }
 
         async let modulesReq = client.listLibraryModules()
         async let configReq = client.directoryConfig()
@@ -855,7 +921,7 @@ struct HomeView: View {
     private func openGallerySet(_ item: GallerySetV2) async {
         guard let client = model.apiClient else { return }
         if item.isArchive, let coverId = item.coverAssetId, !coverId.isEmpty {
-            archiveComic = ComicArchiveTarget(id: coverId, title: item.albumName)
+            archiveGallery = ComicArchiveTarget(id: coverId, title: item.albumName)
             return
         }
         openingGalleryId = item.id
@@ -863,14 +929,43 @@ struct HomeView: View {
         defer { openingGalleryId = nil }
         do {
             let assets = try await client.getGallerySetItems(setId: item.id)
+            if item.isArchive, let archive = assets.first {
+                archiveGallery = ComicArchiveTarget(id: archive.id, title: item.albumName)
+                return
+            }
             let images = assets.filter(\.isImage)
             if !images.isEmpty {
-                imageViewerContext = ImageViewerContext(entries: images.map { $0.toRemoteBrowserEntry() }, startIndex: 0)
+                let sources: [ReaderPageSource] = images.compactMap { img in
+                    let fallback = model.alistDirectURL(remotePath: img.remotePath) ?? client.mediaSourceURL(assetId: img.id)
+                    guard let fallback else { return nil }
+                    return .remoteAsset(assetId: img.id, remotePath: img.remotePath, fallbackURL: fallback)
+                }
+                if !sources.isEmpty {
+                    galleryReaderTarget = HomeGalleryReaderTarget(title: item.albumName, sources: sources)
+                }
             } else if let archive = assets.first(where: \.isComicArchive) {
-                archiveComic = ComicArchiveTarget(id: archive.id, title: item.albumName)
+                archiveGallery = ComicArchiveTarget(id: archive.id, title: item.albumName)
             }
         } catch {
             errorText = "打开图集失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func homeHorizontalSkeletonSection(titleWidth: CGFloat, cardWidth: CGFloat, imageHeight: CGFloat, count: Int) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            PMLSkeletonBlock(cornerRadius: 6).frame(width: titleWidth, height: 18)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 11) {
+                    ForEach(0..<count, id: \.self) { _ in
+                        VStack(alignment: .leading, spacing: 6) {
+                            PMLSkeletonBlock(cornerRadius: 11).frame(width: cardWidth, height: imageHeight)
+                            PMLSkeletonBlock(cornerRadius: 4).frame(width: cardWidth * 0.78, height: 11)
+                        }
+                        .padding(7)
+                        .pmlGlassCard(cornerRadius: 15)
+                    }
+                }
+            }
         }
     }
 
@@ -896,4 +991,10 @@ struct HomeDirectoryTarget: Identifiable {
     let id = UUID()
     let root: LibraryRoot
     let path: String
+}
+
+struct HomeGalleryReaderTarget: Identifiable {
+    let id = UUID()
+    let title: String
+    let sources: [ReaderPageSource]
 }

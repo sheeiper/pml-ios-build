@@ -1420,9 +1420,11 @@ public struct MovieLibraryView: View {
 
                 if let diff = pipelineDiff, let runId = diff.runId, !runId.isEmpty {
                     HStack {
-                        Text("上次\(diff.mode == "full" ? "全量" : "增量") · 新增 +\(diff.addedCount) · 删除 -\(diff.removedCount)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        Text(diff.addedCount > 0
+                             ? "本次\(diff.mode == "full" ? "全量" : "增量") · 获取 +\(diff.addedCount) 个新视频 · 删除 -\(diff.removedCount)"
+                             : "本次\(diff.mode == "full" ? "全量" : "增量") · 无新增视频 · 删除 -\(diff.removedCount)")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(diff.addedCount > 0 ? .primary : .secondary)
                         Spacer()
                         Text(unconsumedAdded > 0 ? "待提取 +\(unconsumedAdded)" : "已消化 ✓")
                             .font(.caption2.bold())

@@ -1152,6 +1152,7 @@ async fn dispatch_command(
             let model_name = payload.get("modelName").and_then(Value::as_str).map(str::to_owned);
             let query = payload.get("query").and_then(Value::as_str).map(str::to_owned);
             let sort = payload.get("sort").and_then(Value::as_str).map(str::to_owned);
+            let kind_filter = payload.get("kindFilter").and_then(Value::as_str).map(str::to_owned);
             let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(80);
             let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
             let app = app.clone();
@@ -1161,8 +1162,28 @@ async fn dispatch_command(
                     model_name.as_deref(),
                     query.as_deref(),
                     sort.as_deref(),
+                    kind_filter.as_deref(),
                     limit,
                     offset,
+                )
+            })
+            .await
+        }
+        "set_gallery_set_cover" => {
+            let set_id = payload
+                .get("setId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let asset_id = payload.get("assetId").and_then(Value::as_str).map(str::to_owned);
+            let page_index = payload.get("pageIndex").and_then(Value::as_i64).unwrap_or(0);
+            let app = app.clone();
+            blocking_result_response(move || {
+                crate::library_modules::set_gallery_set_cover(
+                    &app,
+                    &set_id,
+                    asset_id.as_deref(),
+                    page_index,
                 )
             })
             .await

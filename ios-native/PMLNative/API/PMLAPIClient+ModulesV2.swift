@@ -9,7 +9,7 @@ extension PMLAPIClient {
     /// - 显式上传封面（author_* / banner_*）：`/api/covers/{id}/{id}.jpg`
     /// - 图集压缩包（isArchive == true）：`/api/comic-pages/{id}/0`
     /// - 普通视频/图片资产（asset-*）：`/thumbnail/thumb_{id}`（必须带 thumb_ 前缀）
-    func v2CoverURL(assetId: String?, isArchive: Bool = false) -> URL? {
+    func v2CoverURL(assetId: String?, isArchive: Bool = false, pageIndex: Int = 0) -> URL? {
         guard let raw = assetId?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return nil
         }
@@ -18,7 +18,7 @@ extension PMLAPIClient {
             return URL(string: "/api/covers/\(encoded)/\(encoded).jpg", relativeTo: configuration.baseURL)?.absoluteURL
         }
         if isArchive {
-            return comicPageURL(assetId: raw, pageIndex: 0)
+            return comicPageURL(assetId: raw, pageIndex: pageIndex, thumb: true)
         }
         let key = raw.hasPrefix("thumb_") ? raw : "thumb_\(raw)"
         let encoded = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
@@ -541,6 +541,7 @@ extension PMLAPIClient {
         modelName: String? = nil,
         query: String? = nil,
         sort: String = "count",
+        kindFilter: String? = nil,
         limit: Int = 80,
         offset: Int = 0
     ) async throws -> GallerySetsPage {
@@ -551,7 +552,14 @@ extension PMLAPIClient {
         ]
         if let modelName, !modelName.isEmpty { args["modelName"] = modelName }
         if let query, !query.isEmpty { args["query"] = query }
+        if let kindFilter, !kindFilter.isEmpty, kindFilter != "all" { args["kindFilter"] = kindFilter }
         return try await command("list_gallery_sets", arguments: args)
+    }
+
+    func setGallerySetCover(setId: String, assetId: String? = nil, pageIndex: Int = 0) async throws -> GallerySetV2 {
+        var args: [String: Any] = ["setId": setId, "pageIndex": pageIndex]
+        if let assetId, !assetId.isEmpty { args["assetId"] = assetId }
+        return try await command("set_gallery_set_cover", arguments: args)
     }
 
     func getGallerySetItems(setId: String) async throws -> [CreatorAssetV2] {

@@ -363,9 +363,12 @@ struct MagnetSearchView: View {
     @State private var filesTarget: MagnetFilesSheetTarget?
     @State private var mainTab = 0 // 0 = 搜索, 1 = 下载, 2 = 整理
     @State private var cloudStatus: OfflineCloudStatusResponse?
+    @State private var cloudItems: [CloudOfflineFile] = []
     @State private var cloudLoading = false
+    @State private var cloudLoadingMore = false
     @State private var cloudError = ""
     @State private var cloudPage = 1
+    @State private var cloudPageCount = 1
     @State private var dlSubTab = 0 // 0 = 正在下载, 1 = 失败, 2 = 完成记录
     @State private var batchResult: BatchOfflineSubmitResponse?
     @State private var inboxScanning = false
@@ -928,9 +931,15 @@ struct MagnetSearchView: View {
                                                 .foregroundStyle(.secondary)
                                         }
                                         Spacer()
+                                        if !item.category.isEmpty {
+                                            Text(item.category)
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
                                     }
 
-                                    HStack(spacing: 10) {
+                                    HStack(spacing: 8) {
                                         Button {
                                             Task { await submitOffline(magnet: item.magnet, title: item.title, key: item.infoHash) }
                                         } label: {
@@ -942,12 +951,15 @@ struct MagnetSearchView: View {
                                                     systemImage: offlinedHashes.contains(item.infoHash.lowercased()) ? "checkmark.icloud.fill" : "icloud.and.arrow.down"
                                                 )
                                                 .font(.caption.bold())
+                                                .lineLimit(1)
+                                                .fixedSize(horizontal: true, vertical: false)
                                             }
                                         }
                                         .buttonStyle(.borderedProminent)
                                         .controlSize(.small)
                                         .tint(offlinedHashes.contains(item.infoHash.lowercased()) ? .green : .blue)
                                         .disabled(!offlineBusyKey.isEmpty)
+                                        .layoutPriority(1)
 
                                         Button {
                                             UIPasteboard.general.string = item.magnet
@@ -959,6 +971,8 @@ struct MagnetSearchView: View {
                                                 systemImage: copiedStore.isCopied(item.infoHash) ? "checkmark" : "doc.on.doc"
                                             )
                                             .font(.caption.bold())
+                                            .lineLimit(1)
+                                            .fixedSize(horizontal: true, vertical: false)
                                         }
                                         .buttonStyle(.bordered)
                                         .controlSize(.small)
@@ -969,9 +983,13 @@ struct MagnetSearchView: View {
                                         } label: {
                                             Label("文件", systemImage: "folder")
                                                 .font(.caption)
+                                                .lineLimit(1)
+                                                .fixedSize(horizontal: true, vertical: false)
                                         }
                                         .buttonStyle(.bordered)
                                         .controlSize(.small)
+
+                                        Spacer(minLength: 0)
 
                                         ShareLink(item: item.magnet) {
                                             Image(systemName: "square.and.arrow.up")
@@ -979,12 +997,6 @@ struct MagnetSearchView: View {
                                         }
                                         .buttonStyle(.bordered)
                                         .controlSize(.small)
-
-                                        Spacer()
-                                        Text(item.category)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
                                     }
                                 }
                                 .padding(12)
@@ -1015,7 +1027,7 @@ struct MagnetSearchView: View {
                         Text("云下载配额").font(.subheadline.bold())
                         Spacer()
                         Button {
-                            Task { await loadCloudStatus(page: cloudPage) }
+                            Task { await loadCloudStatus(page: 1, append: false) }
                         } label: {
                             if cloudLoading {
                                 ProgressView().controlSize(.mini)
@@ -1050,10 +1062,9 @@ struct MagnetSearchView: View {
                     Text(cloudError).font(.caption).foregroundStyle(.red)
                 }
 
-                let allItems = cloudStatus?.items ?? []
-                let dlItems = allItems.filter { $0.statusCategory == "downloading" }
-                let failItems = allItems.filter { $0.statusCategory == "failed" }
-                let doneItems = allItems.filter { $0.statusCategory == "completed" }
+                let dlItems = cloudItems.filter { $0.statusCategory == "downloading" }
+                let failItems = cloudItems.filter { $0.statusCategory == "failed" }
+                let doneItems = cloudItems.filter { $0.statusCategory == "completed" }
                 let shown = dlSubTab == 0 ? dlItems : (dlSubTab == 1 ? failItems : doneItems)
 
                 Picker("状态", selection: $dlSubTab) {
@@ -1091,26 +1102,27 @@ struct MagnetSearchView: View {
                             }
                             .padding(10)
                             .pmlGlassCard(cornerRadius: 12)
+                            .onAppear {
+                                if it.id == shown.last?.id && cloudPage < cloudPageCount && !cloudLoading && !cloudLoadingMore {
+                                    Task { await loadCloudStatus(page: cloudPage + 1, append: true) }
+                                }
+                            }
                         }
                     }
-                }
 
-                if let st = cloudStatus, st.pageCount > 1 {
-                    HStack {
-                        Button("上一页") { Task { await loadCloudStatus(page: max(1, cloudPage - 1)) } }
-                            .buttonStyle(.bordered).controlSize(.small)
-                            .disabled(cloudPage <= 1 || cloudLoading)
-                        Spacer()
-                        Text("第 \(cloudPage) / \(st.pageCount) 页").font(.caption2).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("下一页") { Task { await loadCloudStatus(page: min(st.pageCount, cloudPage + 1)) } }
-                            .buttonStyle(.bordered).controlSize(.small)
-                            .disabled(cloudPage >= st.pageCount || cloudLoading)
+                    if cloudLoadingMore {
+                        ProgressView("加载更多任务…")
+                            .font(.caption2)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
                     }
                 }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
+        }
+        .refreshable {
+            await loadCloudStatus(page: 1, append: false)
         }
     }
 
@@ -1391,15 +1403,33 @@ struct MagnetSearchView: View {
         }
     }
 
-    private func loadCloudStatus(page: Int) async {
+    private func loadCloudStatus(page: Int, append: Bool = false) async {
         guard let client = model.apiClient else { return }
-        cloudLoading = true
+        if append {
+            guard !cloudLoadingMore && !cloudLoading else { return }
+            cloudLoadingMore = true
+        } else {
+            cloudLoading = true
+        }
         cloudError = ""
-        defer { cloudLoading = false }
+        defer {
+            cloudLoading = false
+            cloudLoadingMore = false
+        }
         do {
             let res = try await client.getOfflineCloudStatus(page: page)
             cloudStatus = res
             cloudPage = res.page
+            cloudPageCount = max(1, res.pageCount)
+            if append {
+                var seen = Set(cloudItems.map(\.id))
+                for item in res.items where !seen.contains(item.id) {
+                    seen.insert(item.id)
+                    cloudItems.append(item)
+                }
+            } else {
+                cloudItems = res.items
+            }
         } catch {
             cloudError = error.localizedDescription
         }

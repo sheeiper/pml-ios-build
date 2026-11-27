@@ -41,10 +41,12 @@ struct ComicLibraryView: View {
     @State private var onlyDl = false
     @State private var onlyFavorites = false
     @State private var showFilterSheet = false
+    @State private var showOnlineFilterSheet = false
     @State private var sortMode: String? = nil
 
     private var activeFilterCount: Int {
         var n = 0
+        if !selectedCategory.isEmpty { n += 1 }
         if !selectedYear.isEmpty { n += 1 }
         if !selectedTag.isEmpty { n += 1 }
         if !selectedAuthor.isEmpty { n += 1 }
@@ -55,11 +57,13 @@ struct ComicLibraryView: View {
         if onlyFullColor { n += 1 }
         if onlyDl { n += 1 }
         if onlyFavorites { n += 1 }
+        if sortMode != nil { n += 1 }
         return n
     }
 
     @State private var selectedWork: ComicWorkItem?
     @State private var workDetail: ComicWorkDetail?
+    @State private var coverPickerWork: ComicWorkItem?
     @State private var volumeOrderDesc = false
     @State private var comicTarget: ComicArchiveTarget?
     @State private var folderTarget: ComicFolderTarget?
@@ -107,10 +111,11 @@ struct ComicLibraryView: View {
             switch tab {
             case .shelf:
                 shelfView
+                    .searchable(text: $searchQuery, prompt: "搜索书名、作者、社团、原作 IP")
             case .galleries:
                 GalleriesView()
             case .online:
-                OnlineComicsPaneView()
+                OnlineComicsPaneView(showFilterSheet: $showOnlineFilterSheet)
             case .data:
                 dataView
             }
@@ -127,9 +132,17 @@ struct ComicLibraryView: View {
                     }
                     .accessibilityLabel("筛选与排序")
                 }
+            } else if tab == .online {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showOnlineFilterSheet = true
+                    } label: {
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                    }
+                    .accessibilityLabel("在线漫画源与筛选")
+                }
             }
         }
-        .searchable(text: $searchQuery, prompt: "搜索书名、作者、社团、原作 IP")
         .task(id: searchQuery) {
             try? await Task.sleep(for: .milliseconds(320))
             guard !Task.isCancelled else { return }
@@ -146,6 +159,25 @@ struct ComicLibraryView: View {
         .onDisappear { batchPollTask?.cancel() }
         .sheet(item: $selectedWork) { work in
             comicDetailSheet(work)
+        }
+        .sheet(item: $coverPickerWork) { work in
+            ComicCoverPickerSheet(work: work) { updated in
+                if let idx = items.firstIndex(where: { $0.id == updated.id }) {
+                    items[idx] = updated
+                }
+                if let idx = continueReading.firstIndex(where: { $0.id == updated.id }) {
+                    continueReading[idx] = updated
+                }
+                if let d = workDetail, d.work.id == updated.id {
+                    workDetail = ComicWorkDetail(
+                        work: updated,
+                        volumes: d.volumes,
+                        relatedByAuthor: d.relatedByAuthor,
+                        relatedByParody: d.relatedByParody
+                    )
+                }
+            }
+            .environmentObject(model)
         }
         .sheet(isPresented: $showFilterSheet) {
             filterSheetView
@@ -213,6 +245,18 @@ struct ComicLibraryView: View {
                                         .frame(width: 96)
                                     }
                                     .buttonStyle(.plain)
+                                    .contextMenu {
+                                        Button {
+                                            coverPickerWork = cw
+                                        } label: {
+                                            Label("更换封面", systemImage: "photo.on.rectangle")
+                                        }
+                                        Button {
+                                            openDetail(cw)
+                                        } label: {
+                                            Label("查看详情", systemImage: "info.circle")
+                                        }
+                                    }
                                 }
                             }
                             .padding(.horizontal, 14)
@@ -220,62 +264,19 @@ struct ComicLibraryView: View {
                     }
                 }
 
-                // 快捷分类频道条
-                if let cats = filterOptions?.categories, !cats.isEmpty {
+                if !selectedCategory.isEmpty || sortMode != nil || !selectedAuthor.isEmpty || !selectedParody.isEmpty || !selectedTag.isEmpty || !selectedYear.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
-                            filterPill("全部", active: selectedCategory.isEmpty) {
-                                selectedCategory = ""
-                                Task { await loadShelf(reset: true) }
+                            if !selectedCategory.isEmpty {
+                                Button { selectedCategory = ""; Task { await loadShelf(reset: true) } } label: {
+                                    Label("类型：\(selectedCategory)", systemImage: "xmark.circle.fill").font(.caption.bold())
+                                }.buttonStyle(.borderedProminent).controlSize(.mini).tint(.purple)
                             }
-                            ForEach(cats) { c in
-                                filterPill("\(c.name) \(c.count)", active: selectedCategory == c.name) {
-                                    selectedCategory = (selectedCategory == c.name ? "" : c.name)
-                                    Task { await loadShelf(reset: true) }
-                                }
+                            if let sortMode, !sortMode.isEmpty {
+                                Button { self.sortMode = nil; Task { await loadShelf(reset: true) } } label: {
+                                    Label(sortLabel(sortMode), systemImage: "xmark.circle.fill").font(.caption.bold())
+                                }.buttonStyle(.borderedProminent).controlSize(.mini).tint(.indigo)
                             }
-                        }
-                        .padding(.horizontal, 14)
-                    }
-                }
-
-                // 精简工具条：筛选面板入口 + 最新出版 + 随机漫步
-                HStack(spacing: 8) {
-                    Button {
-                        showFilterSheet = true
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "line.3.horizontal.decrease.circle")
-                            Text(activeFilterCount > 0 ? "筛选 (\(activeFilterCount))" : "筛选")
-                        }
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(activeFilterCount > 0 ? Color.purple : Color.secondary.opacity(0.14), in: Capsule())
-                        .foregroundStyle(activeFilterCount > 0 ? .white : .primary)
-                    }
-                    filterPill("最新出版", active: sortMode == "published_desc") {
-                        sortMode = (sortMode == "published_desc" ? nil : "published_desc")
-                        Task { await loadShelf(reset: true) }
-                    }
-                    Button {
-                        sortMode = "random"
-                        Task { await loadShelf(reset: true) }
-                    } label: {
-                        Label("随机", systemImage: "shuffle")
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(sortMode == "random" ? Color.purple : Color.secondary.opacity(0.14), in: Capsule())
-                            .foregroundStyle(sortMode == "random" ? .white : .primary)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, 14)
-
-                if !selectedAuthor.isEmpty || !selectedParody.isEmpty || !selectedTag.isEmpty || !selectedYear.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
                             if !selectedTag.isEmpty {
                                 Button { selectedTag = ""; Task { await loadShelf(reset: true) } } label: {
                                     Label("#\(selectedTag)", systemImage: "xmark.circle.fill").font(.caption.bold())
@@ -305,11 +306,9 @@ struct ComicLibraryView: View {
                     LazyVGrid(columns: columns, spacing: 12) {
                         ForEach(0..<12, id: \.self) { _ in
                             VStack(alignment: .leading, spacing: 6) {
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(Color.secondary.opacity(0.16))
+                                PMLSkeletonBlock(cornerRadius: 8)
                                     .aspectRatio(2.0 / 3.0, contentMode: .fit)
-                                RoundedRectangle(cornerRadius: 4)
-                                    .fill(Color.secondary.opacity(0.14))
+                                PMLSkeletonBlock(cornerRadius: 4)
                                     .frame(height: 11)
                             }
                         }
@@ -394,6 +393,26 @@ struct ComicLibraryView: View {
                                 }
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                Button {
+                                    coverPickerWork = work
+                                } label: {
+                                    Label("更换封面", systemImage: "photo.on.rectangle")
+                                }
+                                Button {
+                                    openDetail(work)
+                                } label: {
+                                    Label("查看详情", systemImage: "info.circle")
+                                }
+                                Button {
+                                    Task { await favs.toggle(.comic, id: work.id, client: model.apiClient) }
+                                } label: {
+                                    Label(
+                                        favs.isComicFav(work.id) ? "取消收藏" : "加入收藏",
+                                        systemImage: favs.isComicFav(work.id) ? "heart.slash" : "heart"
+                                    )
+                                }
+                            }
                             .onAppear {
                                 if work.id == items.last?.id && hasMore && !loadingMore {
                                     Task { await loadShelf(reset: false) }
@@ -685,51 +704,6 @@ struct ComicLibraryView: View {
                     }
                 }
 
-                // 内页画风预览 & 一键切换封面
-                if let firstVol = vols.first, firstVol.isArchive {
-                    let curCoverIdx = workDetail?.work.coverPageIndex ?? work.coverPageIndex ?? 0
-                    Section("内页预览（可一键更换封面）") {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 10) {
-                                ForEach(0..<6, id: \.self) { pIdx in
-                                    VStack(spacing: 4) {
-                                        Button {
-                                            openVolume(firstVol, workId: work.id)
-                                        } label: {
-                                            CachedImageView(
-                                                url: coverURL(assetId: firstVol.assetId, isArchive: true, pageIndex: pIdx),
-                                                contentMode: .fill,
-                                                minHeight: 110,
-                                                maxPixel: 360
-                                            )
-                                            .frame(width: 78, height: 116)
-                                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 6)
-                                                    .stroke(curCoverIdx == pIdx ? Color.purple : Color.clear, lineWidth: 2)
-                                            )
-                                        }
-                                        .buttonStyle(.plain)
-
-                                        Button {
-                                            Task { await setCoverPage(workId: work.id, assetId: firstVol.assetId, pageIndex: pIdx) }
-                                        } label: {
-                                            Text(curCoverIdx == pIdx ? "当前封面" : "设为封面")
-                                                .font(.system(size: 10, weight: curCoverIdx == pIdx ? .bold : .medium))
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 3)
-                                                .background(curCoverIdx == pIdx ? Color.purple : Color.secondary.opacity(0.16), in: Capsule())
-                                                .foregroundStyle(curCoverIdx == pIdx ? .white : .primary)
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                            .padding(.vertical, 4)
-                        }
-                    }
-                }
-
                 // 多卷/多话：选话宫格 + 正/倒序切换
                 if vols.count > 1 {
                     Section {
@@ -934,9 +908,50 @@ struct ComicLibraryView: View {
         filterOptions = try? await client.listComicFilterOptions()
     }
 
+    private func sortLabel(_ raw: String) -> String {
+        switch raw {
+        case "recent_read": return "最近阅读"
+        case "published_desc": return "最新出版"
+        case "volumes_desc": return "卷数最多"
+        case "title_asc": return "书名 A-Z"
+        case "random": return "随机漫步"
+        default: return "最新入库"
+        }
+    }
+
     private var filterSheetView: some View {
         NavigationStack {
             Form {
+                Section("排序与随机") {
+                    Picker("排序方式", selection: Binding(
+                        get: { sortMode ?? "" },
+                        set: { sortMode = $0.isEmpty ? nil : $0 }
+                    )) {
+                        Text("最新入库").tag("")
+                        Text("最近阅读").tag("recent_read")
+                        Text("最新出版").tag("published_desc")
+                        Text("卷数最多").tag("volumes_desc")
+                        Text("书名 A-Z").tag("title_asc")
+                        Text("随机漫步").tag("random")
+                    }
+                    Button {
+                        sortMode = "random"
+                        showFilterSheet = false
+                        Task { await loadShelf(reset: true) }
+                    } label: {
+                        Label("随机漫步（换一批随机顺序）", systemImage: "shuffle")
+                    }
+                }
+                if let cats = filterOptions?.categories, !cats.isEmpty {
+                    Section("漫画类型") {
+                        Picker("类型", selection: $selectedCategory) {
+                            Text("全部类型").tag("")
+                            ForEach(cats) { c in
+                                Text("\(c.name) (\(c.count))").tag(c.name)
+                            }
+                        }
+                    }
+                }
                 Section("阅读状态") {
                     Picker("状态", selection: $selectedReadStatus) {
                         Text("全部").tag("all")
@@ -1047,14 +1062,21 @@ struct ComicLibraryView: View {
 
     private func syncAndRebuild() async {
         guard let client = model.apiClient else { return }
+        let prevWorks = stats?.totalWorks ?? 0
+        let prevVolumes = stats?.totalVolumes ?? 0
         busySync = true
         dataFeedback = "正在增量同步并自动聚类建库…"
         defer { busySync = false }
         do {
-            _ = try await client.scanLibraryModule(moduleId: "comics", full: false)
+            let scanRes = try await client.scanLibraryModule(moduleId: "comics", full: false)
             let st = try await client.rebuildComicLibrary()
             stats = st
-            dataFeedback = "完成：\(st.totalWorks) 部作品（\(st.totalSeries) 系列），\(st.totalVolumes) 卷/话，\(st.totalAuthors) 位作者。"
+            let dWorks = st.totalWorks - prevWorks
+            let dVols = st.totalVolumes - prevVolumes
+            let deltaText = dWorks > 0 || dVols > 0
+                ? "本次新增 +\(max(0, dWorks)) 部作品 / +\(max(0, dVols)) 卷"
+                : "暂无新增作品"
+            dataFeedback = "增量同步完成：新增文件 +\(scanRes.scan.added) · 更新 \(scanRes.scan.updated) · 删除 -\(scanRes.scan.deleted)；\(deltaText)（现有 \(st.totalWorks) 部 / \(st.totalSeries) 系列 / \(st.totalVolumes) 卷）"
             await loadShelf(reset: true)
         } catch {
             dataFeedback = "同步失败：\(error.localizedDescription)"
@@ -1126,6 +1148,7 @@ struct ComicLibraryView: View {
 
 private struct OnlineComicsPaneView: View {
     @EnvironmentObject private var model: AppModel
+    @Binding var showFilterSheet: Bool
 
     @State private var source = "jm"
     @State private var mode = "browse"
@@ -1155,9 +1178,6 @@ private struct OnlineComicsPaneView: View {
     @State private var activeChapter: OnlineComicChapter?
     @State private var readerImages: [String] = []
     @State private var readerLoading = false
-    @State private var readerMode: ComicReadingMode = .webtoon
-    @State private var readerPage = 0
-    @State private var readerChromeVisible = true
 
     // Magnet search & CBZ packaging
     @State private var showMagnetSheet = false
@@ -1175,83 +1195,77 @@ private struct OnlineComicsPaneView: View {
         GridItem(.flexible(), spacing: 10),
     ]
 
+    private var commonCategories: [String] {
+        let preferred = ["全部", "同人", "单本", "短篇", "韩漫", "美漫", "全彩", "CG"]
+        var picked = preferred.filter { categories.contains($0) }
+        for c in categories where picked.count < 7 && !picked.contains(c) {
+            picked.append(c)
+        }
+        if !category.isEmpty && !picked.contains(category) {
+            picked.insert(category, at: min(1, picked.count))
+        }
+        return picked.isEmpty ? Array(categories.prefix(7)) : picked
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
-                    Picker("源", selection: $source) {
-                        Text("禁漫 (JM)").tag("jm")
-                        Text("哔咔 (PicACG)").tag("pica")
-                    }
-                    .pickerStyle(.segmented)
-                    .onChange(of: source) { _, newVal in
-                        mode = "browse"
-                        category = "全部"
-                        sort = (newVal == "jm" ? "mr" : "dd")
-                        Task {
-                            await loadCategories()
-                            await loadList(reset: true)
-                        }
-                    }
-
-                    Button {
-                        showConfigSheet = true
-                    } label: {
-                        Image(systemName: "gearshape.fill")
-                            .padding(8)
-                            .background(Color.secondary.opacity(0.14), in: Circle())
-                    }
-                }
-                .padding(.horizontal, 14)
-
-                HStack(spacing: 8) {
                     TextField(source == "jm" ? "搜索书名、作者或 JM 号…" : "搜索哔咔书名/作者…", text: $query)
                         .textFieldStyle(.roundedBorder)
                         .submitLabel(.search)
-                        .onSubmit { Task { await loadList(reset: true) } }
-                    Button("搜索") { Task { await loadList(reset: true) } }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.pink)
+                        .onSubmit {
+                            mode = "browse"
+                            Task { await loadList(reset: true) }
+                        }
+                    Button("搜索") {
+                        mode = "browse"
+                        Task { await loadList(reset: true) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.pink)
                 }
                 .padding(.horizontal, 14)
 
-                // 模式条：分类发现 / 日周月总排行 / 随机 / 我的哔咔收藏
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        modeChip("分类发现", id: "browse")
-                        modeChip("日排行", id: "rank_day")
-                        modeChip("周排行", id: "rank_week")
-                        modeChip("月排行", id: "rank_month")
-                        if source == "jm" {
-                            modeChip("总排行", id: "rank_all")
+                        Text(source == "jm" ? "禁漫" : "哔咔")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(Color.purple.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.purple)
+
+                        if mode != "browse" {
+                            Button {
+                                mode = "browse"
+                                Task { await loadList(reset: true) }
+                            } label: {
+                                Label(modeDisplayLabel(mode), systemImage: "xmark.circle.fill")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.purple, in: Capsule())
+                                    .foregroundStyle(.white)
+                            }
                         }
-                        modeChip("随机", id: "random")
-                        if source == "pica" {
-                            modeChip("我的哔咔收藏", id: "favorites")
+
+                        ForEach(commonCategories, id: \.self) { c in
+                            Button {
+                                mode = "browse"
+                                category = c
+                                Task { await loadList(reset: true) }
+                            } label: {
+                                Text(c)
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background((mode == "browse" && category == c) ? Color.pink : Color.secondary.opacity(0.14), in: Capsule())
+                                    .foregroundStyle((mode == "browse" && category == c) ? .white : .primary)
+                            }
                         }
                     }
                     .padding(.horizontal, 14)
-                }
-
-                if mode == "browse" {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(categories, id: \.self) { c in
-                                Button {
-                                    category = c
-                                    Task { await loadList(reset: true) }
-                                } label: {
-                                    Text(c)
-                                        .font(.caption.weight(.semibold))
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 6)
-                                        .background(category == c ? Color.pink : Color.secondary.opacity(0.14), in: Capsule())
-                                        .foregroundStyle(category == c ? .white : .primary)
-                                }
-                            }
-                        }
-                        .padding(.horizontal, 14)
-                    }
                 }
 
                 if !errorMsg.isEmpty {
@@ -1340,6 +1354,98 @@ private struct OnlineComicsPaneView: View {
             await loadConfig()
             await loadCategories()
             await loadList(reset: true)
+        }
+        .sheet(isPresented: $showFilterSheet) {
+            NavigationStack {
+                Form {
+                    Section("漫画源") {
+                        Picker("漫画源", selection: $source) {
+                            Text("禁漫 (JM)").tag("jm")
+                            Text("哔咔 (PicACG)").tag("pica")
+                        }
+                        .pickerStyle(.segmented)
+                        .onChange(of: source) { _, newVal in
+                            mode = "browse"
+                            category = "全部"
+                            sort = (newVal == "jm" ? "mr" : "dd")
+                            Task {
+                                await loadCategories()
+                                await loadList(reset: true)
+                            }
+                        }
+                    }
+
+                    Section("频道模式") {
+                        Picker("模式", selection: $mode) {
+                            Text("分类发现").tag("browse")
+                            Text("日排行").tag("rank_day")
+                            Text("周排行").tag("rank_week")
+                            Text("月排行").tag("rank_month")
+                            if source == "jm" { Text("总排行").tag("rank_all") }
+                            Text("随机推荐").tag("random")
+                            if source == "pica" { Text("我的哔咔收藏").tag("favorites") }
+                        }
+                        .onChange(of: mode) { _, _ in
+                            Task { await loadList(reset: true) }
+                        }
+                    }
+
+                    if mode == "browse" || mode == "favorites" {
+                        Section("排序") {
+                            Picker("排序", selection: $sort) {
+                                if source == "jm" {
+                                    Text("最新更新").tag("mr")
+                                    Text("最多点击").tag("mv")
+                                    Text("最多爱心").tag("tf")
+                                    Text("最多图片").tag("mp")
+                                } else {
+                                    Text("最新上架").tag("dd")
+                                    if mode == "browse" {
+                                        Text("最多爱心").tag("ld")
+                                        Text("最多指名").tag("vd")
+                                    }
+                                    Text("最早发布").tag("da")
+                                }
+                            }
+                            .onChange(of: sort) { _, _ in
+                                Task { await loadList(reset: true) }
+                            }
+                        }
+                    }
+
+                    if mode == "browse" {
+                        Section("全部分类") {
+                            Picker("分类", selection: $category) {
+                                ForEach(categories, id: \.self) { c in
+                                    Text(c).tag(c)
+                                }
+                            }
+                            .onChange(of: category) { _, _ in
+                                Task { await loadList(reset: true) }
+                            }
+                        }
+                    }
+
+                    Section {
+                        Button {
+                            showFilterSheet = false
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                showConfigSheet = true
+                            }
+                        } label: {
+                            Label("源账号与域名配置", systemImage: "gearshape")
+                        }
+                    }
+                }
+                .navigationTitle("在线漫画 · 源与筛选")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("完成") { showFilterSheet = false }
+                    }
+                }
+            }
+            .presentationDetents([.medium, .large])
         }
         .sheet(isPresented: $showConfigSheet) {
             NavigationStack {
@@ -1631,151 +1737,33 @@ private struct OnlineComicsPaneView: View {
             }
         }
         .fullScreenCover(item: $activeChapter) { ch in
-            let chIdx = detail?.chapters.firstIndex(where: { $0.id == ch.id }) ?? -1
-            let hasPrev = chIdx > 0
-            let hasNext = detail != nil && chIdx >= 0 && chIdx < (detail!.chapters.count - 1)
-            NavigationStack {
+            let chs = detail?.chapters ?? []
+            let readerChapters = chs.map { c in
+                ComicReaderChapterItem(id: c.id, title: c.title, active: c.id == ch.id)
+            }
+            let pageURLs = readerImages.compactMap { model.apiClient?.onlineComicImageURL(relativePath: $0) }
+            let readerTitle = chs.count > 1 ? "\(detail?.title ?? "") · \(ch.title)" : (detail?.title ?? ch.title)
+            if readerLoading {
                 ZStack {
                     Color.black.ignoresSafeArea()
-                    if readerLoading {
-                        ProgressView("加载图片并自动解混淆…")
-                            .tint(.white)
-                            .foregroundStyle(.white)
-                    } else if readerMode == .webtoon {
-                        ScrollView {
-                            LazyVStack(spacing: 0) {
-                                ForEach(readerImages, id: \.self) { rel in
-                                    CachedImageView(
-                                        url: model.apiClient?.onlineComicImageURL(relativePath: rel),
-                                        contentMode: .fit,
-                                        minHeight: 360,
-                                        maxPixel: 1600
-                                    )
-                                }
-                                if hasNext, let nextCh = detail?.chapters[chIdx + 1] {
-                                    Button {
-                                        openChapter(comicId: detail?.id ?? "", chapter: nextCh)
-                                    } label: {
-                                        Label("继续阅读下一话：\(nextCh.title)", systemImage: "arrow.right.circle.fill")
-                                            .font(.subheadline.bold())
-                                            .padding(.horizontal, 18)
-                                            .padding(.vertical, 12)
-                                            .background(Color.purple, in: Capsule())
-                                            .foregroundStyle(.white)
-                                    }
-                                    .padding(.vertical, 28)
-                                }
-                            }
-                        }
-                        .onTapGesture {
-                            withAnimation(.easeInOut(duration: 0.2)) { readerChromeVisible.toggle() }
-                        }
-                    } else if readerMode == .double {
-                        let spreadCount = max(1, (readerImages.count + 1) / 2)
-                        TabView(selection: $readerPage) {
-                            ForEach(0..<spreadCount, id: \.self) { sIdx in
-                                let firstIdx = sIdx * 2
-                                let secondIdx = firstIdx + 1
-                                HStack(spacing: 2) {
-                                    if firstIdx < readerImages.count {
-                                        CachedImageView(
-                                            url: model.apiClient?.onlineComicImageURL(relativePath: readerImages[firstIdx]),
-                                            contentMode: .fit,
-                                            minHeight: 360,
-                                            maxPixel: 1400
-                                        )
-                                    }
-                                    if secondIdx < readerImages.count {
-                                        CachedImageView(
-                                            url: model.apiClient?.onlineComicImageURL(relativePath: readerImages[secondIdx]),
-                                            contentMode: .fit,
-                                            minHeight: 360,
-                                            maxPixel: 1400
-                                        )
-                                    }
-                                }
-                                .tag(sIdx)
-                            }
-                        }
-                        .tabViewStyle(.page(indexDisplayMode: .never))
-                        .onTapGesture {
-                            withAnimation(.easeInOut(duration: 0.2)) { readerChromeVisible.toggle() }
-                        }
-                    } else {
-                        TabView(selection: $readerPage) {
-                            ForEach(Array(readerImages.enumerated()), id: \.offset) { idx, rel in
-                                CachedImageView(
-                                    url: model.apiClient?.onlineComicImageURL(relativePath: rel),
-                                    contentMode: .fit,
-                                    minHeight: 400,
-                                    maxPixel: 1600
-                                )
-                                .tag(idx)
-                            }
-                        }
-                        .tabViewStyle(.page(indexDisplayMode: .never))
-                        .onTapGesture {
-                            withAnimation(.easeInOut(duration: 0.2)) { readerChromeVisible.toggle() }
-                        }
-                    }
+                    ProgressView("加载图片并自动解混淆…")
+                        .tint(.white)
+                        .foregroundStyle(.white)
                 }
-                .navigationTitle(ch.title)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar(readerChromeVisible ? .visible : .hidden, for: .navigationBar)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("完成") { activeChapter = nil }
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        HStack(spacing: 12) {
-                            if hasPrev, let prevCh = detail?.chapters[chIdx - 1] {
-                                Button {
-                                    openChapter(comicId: detail?.id ?? "", chapter: prevCh)
-                                } label: { Image(systemName: "chevron.left") }
-                            }
-                            if hasNext, let nextCh = detail?.chapters[chIdx + 1] {
-                                Button {
-                                    openChapter(comicId: detail?.id ?? "", chapter: nextCh)
-                                } label: { Image(systemName: "chevron.right") }
-                            }
-                            Menu {
-                                Picker("阅读模式", selection: $readerMode) {
-                                    ForEach(ComicReadingMode.allCases) { m in
-                                        Label(m.rawValue, systemImage: m.symbol).tag(m)
-                                    }
-                                }
-                            } label: {
-                                Image(systemName: "ellipsis.circle")
-                            }
+            } else {
+                ComicGalleryReaderView(
+                    kind: .comic,
+                    title: readerTitle,
+                    pageURLs: pageURLs,
+                    chapters: readerChapters,
+                    onSelectChapter: { nextId in
+                        if let nextCh = chs.first(where: { $0.id == nextId }) {
+                            openChapter(comicId: detail?.id ?? "", chapter: nextCh)
                         }
-                    }
-                }
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    if readerChromeVisible && !readerImages.isEmpty && readerMode != .webtoon {
-                        let maxIdx = readerMode == .double ? max(0, (readerImages.count + 1) / 2 - 1) : max(0, readerImages.count - 1)
-                        HStack(spacing: 10) {
-                            Text("\(min(readerPage + 1, maxIdx + 1)) / \(maxIdx + 1)")
-                                .font(.caption2.monospacedDigit().bold())
-                                .foregroundStyle(.white)
-                            if maxIdx > 0 {
-                                Slider(
-                                    value: Binding(
-                                        get: { Double(min(readerPage, maxIdx)) },
-                                        set: { readerPage = Int($0.rounded()) }
-                                    ),
-                                    in: 0...Double(maxIdx),
-                                    step: 1
-                                )
-                                .tint(.purple)
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 8)
-                    }
-                }
+                    },
+                    onDismiss: { activeChapter = nil }
+                )
+                .environmentObject(model)
             }
         }
     }
@@ -1815,17 +1803,15 @@ private struct OnlineComicsPaneView: View {
         }
     }
 
-    private func modeChip(_ title: String, id: String) -> some View {
-        Button {
-            mode = id
-            Task { await loadList(reset: true) }
-        } label: {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(mode == id ? Color.purple : Color.secondary.opacity(0.14), in: Capsule())
-                .foregroundStyle(mode == id ? .white : .primary)
+    private func modeDisplayLabel(_ m: String) -> String {
+        switch m {
+        case "rank_day": return "日排行"
+        case "rank_week": return "周排行"
+        case "rank_month": return "月排行"
+        case "rank_all": return "总排行"
+        case "random": return "随机"
+        case "favorites": return "我的收藏"
+        default: return "发现"
         }
     }
 
@@ -1933,8 +1919,6 @@ private struct OnlineComicsPaneView: View {
         selectedItem = nil
         activeChapter = chapter
         readerImages = []
-        readerPage = 0
-        readerChromeVisible = true
         readerLoading = true
         Task {
             guard let client = model.apiClient else { return }
@@ -1942,6 +1926,164 @@ private struct OnlineComicsPaneView: View {
             if let res = try? await client.getOnlineComicChapterPages(source: source, comicId: comicId, chapterId: chapter.id) {
                 readerImages = res.images
             }
+        }
+    }
+}
+
+private struct ComicCoverPickerSheet: View {
+    let work: ComicWorkItem
+    let onSaved: (ComicWorkItem) -> Void
+
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var loading = true
+    @State private var saving = false
+    @State private var errorText = ""
+    @State private var firstVolume: ComicVolumeItem?
+    @State private var archivePageCount = 0
+    @State private var folderPages: [RemoteBrowserEntry] = []
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10),
+    ]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if !errorText.isEmpty {
+                        Text(errorText).font(.caption).foregroundStyle(.red)
+                    }
+                    if loading {
+                        ProgressView("加载候选封面中…")
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 40)
+                    } else if let vol = firstVolume, vol.isArchive {
+                        let count = max(1, min(archivePageCount, 18))
+                        LazyVGrid(columns: columns, spacing: 10) {
+                            ForEach(0..<count, id: \.self) { pIdx in
+                                let isCurrent = (work.coverPageIndex ?? 0) == pIdx && work.coverAssetId == vol.assetId
+                                Button {
+                                    Task { await saveCover(assetId: vol.assetId, pageIndex: pIdx) }
+                                } label: {
+                                    ZStack(alignment: .bottomTrailing) {
+                                        CachedImageView(
+                                            url: model.apiClient?.comicPageURL(assetId: vol.assetId, pageIndex: pIdx, thumb: true),
+                                            contentMode: .fill,
+                                            minHeight: 130,
+                                            maxPixel: 360
+                                        )
+                                        .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                                        .clipped()
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(isCurrent ? Color.purple : Color.clear, lineWidth: 2.5)
+                                        )
+                                        Text(isCurrent ? "当前" : "P\(pIdx + 1)")
+                                            .font(.caption2.bold())
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(isCurrent ? Color.purple : Color.black.opacity(0.7), in: Capsule())
+                                            .padding(5)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(saving)
+                            }
+                        }
+                    } else if !folderPages.isEmpty {
+                        LazyVGrid(columns: columns, spacing: 10) {
+                            ForEach(Array(folderPages.prefix(18).enumerated()), id: \.element.id) { idx, entry in
+                                let aid = entry.assetId ?? ""
+                                let isCurrent = !aid.isEmpty && work.coverAssetId == aid
+                                Button {
+                                    if !aid.isEmpty {
+                                        Task { await saveCover(assetId: aid, pageIndex: 0) }
+                                    }
+                                } label: {
+                                    ZStack(alignment: .bottomTrailing) {
+                                        CachedImageView(
+                                            url: model.apiClient?.v2CoverURL(assetId: entry.assetId, isArchive: false),
+                                            contentMode: .fill,
+                                            minHeight: 130,
+                                            maxPixel: 360
+                                        )
+                                        .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                                        .clipped()
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(isCurrent ? Color.purple : Color.clear, lineWidth: 2.5)
+                                        )
+                                        Text(isCurrent ? "当前" : "P\(idx + 1)")
+                                            .font(.caption2.bold())
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(isCurrent ? Color.purple : Color.black.opacity(0.7), in: Capsule())
+                                            .padding(5)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(saving || aid.isEmpty)
+                            }
+                        }
+                    } else {
+                        ContentUnavailableView("暂无可选封面页", systemImage: "photo")
+                    }
+                }
+                .padding(14)
+            }
+            .navigationTitle("选择漫画封面")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("关闭") { dismiss() }
+                }
+            }
+            .task { await loadCandidates() }
+        }
+    }
+
+    private func loadCandidates() async {
+        guard let client = model.apiClient else { loading = false; return }
+        defer { loading = false }
+        guard let detail = try? await client.getComicWorkDetail(workId: work.id),
+              let vol = detail.volumes.first else {
+            return
+        }
+        firstVolume = vol
+        if vol.isArchive {
+            if let info = try? await client.inspectComicArchive(assetId: vol.assetId) {
+                archivePageCount = info.pages.count
+            } else {
+                archivePageCount = Int(max(6, min(vol.pageCount, 18)))
+            }
+        } else if let folder = vol.folderPath {
+            let roots = (try? await client.libraryRoots()) ?? []
+            let root = roots.first(where: { $0.kind == "comics" })
+                ?? LibraryRoot(id: "comics", kind: "comics", remotePath: folder, createdAt: 0)
+            if let page = try? await client.remoteChildren(rootId: root.id, path: folder) {
+                folderPages = page.items.filter(\.isImage)
+            }
+        }
+    }
+
+    private func saveCover(assetId: String, pageIndex: Int) async {
+        guard let client = model.apiClient, !saving else { return }
+        saving = true
+        defer { saving = false }
+        do {
+            let updated = try await client.setComicWorkCover(workId: work.id, pageIndex: pageIndex, assetId: assetId)
+            onSaved(updated)
+            dismiss()
+        } catch {
+            errorText = "设置封面失败：\(error.localizedDescription)"
         }
     }
 }

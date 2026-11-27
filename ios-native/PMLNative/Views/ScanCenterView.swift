@@ -163,7 +163,7 @@ struct ScanCenterView: View {
         defer { syncingModuleId = nil }
         do {
             let res = try await client.scanLibraryModule(moduleId: mod.id, full: false)
-            message = "「\(mod.name)」同步完成：扫描 \(res.scan.scanned) 项，新增 \(res.scan.added)，索引 \(res.rebuild.entityCount) \(mod.entityUnitLabel)"
+            message = "「\(mod.name)」增量同步完成：新增 +\(res.scan.added) · 更新 \(res.scan.updated) · 删除 -\(res.scan.deleted)（共扫描 \(res.scan.scanned) 项，索引 \(res.rebuild.entityCount) \(mod.entityUnitLabel)）"
             await load()
         } catch {
             errorText = "同步「\(mod.name)」失败：\(error.localizedDescription)"

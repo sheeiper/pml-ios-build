@@ -299,6 +299,12 @@ private struct ZoomScrollRepresentable: UIViewRepresentable {
 final class ZoomScrollView: UIScrollView, UIScrollViewDelegate {
     private let imageView = UIImageView()
     private var lastImage: UIImage?
+    private var currentPreserveZoom = false
+
+    var onSingleTap: (() -> Void)?
+    var onLongPressChanged: ((Bool) -> Void)?
+    var onZoomScaleChanged: ((CGFloat) -> Void)?
+    var canLongPress: Bool = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -327,15 +333,47 @@ final class ZoomScrollView: UIScrollView, UIScrollViewDelegate {
         let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
         doubleTap.numberOfTapsRequired = 2
         addGestureRecognizer(doubleTap)
+
+        let singleTap = UITapGestureRecognizer(target: self, action: #selector(handleSingleTap(_:)))
+        singleTap.numberOfTapsRequired = 1
+        singleTap.require(toFail: doubleTap)
+        addGestureRecognizer(singleTap)
+
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.25
+        addGestureRecognizer(longPress)
     }
 
     func setImage(_ image: UIImage) {
+        updateImage(image, preserveZoom: false, animated: false)
+    }
+
+    func updateImage(_ image: UIImage, preserveZoom: Bool, animated: Bool) {
         guard image !== lastImage else { return }
+        let hadImage = (lastImage != nil)
         lastImage = image
-        imageView.image = image
-        setZoomScale(1, animated: false)
-        isScrollEnabled = false
-        setNeedsLayout()
+        currentPreserveZoom = preserveZoom
+
+        let applySwap = {
+            self.imageView.image = image
+            if !preserveZoom {
+                self.setZoomScale(1, animated: false)
+                self.isScrollEnabled = false
+            }
+            self.setNeedsLayout()
+        }
+
+        if animated && hadImage {
+            UIView.transition(
+                with: imageView,
+                duration: 0.28,
+                options: [.transitionCrossDissolve, .allowUserInteraction],
+                animations: applySwap,
+                completion: nil
+            )
+        } else {
+            applySwap()
+        }
     }
 
     override func layoutSubviews() {
@@ -354,6 +392,23 @@ final class ZoomScrollView: UIScrollView, UIScrollViewDelegate {
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
         isScrollEnabled = zoomScale > 1.01
+        onZoomScaleChanged?(zoomScale)
+    }
+
+    @objc private func handleSingleTap(_ gesture: UITapGestureRecognizer) {
+        onSingleTap?()
+    }
+
+    @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            guard canLongPress else { return }
+            onLongPressChanged?(true)
+        case .ended, .cancelled, .failed:
+            onLongPressChanged?(false)
+        default:
+            break
+        }
     }
 
     @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {

@@ -1171,18 +1171,84 @@ fn looks_like_multipart_video(name: &str) -> bool {
 fn is_ad_dir_name(dir_name: &str) -> bool {
     let lower = dir_name.to_ascii_lowercase();
     const AD_DIR_KEYWORDS: &[&str] = &[
-        "约炮", "同城上门", "同城约", "全国可飞", "品茶", "广告", "宣传", "防走失", "最新地址",
+        "约炮", "約炮", "同城上门", "同城上門", "同城约", "同城約", "同城交友",
+        "全国可飞", "全國可飛", "品茶", "广告", "廣告", "宣传", "宣傳",
+        "防走失", "最新地址", "永久地址", "备用地址", "備用地址", "发布器", "發布器",
     ];
     AD_DIR_KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
+fn normalize_similarity_token(raw: &str) -> String {
+    let mut s = raw.to_ascii_lowercase();
+    // Strip trailing part/volume counters like (2V), (3P), (1), [2V]
+    for (open, close) in [('(', ')'), ('[', ']'), ('（', '）'), ('【', '】')] {
+        loop {
+            let trimmed = s.trim_end();
+            if trimmed.ends_with(close) {
+                if let Some(idx) = trimmed.rfind(open) {
+                    let inner = trimmed[idx + open.len_utf8()..trimmed.len() - close.len_utf8()].trim();
+                    let is_count_tag = inner.len() <= 6
+                        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == ' ');
+                    if is_count_tag {
+                        s = trimmed[..idx].to_string();
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
+        .collect()
+}
+
+/// Returns true if `sub_name` is a redundant wrapper folder of `parent_name`
+/// (e.g. `推特裸舞小美女【yum707玉米】8月VIP裸舞福利-3❤️最受不了乳摇了(2V)` inside `推特裸舞小美女【yum707玉米】8月VIP裸舞福利-3 最受不了乳摇了`).
+fn is_redundant_same_named_subdir(parent_name: &str, sub_name: &str) -> bool {
+    let a = normalize_similarity_token(&strip_site_watermarks(parent_name, false));
+    let b = normalize_similarity_token(&strip_site_watermarks(sub_name, false));
+    if a.chars().count() < 6 || b.chars().count() < 6 {
+        return false;
+    }
+    if a == b || a.contains(&b) || b.contains(&a) {
+        return true;
+    }
+    // Check shared prefix ratio (>= 70% of shorter normalized string)
+    let min_len = a.chars().count().min(b.chars().count());
+    let shared_prefix = a
+        .chars()
+        .zip(b.chars())
+        .take_while(|(ca, cb)| ca == cb)
+        .count();
+    shared_prefix * 10 >= min_len * 7
+}
+
+fn stem_overlaps_folder(stem: &str, folder_core: &str) -> bool {
+    let s = normalize_similarity_token(stem);
+    let f = normalize_similarity_token(folder_core);
+    if s.chars().count() < 4 || f.chars().count() < 4 {
+        return false;
+    }
+    if s.contains(&f) || f.contains(&s) {
+        return true;
+    }
+    let min_len = s.chars().count().min(f.chars().count());
+    let shared_prefix = s
+        .chars()
+        .zip(f.chars())
+        .take_while(|(ca, cb)| ca == cb)
+        .count();
+    shared_prefix >= 6 && shared_prefix * 2 >= min_len
 }
 
 fn extract_explicit_jav_number(raw: &str) -> Option<String> {
     let stripped = strip_site_watermarks(raw, false);
     let lower = stripped.to_ascii_lowercase();
     const NON_JAV_KEYWORDS: &[&str] = &[
-        "推特", "twitter", "onlyfans", "fansly", "patreon", "网红", "博主", "福利姬",
-        "定制", "私拍", "裸舞", "微密", "秀人", "写真", "套图", "合集", "同人", "汉化",
-        "漫画", "图集",
+        "推特", "twitter", "onlyfans", "fansly", "patreon", "网红", "網紅", "博主", "福利姬",
+        "定制", "私拍", "裸舞", "微密", "秀人", "写真", "寫真", "套图", "套圖", "合集", "同人", "汉化", "漢化",
+        "漫画", "漫畫", "图集", "圖集",
     ];
     if NON_JAV_KEYWORDS.iter().any(|k| lower.contains(k)) {
         return None;
@@ -1197,6 +1263,47 @@ fn extract_explicit_jav_number(raw: &str) -> Option<String> {
     }
 }
 
+fn split_stem_ext(raw: &str) -> (String, Option<String>) {
+    match raw.rsplit_once('.') {
+        Some((st, ex)) if !ex.is_empty() && ex.len() <= 6 && ex.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            (st.to_string(), Some(ex.to_string()))
+        }
+        _ => (raw.to_string(), None),
+    }
+}
+
+fn has_embedded_domain_token(text: &str) -> bool {
+    let l = text.to_ascii_lowercase();
+    const TLDS: &[&str] = &[
+        ".com", ".net", ".org", ".la", ".cc", ".me", ".xyz", ".top", ".vip", ".tv", ".club", ".info", ".pro", ".io", ".cn",
+    ];
+    if l.contains("www.") || l.contains("http://") || l.contains("https://") {
+        return true;
+    }
+    for tld in TLDS {
+        let mut rest = l.as_str();
+        while let Some(idx) = rest.find(tld) {
+            let before = &rest[..idx];
+            let after = &rest[idx + tld.len()..];
+            let has_host_char = before
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric() || c == '-')
+                .unwrap_or(false);
+            let boundary_after = after
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(true);
+            if has_host_char && boundary_after {
+                return true;
+            }
+            rest = &rest[idx + tld.len()..];
+        }
+    }
+    false
+}
+
 fn junk_reason_for_file(
     name: &str,
     full_path: &str,
@@ -1204,9 +1311,15 @@ fn junk_reason_for_file(
     size_bytes: u64,
     jav_code: Option<&str>,
     has_large_movie: bool,
+    max_video_bytes: u64,
+    has_any_real_video: bool,
+    folder_core_name: &str,
+    is_cross_folder_dup: bool,
 ) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
-    let ext = file_ext_lower(name);
+    let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    let (stem_raw, ext_opt) = split_stem_ext(name);
+    let ext = ext_opt.as_deref().unwrap_or("").to_ascii_lowercase();
 
     if matches!(
         ext.as_str(),
@@ -1227,25 +1340,83 @@ fn junk_reason_for_file(
     }
 
     const AD_KEYWORDS: &[&str] = &[
-        "扫码", "约炮", "品茶", "同城上门", "同城约", "全国可飞", "网址", "宣传", "广告",
-        "最新地址", "防走失", "免责", "最新情报", "最新情報", "决胜负", "決勝負",
-        "ai脱衣", "一键脱衣", "ai换脸", "视频换脸", "脱光衣服", "ai创作网站", "脱光心仪",
-        "黄果短剧", "每日更新万部", "91porn", "a8uu.com", "a8nn.com", "xuu92", "98t.la",
-        "sis001", "澳门赌场", "在线荷官", "裸聊", "精品资源免费下载", "免费下载",
+        "扫码", "掃碼", "扫描访问", "掃描訪問", "二维码", "二維碼", "qr码", "qr碼", "2048qr",
+        "约炮", "約炮", "品茶", "同城上门", "同城上門", "同城约", "同城約", "同城交友", "同城一", "yq交友",
+        "全国可飞", "全國可飛", "网址", "網址", "宣传", "宣傳", "广告", "廣告",
+        "发布器", "發布器", "地址发布", "地址發布", "发布页", "發布頁",
+        "最新地址", "最新位址", "永久地址", "备用地址", "備用地址", "防走失", "防屏蔽", "免责", "免責",
+        "点关注", "點關注", "不迷路", "杏吧", "工口mh",
+        "最新情报", "最新情報", "决胜负", "決勝負", "苍老师", "蒼老師", "强力推荐", "強力推薦", "三上悠亚", "三上悠亞",
+        "18禁手游", "18禁手遊", "免费18禁", "免費18禁", "h手游", "h手遊",
+        "核工厂", "核工廠", "色中色", "痴汉俱乐部", "痴漢俱樂部", "公仔箱",
+        "草榴", "t66y", "1024社区", "1024社區", "2048社区", "2048社區", "2048地址", "sehuatang", "色花堂", "98堂",
+        "uu直播", "美少女直播", "美女直播", "美女聊天", "线上美女", "線上美女", "台妹子", "花式表演", "聚合全网", "聚合全網",
+        "信誉保证", "信譽保證", "20年信誉", "20年信譽", "服务全球", "服務全球", "等你来选", "等你來選",
+        "激情随时看", "激情隨時看", "点击进入", "點擊進入", "有惊喜", "有驚喜",
+        "点击访问", "點擊訪問", "免费看", "免費看", "一手资源", "一手資源", "每日更新", "最新最快",
+        "ai脱衣", "ai脫衣", "一键脱衣", "一鍵脫衣", "ai换脸", "ai換臉", "视频换脸", "視頻換臉",
+        "脱光衣服", "脫光衣服", "ai创作网站", "脱光心仪", "黃果短劇", "黄果短剧", "每日更新万部",
+        "91porn", "a8uu.com", "a8nn.com", "xuu92", "98t.la", "sis001",
+        "澳门", "澳門", "威尼斯人", "新葡京", "赌场", "賭場", "在线荷官", "在線荷官", "荷官", "博彩", "棋牌", "娱乐城", "娛樂城",
+        "福利机置", "体育电竞", "體育電競",
+        "裸聊", "一夜情", "加qq", "加微信", "微信号", "微信號", "电报群", "電報群", "飞机群", "飛機群",
+        "精品资源免费下载", "免费下载", "免費下載", "资源免费", "資源免費",
     ];
-    if AD_KEYWORDS.iter().any(|k| lower.contains(k)) {
+    if name.contains("★★★") || AD_KEYWORDS.iter().any(|k| lower.contains(k) || compact.contains(k)) {
         return Some("疑似广告文件");
     }
 
-    // Only flag small <25MB video clips as ad intros inside confirmed explicit JAV movie folders
-    // where the main movie is >= 300MB and the clip is not a numbered/multi-part segment.
+    let stripped_file = strip_site_watermarks(name, true);
+    let (stripped_stem, _) = split_stem_ext(&stripped_file);
+    let matches_folder = stem_overlaps_folder(&stripped_stem, folder_core_name)
+        || stem_overlaps_folder(&stem_raw, folder_core_name);
+
+    // Embedded domain inside filename (e.g. "xxx suu37.com.mp4", "xxx auu32.com.gif") after removing legitimate leading site prefix
+    if !matches_folder && has_embedded_domain_token(&stripped_stem) {
+        let is_small_media = (is_video_ext(&ext) && size_bytes < 47_185_920)
+            || ext == "gif"
+            || (is_image_ext(&ext) && size_bytes < 5_242_880)
+            || (is_archive_ext(&ext) && size_bytes < 10_485_760);
+        if is_small_media {
+            return Some("含推广域名的广告文件");
+        }
+    }
+
+    // Small launcher / ad archives bundled inside video folders (e.g. _1024社区发布器 10.1版.zip, 2048地址发布器PC版.rar)
+    if has_any_real_video && is_archive_ext(&ext) && size_bytes > 0 && size_bytes < 5_242_880 && !matches_folder {
+        const ARCHIVE_AD_TOKENS: &[&str] = &[
+            "发布", "發布", "地址", "社区", "社區", "pc版", "手机版", "手機版", "安卓", "1024", "2048", "app", "说明", "說明", "防走失", "网址", "網址",
+        ];
+        if ARCHIVE_AD_TOKENS.iter().any(|k| lower.contains(k)) {
+            return Some("推广发布器压缩包");
+        }
+    }
+
+    // Promo .gif banners inside video folders
+    if has_any_real_video && ext == "gif" && size_bytes > 0 && size_bytes < 10_485_760 && !matches_folder {
+        return Some("疑似推广动图广告");
+    }
+
+    // Cross-folder identical boilerplate spam across multiple inbox folders
+    if is_cross_folder_dup
+        && size_bytes > 0
+        && size_bytes < 47_185_920
+        && !looks_like_multipart_video(name)
+        && !matches_folder
+    {
+        return Some("多目录重复推广文件");
+    }
+
+    // Unrelated intro/promo clips inside confirmed explicit JAV movie folders
     if let Some(code) = jav_code {
         if has_large_movie
             && is_video_ext(&ext)
             && size_bytes > 0
-            && size_bytes < 26_214_400
             && !looks_like_multipart_video(name)
+            && !matches_folder
             && !name.to_ascii_uppercase().contains(code)
+            && (size_bytes < 26_214_400
+                || (size_bytes < 125_829_120 && size_bytes.saturating_mul(8) <= max_video_bytes))
         {
             return Some("疑似片头广告切片");
         }
@@ -1262,27 +1433,16 @@ fn looks_like_site_token(inner: &str) -> bool {
 
 fn strip_site_watermarks(raw: &str, is_file: bool) -> String {
     let (stem_orig, ext_opt) = if is_file {
-        match raw.rsplit_once('.') {
-            Some((st, ex)) if !ex.is_empty() && ex.len() <= 6 && ex.chars().all(|c| c.is_ascii_alphanumeric()) => {
-                (st.to_string(), Some(ex.to_string()))
-            }
-            _ => (raw.to_string(), None),
-        }
+        split_stem_ext(raw)
     } else {
         (raw.to_string(), None)
     };
 
     let mut s = stem_orig.trim().to_string();
 
-    // 1. Strip leading domain@ prefixes like hhd800.com@ / www.98T.la@
-    if let Some(at_pos) = s.find('@') {
-        let prefix = &s[..at_pos];
-        if prefix.len() <= 32 && looks_like_site_token(prefix) {
-            s = s[at_pos + 1..].trim().to_string();
-        }
-    }
-
-    // 2. Strip bracketed site watermarks anywhere: 【mitaocang.com】, [www.98T.la], (xxx.com)
+    // 1. Strip bracketed site watermarks anywhere first: 【mitaocang.com】, [www.98T.la], (xxx.com)
+    // Running this before leading domain stripping ensures "【98t.la】www.demo.com_title"
+    // and "2048.vip-【98t.la】www.demo.com_title" strip both bracketed and unbracketed domains cleanly.
     for (open, close) in [('【', '】'), ('[', ']'), ('(', ')')] {
         let mut out = String::new();
         let mut rest = s.as_str();
@@ -1305,6 +1465,45 @@ fn strip_site_watermarks(raw: &str, is_file: bool) -> String {
         }
         out.push_str(rest);
         s = out;
+    }
+    s = s
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '_' | '@' | '+'))
+        .to_string();
+
+    // 2. Strip leading domain prefixes separated by '@', '-', '_', '+', or whitespace
+    // e.g. "2048.vip-推特..." -> "推特...", "hhd800.com@ABP-123" -> "ABP-123", "www.98T.la_xxx" -> "xxx"
+    loop {
+        let mut stripped_prefix = false;
+        let bytes = s.as_bytes();
+        let mut sep_pos: Option<(usize, usize)> = None;
+        for (idx, ch) in s.char_indices() {
+            if idx > 36 {
+                break;
+            }
+            if matches!(ch, '@' | '-' | '_' | '+' | ' ') {
+                let candidate = &s[..idx];
+                if looks_like_site_token(candidate) {
+                    let mut end = idx + ch.len_utf8();
+                    while end < bytes.len() && matches!(bytes[end] as char, ' ' | '-' | '_' | '@' | '+') {
+                        end += 1;
+                    }
+                    if end < s.len() {
+                        sep_pos = Some((idx, end));
+                    }
+                }
+                break;
+            }
+        }
+        if let Some((_, after)) = sep_pos {
+            let remainder = s[after..].trim().to_string();
+            if !remainder.is_empty() {
+                s = remainder;
+                stripped_prefix = true;
+            }
+        }
+        if !stripped_prefix {
+            break;
+        }
     }
 
     // 3. Clean stray leading/trailing punctuation and collapse double spaces
@@ -1352,13 +1551,22 @@ pub fn scan_offline_inbox(app: &AppHandle) -> Result<InboxScanResponse, String> 
         cd2_ensure_folder(&client, &origin, &token, &inbox_path).await?;
         let top_entries = cd2_list_sub_files(&client, &origin, &token, &inbox_path).await?;
 
-        let mut plan_items = Vec::new();
+        struct CollectedTopEntry {
+            entry: Cd2Entry,
+            all_files: Vec<Cd2Entry>,
+            ad_dirs: Vec<Cd2Entry>,
+            dir_children: std::collections::HashMap<String, Vec<Cd2Entry>>,
+        }
+
+        // Pass 1: collect directory trees and count cross-folder duplicate boilerplate files
+        let mut collected: Vec<CollectedTopEntry> = Vec::new();
+        let mut cross_folder_counts: std::collections::HashMap<(String, u64), usize> = std::collections::HashMap::new();
+
         for entry in top_entries {
             if entry.name == "_Trash" || entry.name.starts_with('.') {
                 continue;
             }
 
-            // Collect files & per-directory children (up to depth 3, gentle pacing)
             let mut all_files: Vec<Cd2Entry> = Vec::new();
             let mut ad_dirs: Vec<Cd2Entry> = Vec::new();
             let mut dir_children: std::collections::HashMap<String, Vec<Cd2Entry>> = std::collections::HashMap::new();
@@ -1388,12 +1596,52 @@ pub fn scan_offline_inbox(app: &AppHandle) -> Result<InboxScanResponse, String> 
                 all_files.push(entry.clone());
             }
 
+            if entry.is_dir {
+                let mut seen_in_entry = std::collections::HashSet::new();
+                for f in &all_files {
+                    let key = (f.name.to_ascii_lowercase(), f.size_bytes);
+                    if seen_in_entry.insert(key.clone()) {
+                        *cross_folder_counts.entry(key).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            collected.push(CollectedTopEntry {
+                entry,
+                all_files,
+                ad_dirs,
+                dir_children,
+            });
+        }
+
+        let top_dir_count = collected.iter().filter(|c| c.entry.is_dir).count();
+        let mut plan_items = Vec::new();
+
+        // Pass 2: classify kept/junk files, wrapper subfolders, renames, and category suggestions
+        for item in collected {
+            let entry = item.entry;
+            let all_files = item.all_files;
+            let ad_dirs = item.ad_dirs;
+            let dir_children = item.dir_children;
+
+            let folder_core_name = strip_site_watermarks(&entry.name, !entry.is_dir);
             let has_main_video = all_files
                 .iter()
                 .any(|f| is_video_ext(&file_ext_lower(&f.name)) && f.size_bytes >= 52_428_800);
             let has_large_movie = all_files
                 .iter()
                 .any(|f| is_video_ext(&file_ext_lower(&f.name)) && f.size_bytes >= 314_572_800);
+            let max_video_bytes: u64 = all_files
+                .iter()
+                .filter(|f| is_video_ext(&file_ext_lower(&f.name)))
+                .map(|f| f.size_bytes)
+                .max()
+                .unwrap_or(0);
+            let has_any_real_video = has_main_video
+                || all_files.iter().any(|f| {
+                    is_video_ext(&file_ext_lower(&f.name))
+                        && (f.size_bytes >= 31_457_280 || stem_overlaps_folder(&strip_site_watermarks(&f.name, true), &folder_core_name))
+                });
             let explicit_jav_num = extract_explicit_jav_number(&entry.name);
 
             let mut kept_files = Vec::new();
@@ -1403,6 +1651,12 @@ pub fn scan_offline_inbox(app: &AppHandle) -> Result<InboxScanResponse, String> 
 
             for f in &all_files {
                 total_size = total_size.saturating_add(f.size_bytes);
+                let is_cross_folder_dup = top_dir_count >= 2
+                    && cross_folder_counts
+                        .get(&(f.name.to_ascii_lowercase(), f.size_bytes))
+                        .copied()
+                        .unwrap_or(0)
+                        >= 2;
                 if let Some(reason) = junk_reason_for_file(
                     &f.name,
                     &f.full_path,
@@ -1410,6 +1664,10 @@ pub fn scan_offline_inbox(app: &AppHandle) -> Result<InboxScanResponse, String> 
                     f.size_bytes,
                     explicit_jav_num.as_deref(),
                     has_large_movie,
+                    max_video_bytes,
+                    has_any_real_video,
+                    &folder_core_name,
+                    is_cross_folder_dup,
                 ) {
                     junk_set.insert(f.full_path.clone());
                     junk_files.push(InboxFileEntry {
@@ -1441,28 +1699,48 @@ pub fn scan_offline_inbox(app: &AppHandle) -> Result<InboxScanResponse, String> 
                 });
             }
 
-            // Detect ONLY single-chain redundant wrapper folders (never flatten multi-subdir structures!)
+            // Detect single-chain redundant wrapper folders OR single redundant same-named subfolder
             let mut flatten_source_dir: Option<String> = None;
             let mut flatten_wrapper_dir: Option<String> = None;
             let mut flatten_levels = 0usize;
             if entry.is_dir {
                 let mut cur = entry.full_path.clone();
+                let mut cur_name = entry.name.clone();
                 while let Some(children) = dir_children.get(&cur) {
                     let sub_dirs: Vec<&Cd2Entry> = children
                         .iter()
                         .filter(|c| c.is_dir && !junk_set.contains(&c.full_path))
                         .collect();
-                    let non_junk_files_here = children.iter().filter(|c| !c.is_dir && !junk_set.contains(&c.full_path)).count();
-                    if sub_dirs.len() == 1 && non_junk_files_here == 0 {
-                        if flatten_wrapper_dir.is_none() {
-                            flatten_wrapper_dir = Some(sub_dirs[0].full_path.clone());
+                    let non_junk_files_here: Vec<&Cd2Entry> = children
+                        .iter()
+                        .filter(|c| !c.is_dir && !junk_set.contains(&c.full_path))
+                        .collect();
+                    if sub_dirs.len() == 1 {
+                        let only_sub = sub_dirs[0];
+                        let empty_shell = non_junk_files_here.is_empty();
+                        let redundant_same = is_redundant_same_named_subdir(&cur_name, &only_sub.name)
+                            && dir_children
+                                .get(&only_sub.full_path)
+                                .map(|inner| {
+                                    let existing_names: std::collections::HashSet<String> = non_junk_files_here
+                                        .iter()
+                                        .map(|f| f.name.to_ascii_lowercase())
+                                        .collect();
+                                    !inner.iter().any(|c| existing_names.contains(&c.name.to_ascii_lowercase()))
+                                })
+                                .unwrap_or(false);
+                        if empty_shell || redundant_same {
+                            if flatten_wrapper_dir.is_none() {
+                                flatten_wrapper_dir = Some(only_sub.full_path.clone());
+                            }
+                            cur = only_sub.full_path.clone();
+                            cur_name = only_sub.name.clone();
+                            flatten_source_dir = Some(cur.clone());
+                            flatten_levels += 1;
+                            continue;
                         }
-                        cur = sub_dirs[0].full_path.clone();
-                        flatten_source_dir = Some(cur.clone());
-                        flatten_levels += 1;
-                    } else {
-                        break;
                     }
+                    break;
                 }
             }
 
@@ -1481,7 +1759,10 @@ pub fn scan_offline_inbox(app: &AppHandle) -> Result<InboxScanResponse, String> 
 
             let kept_videos = kept_files.iter().filter(|f| is_video_ext(&file_ext_lower(&f.name))).count();
             let kept_images = kept_files.iter().filter(|f| is_image_ext(&file_ext_lower(&f.name))).count();
-            let kept_archives = kept_files.iter().filter(|f| is_archive_ext(&file_ext_lower(&f.name))).count();
+            let kept_comic_archives = kept_files
+                .iter()
+                .filter(|f| is_archive_ext(&file_ext_lower(&f.name)) && (kept_videos == 0 || f.size_bytes >= 2_097_152))
+                .count();
 
             let lower_name = entry.name.to_ascii_lowercase();
             let has_jav_num = explicit_jav_num.is_some();
@@ -1489,7 +1770,7 @@ pub fn scan_offline_inbox(app: &AppHandle) -> Result<InboxScanResponse, String> 
                 "movie"
             } else if lower_name.contains("写真") || lower_name.contains("套图") || lower_name.contains("cos") || lower_name.contains("私房") {
                 "gallery"
-            } else if kept_archives > 0 || kept_images >= 8 {
+            } else if kept_comic_archives > 0 || (kept_videos == 0 && kept_images >= 8) {
                 "comic"
             } else if has_main_video || kept_videos > 0 {
                 "creator"
@@ -2012,4 +2293,135 @@ pub fn create_cd2_folder(
             full_path,
         })
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_leading_domain_dash_and_brackets() {
+        assert_eq!(
+            strip_site_watermarks("2048.vip-推特裸舞小美女【yum707玉米】8月VIP裸舞福利-2 掰穴大桃包小桃.mp4", true),
+            "推特裸舞小美女【yum707玉米】8月VIP裸舞福利-2 掰穴大桃包小桃.mp4"
+        );
+        assert_eq!(
+            strip_site_watermarks("hhd800.com@ABP-123.mp4", true),
+            "ABP-123.mp4"
+        );
+        assert_eq!(
+            strip_site_watermarks("【98t.la】www.demo.com_测试视频.mkv", true),
+            "测试视频.mkv"
+        );
+    }
+
+    #[test]
+    fn detects_real_inbox_ads_and_preserves_main_videos() {
+        let folder = "推特裸舞小美女【yum707玉米】8月VIP裸舞福利-2 掰穴大桃包小桃";
+        let root = format!("/115open/PML_Inbox/{folder}");
+
+        assert!(junk_reason_for_file(
+            "2048.vip-推特裸舞小美女【yum707玉米】8月VIP裸舞福利-2 掰穴大桃包小桃.mp4",
+            &format!("{root}/2048.vip-推特裸舞小美女【yum707玉米】8月VIP裸舞福利-2 掰穴大桃包小桃.mp4"),
+            &root,
+            462_724_450,
+            None,
+            true,
+            462_724_450,
+            true,
+            folder,
+            false,
+        ).is_none());
+
+        assert!(junk_reason_for_file(
+            "V (2).mp4",
+            &format!("{root}/sub/V (2).mp4"),
+            &root,
+            234_967_469,
+            None,
+            false,
+            462_724_450,
+            true,
+            folder,
+            false,
+        ).is_none());
+
+        for ad in [
+            ("2048QR二维码.png", 19_530u64),
+            ("2048地址发布器PC版.rar", 17_515),
+            ("_1024社区发布器 10.1版.zip", 1_209_011),
+            ("UU直播 20年信誉保证拥有海量美女等你来选 suu37.com.mp4", 23_480_443),
+            ("台湾uu美少女直播 20年信誉保证服务全球 suu28.com.mp4", 23_498_796),
+            ("台灣UU線上美女聊天 suu27.com.mp4", 23_472_234),
+            ("同城一YQ交友.gif", 239_252),
+            ("找美女看美女来点击进入有惊喜auu32.com.gif", 3_406_956),
+            ("激情隨時看 suu26.com.mp4", 23_485_588),
+        ] {
+            let reason = junk_reason_for_file(
+                ad.0,
+                &format!("{root}/{}", ad.0),
+                &root,
+                ad.1,
+                None,
+                false,
+                462_724_450,
+                true,
+                folder,
+                true,
+            );
+            assert!(reason.is_some(), "expected junk for {}", ad.0);
+        }
+
+        // JAV folder promo leftovers (spaced text, ★★★ mobile game promo, unrelated intro clip < 1/8 max)
+        for (main_name, folder_name, code, main_size, ad_name, ad_size) in [
+            ("390JAC-172-uncensored-nyap2p.com.mp4", "390JAC-172-uncensored-HD", "390JAC-172", 3_492_693_024u64, "★★★櫻境物語-免费18禁手游.mp4", 51_834_116u64),
+            ("390JAC-172-uncensored-nyap2p.com.mp4", "390JAC-172-uncensored-HD", "390JAC-172", 3_492_693_024, "工口MH-扫描访问.png", 989_472),
+            ("390JAC-172-uncensored-nyap2p.com.mp4", "390JAC-172-uncensored-HD", "390JAC-172", 3_492_693_024, "杏吧社区-点关注不迷路.jpg", 278_195),
+            ("4k2.meblk-673.mp4", "blk-673", "BLK-673", 5_330_590_991, "苍 老 师 强 力 推 荐.mp4", 77_146_172),
+            ("nima-007.mp4", "nima-007", "NIMA-007", 5_920_167_105, "uuv79.mp4", 55_272_407),
+        ] {
+            let r_dir = format!("/115open/PML_Inbox/{folder_name}");
+            assert!(junk_reason_for_file(
+                main_name,
+                &format!("{r_dir}/{main_name}"),
+                &r_dir,
+                main_size,
+                Some(code),
+                true,
+                main_size,
+                true,
+                folder_name,
+                false,
+            ).is_none(), "main movie must stay: {main_name}");
+            assert!(junk_reason_for_file(
+                ad_name,
+                &format!("{r_dir}/{ad_name}"),
+                &r_dir,
+                ad_size,
+                Some(code),
+                true,
+                main_size,
+                true,
+                folder_name,
+                false,
+            ).is_some(), "expected junk for {ad_name}");
+        }
+    }
+
+    #[test]
+    fn redundant_same_named_subfolder_matches_with_emoji_and_count() {
+        assert!(is_redundant_same_named_subdir(
+            "推特裸舞小美女【yum707玉米】8月VIP裸舞福利-3 最受不了乳摇了",
+            "推特裸舞小美女【yum707玉米】8月VIP裸舞福利-3❤️最受不了乳摇了(2V)"
+        ));
+        assert!(is_redundant_same_named_subdir(
+            "推特裸舞小美女【yum707玉米】8月VIP裸舞福利-2 掰穴大桃包小桃",
+            "推特裸舞小美女【yum707玉米】8月VIP裸舞福利-2掰穴大桃包小桃"
+        ));
+        assert!(!is_redundant_same_named_subdir(
+            "合集大包",
+            "第一集"
+        ));
+    }
 }

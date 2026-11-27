@@ -207,6 +207,13 @@ pub(crate) fn ensure_module_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_gallery_items_set
             ON gallery_items(set_id, sort_order);
 
+        CREATE TABLE IF NOT EXISTS gallery_cover_overrides (
+            set_id TEXT PRIMARY KEY,
+            cover_asset_id TEXT NOT NULL,
+            cover_page_index INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS entity_favorites (
             entity_type TEXT NOT NULL,
             entity_id TEXT NOT NULL,
@@ -247,6 +254,14 @@ pub(crate) fn ensure_module_schema(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("为 library_modules 添加 extra_paths_json 列失败：{e}"))?;
+    }
+
+    if !has_column(conn, "gallery_sets", "cover_page_index")? {
+        conn.execute(
+            "ALTER TABLE gallery_sets ADD COLUMN cover_page_index INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| format!("为 gallery_sets 添加 cover_page_index 列失败：{e}"))?;
     }
 
     seed_default_modules(conn)?;
@@ -1044,6 +1059,14 @@ fn rebuild_galleries_index(
         )
         .map_err(|e| e.to_string())?;
     }
+
+    let _ = tx.execute(
+        "UPDATE gallery_sets
+         SET cover_asset_id = (SELECT o.cover_asset_id FROM gallery_cover_overrides o WHERE o.set_id = gallery_sets.id),
+             cover_page_index = COALESCE((SELECT o.cover_page_index FROM gallery_cover_overrides o WHERE o.set_id = gallery_sets.id), 0)
+         WHERE EXISTS (SELECT 1 FROM gallery_cover_overrides o WHERE o.set_id = gallery_sets.id)",
+        [],
+    );
 
     Ok((set_count, item_count))
 }
@@ -2528,6 +2551,7 @@ pub struct GallerySetV2 {
     pub remote_path: String,
     pub is_archive: bool,
     pub cover_asset_id: Option<String>,
+    pub cover_page_index: i64,
     pub item_count: i64,
     pub total_bytes: i64,
     pub updated_at: i64,
@@ -2577,31 +2601,39 @@ pub fn list_gallery_sets(
     model_name: Option<&str>,
     query: Option<&str>,
     sort: Option<&str>,
+    kind_filter: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> Result<GallerySetsPage, String> {
     four_domains::ensure_v2(app)?;
     let conn = four_domains::open_v2(app)?;
 
-    let mut where_clauses = vec!["item_count > 0".to_string()];
+    let mut where_clauses = vec!["g.item_count > 0".to_string()];
     let mut bind_vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(m) = model_name
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "all")
     {
-        where_clauses.push("model_name = ?".to_string());
+        where_clauses.push("g.model_name = ?".to_string());
         bind_vals.push(Box::new(m.to_string()));
     }
+    if let Some(kf) = kind_filter.map(str::trim) {
+        match kf {
+            "archive" => where_clauses.push("g.is_archive = 1".to_string()),
+            "folder" => where_clauses.push("g.is_archive = 0".to_string()),
+            _ => {}
+        }
+    }
     if let Some(q) = query.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()) {
-        where_clauses.push("(LOWER(album_name) LIKE ? OR LOWER(model_name) LIKE ?)".to_string());
+        where_clauses.push("(LOWER(g.album_name) LIKE ? OR LOWER(g.model_name) LIKE ?)".to_string());
         let pat = format!("%{q}%");
         bind_vals.push(Box::new(pat.clone()));
         bind_vals.push(Box::new(pat));
     }
 
     let where_sql = where_clauses.join(" AND ");
-    let count_sql = format!("SELECT COUNT(*) FROM gallery_sets WHERE {where_sql}");
+    let count_sql = format!("SELECT COUNT(*) FROM gallery_sets g WHERE {where_sql}");
     let total: i64 = {
         let refs: Vec<&dyn rusqlite::ToSql> = bind_vals.iter().map(|b| b.as_ref()).collect();
         conn.query_row(&count_sql, refs.as_slice(), |r| r.get(0))
@@ -2612,6 +2644,7 @@ pub fn list_gallery_sets(
         "name" => "g.model_name COLLATE NOCASE ASC, g.album_name COLLATE NOCASE ASC",
         "size" => "g.total_bytes DESC, g.album_name COLLATE NOCASE ASC",
         "count" => "effective_count DESC, g.total_bytes DESC",
+        "random" => "RANDOM()",
         _ => "g.updated_at DESC, g.rowid DESC",
     };
 
@@ -2623,6 +2656,7 @@ pub fn list_gallery_sets(
 
     let sql = format!(
         "SELECT g.id, g.model_name, g.album_name, g.remote_path, g.is_archive, g.cover_asset_id,
+                COALESCE(g.cover_page_index, 0),
                 CASE WHEN g.is_archive = 1 AND COALESCE(ca.page_count, 0) > g.item_count THEN ca.page_count ELSE g.item_count END AS effective_count,
                 g.total_bytes, g.updated_at
          FROM gallery_sets g
@@ -2642,9 +2676,10 @@ pub fn list_gallery_sets(
                 remote_path: r.get(3)?,
                 is_archive: r.get::<_, i64>(4)? != 0,
                 cover_asset_id: r.get(5)?,
-                item_count: r.get(6)?,
-                total_bytes: r.get(7)?,
-                updated_at: r.get(8)?,
+                cover_page_index: r.get(6)?,
+                item_count: r.get(7)?,
+                total_bytes: r.get(8)?,
+                updated_at: r.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -2655,6 +2690,78 @@ pub fn list_gallery_sets(
     }
 
     Ok(GallerySetsPage { sets, total })
+}
+
+pub fn set_gallery_set_cover(
+    app: &AppHandle,
+    set_id: &str,
+    cover_asset_id: Option<&str>,
+    page_index: i64,
+) -> Result<GallerySetV2, String> {
+    four_domains::ensure_v2(app)?;
+    let conn = four_domains::open_v2(app)?;
+    let page_idx = page_index.max(0);
+    let ts = now();
+
+    let existing_cover: Option<String> = conn
+        .query_row(
+            "SELECT cover_asset_id FROM gallery_sets WHERE id = ?1",
+            params![set_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+
+    let resolved_asset = cover_asset_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(existing_cover)
+        .ok_or_else(|| "未找到该图集的封面资源".to_string())?;
+
+    conn.execute(
+        "INSERT INTO gallery_cover_overrides (set_id, cover_asset_id, cover_page_index, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(set_id) DO UPDATE SET
+            cover_asset_id = excluded.cover_asset_id,
+            cover_page_index = excluded.cover_page_index,
+            updated_at = excluded.updated_at",
+        params![set_id, resolved_asset, page_idx, ts],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "UPDATE gallery_sets SET cover_asset_id = ?1, cover_page_index = ?2, updated_at = ?3 WHERE id = ?4",
+        params![resolved_asset, page_idx, ts, set_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.query_row(
+        "SELECT g.id, g.model_name, g.album_name, g.remote_path, g.is_archive, g.cover_asset_id,
+                COALESCE(g.cover_page_index, 0),
+                CASE WHEN g.is_archive = 1 AND COALESCE(ca.page_count, 0) > g.item_count THEN ca.page_count ELSE g.item_count END AS effective_count,
+                g.total_bytes, g.updated_at
+         FROM gallery_sets g
+         LEFT JOIN comic_archives ca ON ca.asset_id = g.cover_asset_id
+         WHERE g.id = ?1",
+        params![set_id],
+        |r| {
+            Ok(GallerySetV2 {
+                id: r.get(0)?,
+                model_name: r.get(1)?,
+                album_name: r.get(2)?,
+                remote_path: r.get(3)?,
+                is_archive: r.get::<_, i64>(4)? != 0,
+                cover_asset_id: r.get(5)?,
+                cover_page_index: r.get(6)?,
+                item_count: r.get(7)?,
+                total_bytes: r.get(8)?,
+                updated_at: r.get(9)?,
+            })
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub fn get_gallery_set_items(

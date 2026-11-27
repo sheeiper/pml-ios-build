@@ -307,6 +307,7 @@ struct GallerySetV2: Decodable, Identifiable, Hashable {
     let remotePath: String
     let isArchive: Bool
     let coverAssetId: String?
+    let coverPageIndex: Int?
     let itemCount: Int64
     let totalBytes: Int64
     let updatedAt: Int64
