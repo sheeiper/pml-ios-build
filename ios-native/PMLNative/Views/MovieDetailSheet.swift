@@ -171,7 +171,7 @@ public struct MovieDetailSheet: View {
                     title: metadata?.title ?? targetNum,
                     releaseDate: metadata?.releaseDate,
                     coverUrl: metadata?.coverUrl,
-                    detailUrl: metadata?.detailUrl ?? "",
+                    detailUrl: "",
                     inLibrary: true,
                     source: metadata?.source ?? "local"
                 ),
