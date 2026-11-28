@@ -248,6 +248,10 @@ extension PMLAPIClient {
         try await command("list_offline_download_tasks", arguments: ["limit": limit])
     }
 
+    func listOfflinedSignatures() async throws -> OfflinedSignaturesResponse {
+        try await command("list_offlined_signatures", arguments: [:])
+    }
+
     func deleteOfflineDownloadTask(id: String) async throws {
         try await command("delete_offline_download_task", arguments: ["id": id])
     }

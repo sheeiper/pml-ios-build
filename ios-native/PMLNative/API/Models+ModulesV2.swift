@@ -692,6 +692,12 @@ struct BatchOfflineSubmitResponse: Decodable {
     let results: [BatchOfflineSubmitItemResult]
 }
 
+struct OfflinedSignaturesResponse: Decodable {
+    let hashes: [String]
+    let urls: [String]
+    let cloudSyncedAt: Int64?
+}
+
 struct InboxFileEntry: Decodable, Identifiable, Hashable {
     var id: String { fullPath }
     let name: String

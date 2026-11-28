@@ -1185,6 +1185,8 @@ private struct OnlineComicsPaneView: View {
     @State private var magnetLoading = false
     @State private var magnetItems: [UniversalMagnetItem] = []
     @State private var copiedMagnetHash = ""
+    @State private var magnetFeedback = ""
+    @ObservedObject private var offlineStore = OfflineHistoryStore.shared
     @State private var filesTarget: MagnetFilesSheetTarget?
     @State private var cbzTask: CbzPackageTask?
     @State private var cbzPollTask: Task<Void, Never>?
@@ -1539,8 +1541,12 @@ private struct OnlineComicsPaneView: View {
                             Button {
                                 magnetQuery = detail?.title ?? item.title
                                 magnetItems = []
+                                magnetFeedback = ""
                                 showMagnetSheet = true
-                                Task { await runMagnetSearch() }
+                                Task {
+                                    await offlineStore.ensureLoaded(client: model.apiClient)
+                                    await runMagnetSearch()
+                                }
                             } label: {
                                 Label("搜磁力", systemImage: "link")
                             }
@@ -1670,6 +1676,11 @@ private struct OnlineComicsPaneView: View {
                                         .buttonStyle(.borderedProminent)
                                         .tint(.purple)
                                 }
+                                if !magnetFeedback.isEmpty {
+                                    Text(magnetFeedback)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             if magnetLoading {
                                 Section { ProgressView("正在搜索 Sukebei / Nyaa 磁力…") }
@@ -1682,6 +1693,7 @@ private struct OnlineComicsPaneView: View {
                             } else {
                                 Section("磁力结果（\(magnetItems.count)）") {
                                     ForEach(magnetItems) { m in
+                                        let isOff = offlineStore.isOfflined(m.infoHash) || offlineStore.isOfflined(m.magnet)
                                         VStack(alignment: .leading, spacing: 6) {
                                             Text(m.title).font(.caption.weight(.semibold))
                                             HStack(spacing: 8) {
@@ -1694,6 +1706,29 @@ private struct OnlineComicsPaneView: View {
                                                 Text(m.sizeText).font(.caption2).foregroundStyle(.secondary)
                                                 Text("做种 \(m.seeders)").font(.caption2).foregroundStyle(.green)
                                                 Spacer()
+                                                Button {
+                                                    Task {
+                                                        guard let client = model.apiClient else { return }
+                                                        do {
+                                                            let task = try await offlineStore.submit(client: client, magnet: m.magnet, title: m.title)
+                                                            magnetFeedback = "已加入 115 离线下载：\(task.targetDir)"
+                                                        } catch {
+                                                            magnetFeedback = "离线失败：\(error.localizedDescription)"
+                                                        }
+                                                    }
+                                                } label: {
+                                                    if offlineStore.busyKey == OfflineHistoryStore.cleanURL(m.magnet).lowercased() {
+                                                        ProgressView().scaleEffect(0.65)
+                                                    } else {
+                                                        Label(isOff ? "已离线" : "离线", systemImage: isOff ? "checkmark.icloud.fill" : "icloud.and.arrow.down")
+                                                            .font(.caption2.bold())
+                                                    }
+                                                }
+                                                .buttonStyle(.borderedProminent)
+                                                .controlSize(.mini)
+                                                .tint(isOff ? .green : .blue)
+                                                .disabled(!offlineStore.busyKey.isEmpty)
+
                                                 Button {
                                                     filesTarget = MagnetFilesSheetTarget(infoHash: m.infoHash, title: m.title)
                                                 } label: {

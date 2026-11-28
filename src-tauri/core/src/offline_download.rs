@@ -593,6 +593,7 @@ fn normalize_magnet_url(raw: &str) -> Result<(String, String), String> {
         return Ok((s.to_string(), hash));
     }
     if s.to_ascii_lowercase().starts_with("ed2k://")
+        || s.to_ascii_lowercase().starts_with("thunder://")
         || s.to_ascii_lowercase().starts_with("http://")
         || s.to_ascii_lowercase().starts_with("https://")
     {
@@ -713,7 +714,171 @@ pub fn submit_offline_magnet(
     )
     .map_err(|e| format!("记录离线任务失败：{e}"))?;
 
+    record_offlined_signature_in_cache(&info_hash, &magnet_url);
+
     Ok(task)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfflinedSignatures {
+    pub hashes: Vec<String>,
+    pub urls: Vec<String>,
+    pub cloud_synced_at: i64,
+}
+
+fn offlined_cloud_cache() -> &'static std::sync::Mutex<(i64, Vec<String>, Vec<String>)> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<(i64, Vec<String>, Vec<String>)>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new((0, Vec::new(), Vec::new())))
+}
+
+fn record_offlined_signature_in_cache(info_hash: &str, url: &str) {
+    if let Ok(mut guard) = offlined_cloud_cache().lock() {
+        let h = info_hash.trim().to_ascii_lowercase();
+        if !h.is_empty() && !guard.1.contains(&h) {
+            guard.1.push(h);
+        }
+        let u = url.trim().to_ascii_lowercase();
+        if !u.is_empty() && !guard.2.contains(&u) {
+            guard.2.push(u);
+        }
+    }
+}
+
+pub fn list_offlined_signatures(app: &AppHandle) -> Result<OfflinedSignatures, String> {
+    let conn = crate::v2_config::open(app)?;
+    ensure_schema(&conn)?;
+    let mut hash_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut url_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT info_hash, magnet FROM offline_download_tasks ORDER BY created_at DESC LIMIT 5000",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+            for row in rows.flatten() {
+                let h = row.0.trim().to_ascii_lowercase();
+                if !h.is_empty() {
+                    hash_set.insert(h);
+                }
+                let u = row.1.trim().to_ascii_lowercase();
+                if !u.is_empty() {
+                    let extracted = extract_btih(&u);
+                    if !extracted.is_empty() {
+                        hash_set.insert(extracted);
+                    }
+                    url_set.insert(u);
+                }
+            }
+        }
+    }
+
+    let now = now_ts();
+    let (cached_ts, cached_hashes, cached_urls) = offlined_cloud_cache()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or((0, Vec::new(), Vec::new()));
+
+    let cloud_synced_at = if now - cached_ts < 90 && cached_ts > 0 {
+        for h in cached_hashes {
+            hash_set.insert(h);
+        }
+        for u in cached_urls {
+            url_set.insert(u);
+        }
+        cached_ts
+    } else {
+        let cfg = get_offline_download_config(app).ok();
+        let creds = resolve_cd2_grpc_credentials(&conn).ok();
+        if let (Some(cfg), Some((origin, user, pass))) = (cfg, creds) {
+            let inbox_path = cfg.inbox_path.clone();
+            let fetched: Result<(Vec<String>, Vec<String>), String> = crate::rt::block_on(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(12))
+                    .connect_timeout(Duration::from_secs(5))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let token = cd2_login(&client, &origin, &user, &pass).await?;
+                let (cloud_name, cloud_acct) = cd2_detect_cloud_account(&client, &origin, &token, &inbox_path).await?;
+                let mut c_hashes = Vec::new();
+                let mut c_urls = Vec::new();
+                for page_num in 1..=3u64 {
+                    let mut l_payload = Vec::new();
+                    pb_str(1, &cloud_name, &mut l_payload);
+                    pb_str(2, &cloud_acct, &mut l_payload);
+                    pb_int(3, page_num, &mut l_payload);
+                    let l_res = cd2_grpc_call(&client, &origin, "ListAllOfflineFiles", &l_payload, Some(&token)).await?;
+                    if l_res.grpc_status != 0 {
+                        break;
+                    }
+                    let mut page_count = 1u64;
+                    for (fn_num, val) in parse_pb_fields(&l_res.message) {
+                        match (fn_num, val) {
+                            (3, PbVal::Varint(v)) => page_count = v.max(1),
+                            (6, PbVal::Bytes(entry_bytes)) => {
+                                let mut url = String::new();
+                                let mut ih = String::new();
+                                for (efn, eval) in parse_pb_fields(entry_bytes) {
+                                    match (efn, eval) {
+                                        (3, PbVal::Bytes(b)) => url = String::from_utf8_lossy(b).to_string(),
+                                        (5, PbVal::Bytes(b)) => ih = String::from_utf8_lossy(b).to_string(),
+                                        _ => {}
+                                    }
+                                }
+                                let hl = ih.trim().to_ascii_lowercase();
+                                if !hl.is_empty() {
+                                    c_hashes.push(hl);
+                                }
+                                let ul = url.trim().to_ascii_lowercase();
+                                if !ul.is_empty() {
+                                    let ex = extract_btih(&ul);
+                                    if !ex.is_empty() {
+                                        c_hashes.push(ex);
+                                    }
+                                    c_urls.push(ul);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if page_num >= page_count {
+                        break;
+                    }
+                }
+                Ok((c_hashes, c_urls))
+            });
+            match fetched {
+                Ok((c_hashes, c_urls)) => {
+                    for h in &c_hashes {
+                        hash_set.insert(h.clone());
+                    }
+                    for u in &c_urls {
+                        url_set.insert(u.clone());
+                    }
+                    if let Ok(mut guard) = offlined_cloud_cache().lock() {
+                        *guard = (now, c_hashes, c_urls);
+                    }
+                    now
+                }
+                Err(_) => {
+                    for h in cached_hashes {
+                        hash_set.insert(h);
+                    }
+                    for u in cached_urls {
+                        url_set.insert(u);
+                    }
+                    cached_ts
+                }
+            }
+        } else {
+            cached_ts
+        }
+    };
+
+    Ok(OfflinedSignatures {
+        hashes: hash_set.into_iter().collect(),
+        urls: url_set.into_iter().collect(),
+        cloud_synced_at,
+    })
 }
 
 pub fn list_offline_download_tasks(app: &AppHandle, limit: i64) -> Result<Vec<OfflineDownloadTask>, String> {
@@ -1425,10 +1590,76 @@ fn junk_reason_for_file(
     None
 }
 
+const DOMAIN_TLDS: &[&str] = &[
+    ".info", ".club", ".com", ".net", ".org", ".xyz", ".top", ".vip", ".pro", ".la", ".cc", ".me", ".tv", ".io", ".cn",
+];
+
 fn looks_like_site_token(inner: &str) -> bool {
     let l = inner.to_ascii_lowercase();
-    const TLDS: &[&str] = &[".com", ".net", ".org", ".la", ".cc", ".me", ".xyz", ".top", ".vip", ".tv", ".club", ".info", ".pro", ".io", ".cn"];
-    l.contains("www.") || l.contains("http") || TLDS.iter().any(|t| l.contains(t))
+    l.contains("www.") || l.contains("http") || DOMAIN_TLDS.iter().any(|t| l.contains(t))
+}
+
+/// Strictly match a hostname token whose suffix IS a domain TLD (never matches `.me` inside `4k2.meblk`).
+fn is_domain_tld_suffix(candidate: &str) -> bool {
+    let l = candidate.trim().to_ascii_lowercase();
+    if l.starts_with("www.") || l.starts_with("http://") || l.starts_with("https://") {
+        return DOMAIN_TLDS.iter().any(|t| l.contains(t));
+    }
+    for tld in DOMAIN_TLDS {
+        if let Some(host) = l.strip_suffix(tld) {
+            if host.len() >= 2
+                && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+                && host.chars().any(|c| c.is_ascii_alphanumeric())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Strip a glued leading domain such as `4k2.meblk-673` -> `blk-673` or `4k2.me-blk-673` -> `blk-673`
+/// without letting the delimiter scan eat past `.me`.
+fn strip_glued_leading_domain(s: &str) -> Option<String> {
+    let l = s.to_ascii_lowercase();
+    let after_www = l.strip_prefix("www.").unwrap_or(&l);
+    let offset_base = if l.starts_with("www.") { 4usize } else { 0usize };
+    let dot_rel = after_www.find('.')?;
+    if dot_rel < 2 || dot_rel > 24 {
+        return None;
+    }
+    let host_part = &after_www[..dot_rel];
+    if !host_part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let after_dot_offset = offset_base + dot_rel;
+    let rest_lower = &l[after_dot_offset..];
+    for tld in DOMAIN_TLDS {
+        if rest_lower.starts_with(tld) {
+            let tld_end = after_dot_offset + tld.len();
+            if tld_end >= s.len() {
+                return None;
+            }
+            let tail = &s[tld_end..];
+            let next_ch = tail.chars().next()?;
+            let is_sep = matches!(next_ch, '@' | '-' | '_' | '+' | ' ' | '.' | '[' | '【' | '(');
+            let host_has_digit_or_www = offset_base > 0 || host_part.chars().any(|c| c.is_ascii_digit());
+            let starts_cjk_or_non_ascii = !next_ch.is_ascii();
+            let starts_jav = crate::jav_scraper::extract_jav_number(tail)
+                .map(|n| tail.to_ascii_uppercase().starts_with(&n))
+                .unwrap_or(false);
+            if is_sep || (host_has_digit_or_www && (starts_jav || starts_cjk_or_non_ascii)) {
+                let cleaned = tail
+                    .trim_start_matches(|c: char| matches!(c, '@' | '-' | '_' | '+' | ' '))
+                    .to_string();
+                if !cleaned.is_empty() {
+                    return Some(cleaned);
+                }
+            }
+            break;
+        }
+    }
+    None
 }
 
 fn strip_site_watermarks(raw: &str, is_file: bool) -> String {
@@ -1470,9 +1701,13 @@ fn strip_site_watermarks(raw: &str, is_file: bool) -> String {
         .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '_' | '@' | '+'))
         .to_string();
 
-    // 2. Strip leading domain prefixes separated by '@', '-', '_', '+', or whitespace
-    // e.g. "2048.vip-推特..." -> "推特...", "hhd800.com@ABP-123" -> "ABP-123", "www.98T.la_xxx" -> "xxx"
+    // 2. Strip leading glued/delimited domain prefixes separated by '@', '-', '_', '+', or whitespace
+    // e.g. "2048.vip-推特..." -> "推特...", "hhd800.com@ABP-123" -> "ABP-123", "4k2.meblk-673" -> "blk-673"
     loop {
+        if let Some(glued_stripped) = strip_glued_leading_domain(&s) {
+            s = glued_stripped;
+            continue;
+        }
         let mut stripped_prefix = false;
         let bytes = s.as_bytes();
         let mut sep_pos: Option<(usize, usize)> = None;
@@ -1482,7 +1717,7 @@ fn strip_site_watermarks(raw: &str, is_file: bool) -> String {
             }
             if matches!(ch, '@' | '-' | '_' | '+' | ' ') {
                 let candidate = &s[..idx];
-                if looks_like_site_token(candidate) {
+                if is_domain_tld_suffix(candidate) {
                     let mut end = idx + ch.len_utf8();
                     while end < bytes.len() && matches!(bytes[end] as char, ' ' | '-' | '_' | '@' | '+') {
                         end += 1;
@@ -1744,10 +1979,27 @@ pub fn scan_offline_inbox(app: &AppHandle) -> Result<InboxScanResponse, String> 
                 }
             }
 
-            // Detect kept files with website watermarks in their names
+            // Detect kept files with website watermarks in their names and protect JAV code casing
             let mut file_renames = Vec::new();
             for kf in &kept_files {
-                let cleaned = strip_site_watermarks(&kf.name, true);
+                let mut cleaned = strip_site_watermarks(&kf.name, true);
+                if let Some(ref code) = explicit_jav_num {
+                    let upper_orig = kf.name.to_ascii_uppercase();
+                    if upper_orig.contains(code) {
+                        let (c_stem, c_ext) = split_stem_ext(&cleaned);
+                        if !c_stem.to_ascii_uppercase().contains(code) {
+                            cleaned = match c_ext {
+                                Some(ref ext) => format!("{code}.{ext}"),
+                                None => code.clone(),
+                            };
+                        } else if c_stem.eq_ignore_ascii_case(code) {
+                            cleaned = match c_ext {
+                                Some(ref ext) => format!("{code}.{ext}"),
+                                None => code.clone(),
+                            };
+                        }
+                    }
+                }
                 if cleaned != kf.name && !cleaned.is_empty() {
                     file_renames.push(InboxFileRename {
                         full_path: kf.full_path.clone(),
@@ -2313,6 +2565,18 @@ mod tests {
         assert_eq!(
             strip_site_watermarks("【98t.la】www.demo.com_测试视频.mkv", true),
             "测试视频.mkv"
+        );
+        assert_eq!(
+            strip_site_watermarks("4k2.meblk-673.mp4", true),
+            "blk-673.mp4"
+        );
+        assert_eq!(
+            strip_site_watermarks("4k2.me-blk-673.mp4", true),
+            "blk-673.mp4"
+        );
+        assert_eq!(
+            strip_site_watermarks("home-video-01.mp4", true),
+            "home-video-01.mp4"
         );
     }
 

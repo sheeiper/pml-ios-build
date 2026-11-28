@@ -348,6 +348,7 @@ struct MagnetSourceBucket: Identifiable {
 struct MagnetSearchView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var copiedStore = CopiedMagnetsStore.shared
+    @ObservedObject private var offlineStore = OfflineHistoryStore.shared
     @AppStorage("pml.magnet.history.v1") private var historyRaw = ""
 
     @State private var query = ""
@@ -959,6 +960,9 @@ struct MagnetSearchView: View {
                                     }
 
                                     HStack(spacing: 8) {
+                                        let alreadyOff = offlinedHashes.contains(item.infoHash.lowercased())
+                                            || offlineStore.isOfflined(item.infoHash)
+                                            || offlineStore.isOfflined(item.magnet)
                                         Button {
                                             Task { await submitOffline(magnet: item.magnet, title: item.title, key: item.infoHash) }
                                         } label: {
@@ -966,8 +970,8 @@ struct MagnetSearchView: View {
                                                 ProgressView().controlSize(.mini)
                                             } else {
                                                 Label(
-                                                    offlinedHashes.contains(item.infoHash.lowercased()) ? "已离线" : "离线",
-                                                    systemImage: offlinedHashes.contains(item.infoHash.lowercased()) ? "checkmark.icloud.fill" : "icloud.and.arrow.down"
+                                                    alreadyOff ? "已离线" : "离线",
+                                                    systemImage: alreadyOff ? "checkmark.icloud.fill" : "icloud.and.arrow.down"
                                                 )
                                                 .font(.caption.bold())
                                                 .lineLimit(1)
@@ -976,7 +980,7 @@ struct MagnetSearchView: View {
                                         }
                                         .buttonStyle(.borderedProminent)
                                         .controlSize(.small)
-                                        .tint(offlinedHashes.contains(item.infoHash.lowercased()) ? .green : .blue)
+                                        .tint(alreadyOff ? .green : .blue)
                                         .disabled(!offlineBusyKey.isEmpty)
                                         .layoutPriority(1)
 
@@ -1481,6 +1485,7 @@ struct MagnetSearchView: View {
             offlineGalleryDir = cfg.galleryPendingDir ?? cfg.galleryDir
             offlineCollectionPendingDir = cfg.collectionPendingDir ?? ""
         }
+        await offlineStore.ensureLoaded(client: client, force: true)
         if let list = try? await client.listOfflineDownloadTasks(limit: 30) {
             offlineTasks = list
             offlinedHashes = Set(list.flatMap { [$0.infoHash.lowercased(), $0.magnet.lowercased()] }.filter { !$0.isEmpty })
@@ -1526,6 +1531,7 @@ struct MagnetSearchView: View {
             offlineTasks.insert(task, at: 0)
             if !task.infoHash.isEmpty { offlinedHashes.insert(task.infoHash.lowercased()) }
             offlinedHashes.insert(clean.lowercased())
+            offlineStore.markOfflined(magnet: clean, infoHash: task.infoHash)
             offlineMessage = "已离线到 \(task.targetDir)"
             if key == "manual" {
                 offlineManualMagnet = ""

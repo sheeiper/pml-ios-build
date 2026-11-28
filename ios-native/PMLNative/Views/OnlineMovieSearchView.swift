@@ -304,6 +304,7 @@ struct OnlineMovieSearchTabView: View {
 struct OnlineMovieDetailSheet: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var copiedStore = CopiedMagnetsStore.shared
+    @ObservedObject private var offlineStore = OfflineHistoryStore.shared
     @Environment(\.dismiss) private var dismiss
 
     let release: PerformerRecentRelease
@@ -337,8 +338,7 @@ struct OnlineMovieDetailSheet: View {
     @State private var translatingTitle = false
     @State private var editingTranslation = false
     @State private var draftTranslatedTitle = ""
-    @State private var offlineBusyKey = ""
-    @State private var offlinedMagnets: Set<String> = []
+    @State private var showAllTags = false
 
     private enum OnlineDetailFullScreen: Identifiable {
         case sample(Int)
@@ -397,6 +397,7 @@ struct OnlineMovieDetailSheet: View {
                 }
             }
             .task {
+                await offlineStore.ensureLoaded(client: model.apiClient)
                 async let metaTask: Void = loadDetail()
                 async let magnetTask: Void = loadMagnets(forceRefresh: false)
                 _ = await (metaTask, magnetTask)
@@ -587,24 +588,20 @@ struct OnlineMovieDetailSheet: View {
                 .buttonStyle(.bordered)
                 .tint(.green)
 
-                Button {
-                    Task { await translateCurrentTitle(manual: nil) }
-                } label: {
-                    HStack(spacing: 4) {
-                        if translatingTitle { ProgressView().scaleEffect(0.7) }
-                        else { Image(systemName: "character.book.closed") }
-                        Text("翻译")
+                Menu {
+                    Button {
+                        Task { await translateCurrentTitle(manual: nil) }
+                    } label: {
+                        Label("翻译标题", systemImage: "character.book.closed")
                     }
-                    .font(.caption.bold())
-                }
-                .buttonStyle(.bordered)
-                .disabled(translatingTitle)
-
-                Button {
-                    draftTranslatedTitle = detail?.translatedTitle ?? displayTitle
-                    editingTranslation.toggle()
+                    Button {
+                        draftTranslatedTitle = detail?.translatedTitle ?? displayTitle
+                        editingTranslation.toggle()
+                    } label: {
+                        Label("编辑中文译名", systemImage: "pencil")
+                    }
                 } label: {
-                    Image(systemName: "pencil")
+                    Label("更多", systemImage: "ellipsis.circle")
                         .font(.caption.bold())
                 }
                 .buttonStyle(.bordered)
@@ -641,15 +638,17 @@ struct OnlineMovieDetailSheet: View {
                 ("系列", d.series ?? ""),
             ].filter { !$0.1.isEmpty }
             if !pairs.isEmpty {
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 8) {
-                    ForEach(pairs, id: \.0) { label, value in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(label).font(.caption2).foregroundStyle(.secondary)
-                            Text(value).font(.caption.weight(.semibold)).lineLimit(2)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(pairs, id: \.0) { label, value in
+                            HStack(spacing: 4) {
+                                Text(label).font(.caption2).foregroundStyle(.secondary)
+                                Text(value).font(.caption2.weight(.semibold)).lineLimit(1)
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(.quaternary.opacity(0.25), in: Capsule())
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
                     }
                 }
             }
@@ -814,20 +813,21 @@ struct OnlineMovieDetailSheet: View {
                                 Text(item.source).font(.caption2).foregroundStyle(.tertiary)
                             }
                             HStack(spacing: 8) {
+                                let isOff = offlineStore.isOfflined(item.magnet)
                                 Button {
                                     Task { await submitOffline(magnet: item.magnet, title: item.title) }
                                 } label: {
-                                    if offlineBusyKey == item.magnet {
+                                    if offlineStore.busyKey == OfflineHistoryStore.cleanURL(item.magnet).lowercased() {
                                         ProgressView().scaleEffect(0.75)
                                     } else {
-                                        Label(offlinedMagnets.contains(item.magnet) ? "已离线" : "离线", systemImage: offlinedMagnets.contains(item.magnet) ? "checkmark" : "icloud.and.arrow.down")
+                                        Label(isOff ? "已离线" : "离线", systemImage: isOff ? "checkmark.icloud.fill" : "icloud.and.arrow.down")
                                             .font(.caption.bold())
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
-                                .tint(offlinedMagnets.contains(item.magnet) ? .green : .blue)
+                                .tint(isOff ? .green : .blue)
                                 .controlSize(.small)
-                                .disabled(!offlineBusyKey.isEmpty)
+                                .disabled(!offlineStore.busyKey.isEmpty)
 
                                 Button {
                                     filesTarget = MagnetFilesSheetTarget(infoHash: extractMagnetHash(item.magnet), title: item.title)
@@ -901,20 +901,21 @@ struct OnlineMovieDetailSheet: View {
                                 }
                             }
                             HStack(spacing: 8) {
+                                let isOff = offlineStore.isOfflined(item.magnet)
                                 Button {
                                     Task { await submitOffline(magnet: item.magnet, title: item.title) }
                                 } label: {
-                                    if offlineBusyKey == item.magnet {
+                                    if offlineStore.busyKey == OfflineHistoryStore.cleanURL(item.magnet).lowercased() {
                                         ProgressView().scaleEffect(0.75)
                                     } else {
-                                        Label(offlinedMagnets.contains(item.magnet) ? "已离线" : "离线", systemImage: offlinedMagnets.contains(item.magnet) ? "checkmark" : "icloud.and.arrow.down")
+                                        Label(isOff ? "已离线" : "离线", systemImage: isOff ? "checkmark.icloud.fill" : "icloud.and.arrow.down")
                                             .font(.caption.bold())
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
-                                .tint(offlinedMagnets.contains(item.magnet) ? .green : .blue)
+                                .tint(isOff ? .green : .blue)
                                 .controlSize(.small)
-                                .disabled(!offlineBusyKey.isEmpty)
+                                .disabled(!offlineStore.busyKey.isEmpty)
 
                                 Button {
                                     filesTarget = MagnetFilesSheetTarget(infoHash: item.infoHash, title: item.title)
@@ -1076,12 +1077,9 @@ struct OnlineMovieDetailSheet: View {
     }
 
     private func submitOffline(magnet: String, title: String?) async {
-        guard let client = model.apiClient, offlineBusyKey.isEmpty else { return }
-        offlineBusyKey = magnet
-        defer { offlineBusyKey = "" }
+        guard let client = model.apiClient, offlineStore.busyKey.isEmpty else { return }
         do {
-            let task = try await client.submitOfflineMagnet(magnet: magnet, title: title, targetDir: nil)
-            offlinedMagnets.insert(magnet)
+            let task = try await offlineStore.submit(client: client, magnet: magnet, title: title)
             showToast("已加入离线下载：\(task.targetDir)")
         } catch {
             showToast("离线失败：\(error.localizedDescription)")

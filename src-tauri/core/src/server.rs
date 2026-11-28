@@ -823,6 +823,10 @@ async fn dispatch_command(
             let app = app.clone();
             blocking_result_response(move || crate::offline_download::list_offline_download_tasks(&app, limit)).await
         }
+        "list_offlined_signatures" => {
+            let app = app.clone();
+            blocking_result_response(move || crate::offline_download::list_offlined_signatures(&app)).await
+        }
         "delete_offline_download_task" => {
             let id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
             let app = app.clone();

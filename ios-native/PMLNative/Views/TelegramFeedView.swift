@@ -6,6 +6,7 @@ import AVKit
 /// 具备自动防广告过滤、相册合集聚合展示、评论区资源穿透与手势视频播放器联动。
 struct TelegramFeedView: View {
     @EnvironmentObject private var model: AppModel
+    @ObservedObject private var offlineStore = OfflineHistoryStore.shared
     
     @State private var dialogs: [TelegramNativeDialog] = []
     @State private var subscribedDialogs: [TelegramNativeDialog] = []
@@ -168,6 +169,7 @@ struct TelegramFeedView: View {
             channelFilterSheet
         }
         .task {
+            await offlineStore.ensureLoaded(client: model.apiClient)
             await loadDialogsAndSubscriptions()
         }
     }
@@ -491,6 +493,33 @@ struct TelegramFeedView: View {
                         .truncationMode(.middle)
 
                     HStack(spacing: 8) {
+                        if OfflineHistoryStore.canSubmitOffline(lk.url, linkType: lk.type) {
+                            let isOff = offlineStore.isOfflined(lk.url)
+                            Button {
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                Task {
+                                    guard let client = model.apiClient else { return }
+                                    do {
+                                        let task = try await offlineStore.submit(client: client, magnet: lk.url, title: lk.name)
+                                        triggerToast("☁️ 已提交离线：\(task.targetDir)")
+                                    } catch {
+                                        triggerToast("❌ 离线失败：\(error.localizedDescription)")
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: isOff ? "checkmark.icloud.fill" : "icloud.and.arrow.down")
+                                    Text(isOff ? "已离线" : "离线")
+                                }
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(isOff ? Color.green : Color.purple, in: Capsule())
+                                .foregroundStyle(.white)
+                            }
+                            .disabled(!offlineStore.busyKey.isEmpty)
+                        }
+
                         Button {
                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                             let clean = lk.textWithoutLinks ?? removeURLsFromText(parentText ?? lk.name)
@@ -1695,6 +1724,7 @@ struct TelegramFeedView: View {
 // MARK: - 专属评论区讨论抽屉 (按需点击展开)
 struct TelegramCommentsSheet: View {
     @EnvironmentObject private var model: AppModel
+    @ObservedObject private var offlineStore = OfflineHistoryStore.shared
     @Environment(\.dismiss) private var dismiss
 
     let message: TelegramNativeMessage
@@ -1788,6 +1818,7 @@ struct TelegramCommentsSheet: View {
                 }
             }
             .task {
+                await offlineStore.ensureLoaded(client: model.apiClient)
                 loadComments()
             }
         }
@@ -1850,6 +1881,33 @@ struct TelegramCommentsSheet: View {
                 .truncationMode(.middle)
 
             HStack(spacing: 8) {
+                if OfflineHistoryStore.canSubmitOffline(lk.url, linkType: lk.type) {
+                    let isOff = offlineStore.isOfflined(lk.url)
+                    Button {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        Task {
+                            guard let client = model.apiClient else { return }
+                            do {
+                                let task = try await offlineStore.submit(client: client, magnet: lk.url, title: lk.name)
+                                onToast("☁️ 已提交离线：\(task.targetDir)")
+                            } catch {
+                                onToast("❌ 离线失败：\(error.localizedDescription)")
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: isOff ? "checkmark.icloud.fill" : "icloud.and.arrow.down")
+                            Text(isOff ? "已离线" : "离线")
+                        }
+                        .font(.caption.weight(.bold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(isOff ? Color.green : Color.purple, in: Capsule())
+                        .foregroundStyle(.white)
+                    }
+                    .disabled(!offlineStore.busyKey.isEmpty)
+                }
+
                 Button {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     let clean = lk.textWithoutLinks ?? removeURLs(parentText ?? lk.name)
